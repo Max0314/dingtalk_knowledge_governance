@@ -43,4 +43,3 @@
 - 代码修改按风险运行单元测试、`compileall`、前端 `node --check` 和 Docker Compose 配置检查。
 - 部署后检查 `docker compose ps`、`/api/health`、worker 状态、同步批次、评审队列和最近错误日志。
 - 只改 Markdown 时，至少确认文件 UTF-8 可读、无真实密钥或人员数据，并检查 Git 状态。
-
