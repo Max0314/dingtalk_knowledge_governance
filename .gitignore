@@ -1,0 +1,37 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Frontend dependencies and build output
+node_modules/
+dist/
+
+# Runtime data: never commit metadata databases, queues, logs, or documents
+data/
+runtime/
+logs/
+uploads/
+tmp/
+temp/
+*.log
+*.db
+*.sqlite*
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
