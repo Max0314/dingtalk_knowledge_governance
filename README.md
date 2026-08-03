@@ -1,5 +1,32 @@
 # DingTalk Knowledge Governance
 
+## Quick start
+
+```powershell
+Copy-Item .env.example .env
+docker compose up --build -d
+```
+
+Open `http://localhost:39057`. If Docker is not installed, run a local SQLite demonstration:
+
+```powershell
+$env:KG_DATABASE_URL='sqlite:///./runtime/knowledge_governance.db'
+$env:KG_DEMO_MODE='true'
+python -m uvicorn app.main:app --port 39057
+```
+
+Docker Compose runs the API, review worker, MySQL, and Redis. API and worker use `/tmp` tmpfs and do not mount a persistent document volume.
+
+## Implemented capabilities
+
+- Read-only DingTalk workspace/node adapters, incremental sync batches, and connection diagnostics.
+- Document metadata, ingestion time, monthly counts, new/changed increments, immutable review instances, and derived rerun counts.
+- Read-only `bi_center` identity contract adapter using `employeeKey=UnionID`.
+- Explainable deductions based on the provided V1.1 rule; see [scoring mapping](docs/scoring-standard-v1.1-mapping.md).
+- Model configuration, environment-only API-key references, connectivity checks, and governance UI.
+
+When DingTalk, bi_center, or model credentials have not been injected, diagnostics explicitly return `not_configured`; the service never fabricates connectivity or persists document body content.
+
 钉钉知识库治理服务的设计起点，面向“入库可追溯、质量可评审、增量可统计”的管理诉求。
 
 ## 命名

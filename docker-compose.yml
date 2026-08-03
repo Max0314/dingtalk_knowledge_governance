@@ -1,0 +1,57 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    environment:
+      KG_DATABASE_URL: ${KG_DATABASE_URL:-mysql+pymysql://knowledge_governance:knowledge_governance@mysql:3306/knowledge_governance?charset=utf8mb4}
+      KG_REDIS_URL: ${KG_REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - "39057:39057"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      KG_DATABASE_URL: ${KG_DATABASE_URL:-mysql+pymysql://knowledge_governance:knowledge_governance@mysql:3306/knowledge_governance?charset=utf8mb4}
+      KG_REDIS_URL: ${KG_REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: knowledge_governance
+      MYSQL_USER: knowledge_governance
+      MYSQL_PASSWORD: knowledge_governance
+      MYSQL_ROOT_PASSWORD: local_root_only
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-plocal_root_only"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
