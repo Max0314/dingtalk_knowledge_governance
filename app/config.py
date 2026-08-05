@@ -6,10 +6,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", env_prefix="KG_", extra="ignore")
     database_url: str = "sqlite:///./runtime/knowledge_governance.db"
-    redis_url: str = "redis://localhost:6379/0"
     demo_mode: bool = False
     default_actor: str = "knowledge-governance-admin"
-    public_base_url: str = "http://localhost:39057"
+    public_base_url: str = "http://localhost:39021"
     dingtalk_app_key: str = Field(default="", validation_alias="DINGTALK_APP_KEY")
     dingtalk_app_secret: str = Field(default="", validation_alias="DINGTALK_APP_SECRET")
     dingtalk_sync_operator_id: str = Field(default="", validation_alias="DINGTALK_SYNC_OPERATOR_ID")

@@ -1,19 +1,22 @@
+# Platform rules (NeoFlow): no database containers in the app stack; MySQL
+# lives on the dedicated data server and is configured via .env. Port 39021
+# is from this user's assigned range 39020-39029.
 services:
   api:
     build: .
     env_file: .env
     environment:
-      KG_DATABASE_URL: ${KG_DATABASE_URL:-mysql+pymysql://knowledge_governance:knowledge_governance@mysql:3306/knowledge_governance?charset=utf8mb4}
-      KG_REDIS_URL: ${KG_REDIS_URL:-redis://redis:6379/0}
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "39057:39057"
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      - "${KG_PUBLISH_PORT:-39021}:39021"
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:39021/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   worker:
@@ -21,37 +24,7 @@ services:
     command: ["python", "-m", "app.worker"]
     env_file: .env
     environment:
-      KG_DATABASE_URL: ${KG_DATABASE_URL:-mysql+pymysql://knowledge_governance:knowledge_governance@mysql:3306/knowledge_governance?charset=utf8mb4}
-      KG_REDIS_URL: ${KG_REDIS_URL:-redis://redis:6379/0}
-    depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      TZ: ${TZ:-Asia/Shanghai}
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped
-
-  mysql:
-    image: mysql:8.4
-    environment:
-      MYSQL_DATABASE: knowledge_governance
-      MYSQL_USER: knowledge_governance
-      MYSQL_PASSWORD: knowledge_governance
-      MYSQL_ROOT_PASSWORD: local_root_only
-    volumes:
-      - mysql_data:/var/lib/mysql
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-plocal_root_only"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "no"]
-    restart: unless-stopped
-
-volumes:
-  mysql_data:

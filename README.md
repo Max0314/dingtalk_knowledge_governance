@@ -7,15 +7,21 @@ Copy-Item .env.example .env
 docker compose up --build -d
 ```
 
-Open `http://localhost:39057`. If Docker is not installed, run a local SQLite demonstration:
+Open `http://localhost:39021`. If Docker is not installed, run a local SQLite demonstration:
 
 ```powershell
 $env:KG_DATABASE_URL='sqlite:///./runtime/knowledge_governance.db'
 $env:KG_DEMO_MODE='true'
-python -m uvicorn app.main:app --port 39057
+python -m uvicorn app.main:app --port 39021
 ```
 
-Docker Compose runs the API, review worker, MySQL, and Redis. API and worker use `/tmp` tmpfs and do not mount a persistent document volume.
+Docker Compose runs the API and the review worker only. Per platform rules the
+stack contains no database container: `KG_DATABASE_URL` must point at the
+external MySQL server. There is no Redis — the worker polls the database. API
+and worker use `/tmp` tmpfs and do not mount a persistent document volume.
+
+Server deployment: see [docs/deployment-guide.md](docs/deployment-guide.md)
+(sanitized; live credentials stay in the local ops manual outside this repo).
 
 ## Implemented capabilities
 

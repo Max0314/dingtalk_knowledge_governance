@@ -1,6 +1,8 @@
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, create_engine
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from .config import get_settings
 
@@ -131,6 +133,36 @@ class ModelConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class HistoricalSnapshot(Base):
+    """An immutable, metadata-only baseline used for historical governance metrics."""
+    __tablename__ = "historical_snapshots"
+    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source: Mapped[str] = mapped_column(String(64), default="dingtalk")
+    scope: Mapped[str] = mapped_column(String(128), default="accessible_org_wiki_spaces")
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
+    status: Mapped[str] = mapped_column(String(32), default="completed")
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    definition: Mapped[dict] = mapped_column(JSON, default=dict)
+    total_file_nodes: Mapped[int] = mapped_column(Integer, default=0)
+    created_2025: Mapped[int] = mapped_column(Integer, default=0)
+    created_2026: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class HistoricalFileNode(Base):
+    """Metadata only: no document body, attachment bytes, or extracted content."""
+    __tablename__ = "historical_file_nodes"
+    __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "node_id", name="uq_history_snapshot_node"),)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(String(128), index=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    name: Mapped[str] = mapped_column(String(512), default="")
+    node_type: Mapped[str] = mapped_column(String(64), default="")
+    extension: Mapped[str] = mapped_column(String(32), default="")
+    source_created_at: Mapped[str] = mapped_column(String(64), default="")
+    source_updated_at: Mapped[str] = mapped_column(String(64), default="")
+
+
 def build_engine():
     settings = get_settings()
     if settings.database_url.startswith("sqlite:///"):
@@ -145,5 +177,21 @@ engine = build_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
-def init_db() -> None:
+def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
+    """Create tables, waiting for the external database to accept connections.
+
+    The platform stack has no database container, so `depends_on: healthy`
+    cannot order startup; the MySQL server may be briefly unreachable while
+    containers restart. Retrying here beats crash-looping the whole service.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            with engine.connect():
+                break
+        except OperationalError as exc:
+            last_error = exc
+            if attempt == max_attempts - 1:
+                raise RuntimeError(f"数据库在 {max_attempts * retry_delay:.0f} 秒内不可达。") from last_error
+            time.sleep(retry_delay)
     Base.metadata.create_all(engine)

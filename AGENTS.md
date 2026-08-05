@@ -25,8 +25,8 @@
 
 ## 技术与部署
 
-- 目标栈：Python 3.11、FastAPI、MySQL、Redis、原生 HTML/CSS/JavaScript、ECharts。
-- 使用 Docker Compose 编排 API、后台 worker 与 Redis；MySQL 默认使用受管或既有实例，开发环境可通过 profile 启动本地数据库。
+- 目标栈：Python 3.11、FastAPI、MySQL（外部实例）、原生 HTML/CSS/JavaScript、ECharts。不使用 Redis：评审队列由数据库轮询实现。
+- 使用 Docker Compose 编排 API 与后台 worker。平台禁止在应用服务器跑数据库容器：Compose 内不得出现 mysql/redis 服务，`KG_DATABASE_URL` 指向数据服务器。端口只用分配段 39020-39029（当前 39021）。
 - API 和 worker 对临时文档使用独立 `tmpfs`，不得挂载持久化文档目录。
 - UI 视觉与交互参考 `bi_center` 和 `ai_code_review_web`：蓝灰色工作台、顶部栏、左侧导航、白底卡片、筛选表格、分数徽标和响应式窄屏布局。
 
