@@ -101,6 +101,44 @@ async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p
   const prev=document.querySelector('#bl-prev'),next=document.querySelector('#bl-next');
   if(prev)prev.onclick=()=>{p.offset=Math.max(0,p.offset-50);blSearch()};
   if(next)next.onclick=()=>{p.offset+=50;blSearch()}}
+async function uploaders(month,excl){const meta=await api('/api/v1/metrics/uploaders/months');
+  if(!meta.months.length){shell('上传统计','按人 / 部门统计知识库上传量（数据来自带创建人的全量扫描）。',`<section class="card"><div class="empty">带创建人的扫描尚未完成（快照 ${meta.snapshot_id||'未开始'}）。扫描进行中会逐库出现数据，稍后刷新。</div></section>`);return}
+  month=month??meta.months[meta.months.length-1].month;excl=excl!==false;
+  const qs=new URLSearchParams({month,exclude_unmatched:excl,limit:50});
+  const [d,dept]=await Promise.all([api('/api/v1/metrics/uploaders?'+qs),api('/api/v1/metrics/departments?month='+month)]);
+  const monthOpts=meta.months.map(m=>`<option value="${m.month}" ${m.month===month?'selected':''}>${m.month}（${nf(m.total)}）</option>`).join('');
+  shell('上传统计',`快照 ${d.snapshot_id} · 覆盖 ${meta.workspace_count} 库 · ${d.note}`,`
+  <div class="grid metrics">
+    ${statCard(month+' 上传（已映射人员）',nf(d.total_files),excl?'已剔除未映射/机器人':'含未映射')}
+    ${statCard('上传人数',d.items.length,'当月有上传的已映射员工')}
+    ${statCard('未映射文件数',nf(d.unmatched_files),'数字员工 / 离职 / 外部账号')}
+    ${statCard('参与部门',dept.items.filter(x=>x.department_name!=='未映射').length,'按 bi_center 归属')}
+  </div>
+  <section class="card section-gap"><div class="card-head"><h2>${month} 人员上传 Top 15</h2></div><div id="upChart" class="chart"></div></section>
+  <div class="grid two-cols section-gap">
+    <section class="card"><div class="card-head"><h2>人员明细</h2></div><div class="table-wrap" style="max-height:420px;overflow-y:auto"><table class="data-table"><thead><tr><th>#</th><th>员工</th><th>部门 / 业务组</th><th class="num">上传数</th><th class="num">涉及库</th></tr></thead><tbody>
+      ${d.items.map((x,i)=>`<tr class="rowlink" data-up="${x.user_id}"><td>${i+1}</td><td><b>${x.name||x.user_id}</b>${x.matched?'':' <span class=\"chip amber\">未映射</span>'}</td><td>${x.department_name}<br><small>${x.biz_group_name}</small></td><td class="num"><b>${nf(x.files)}</b></td><td class="num">${x.workspaces}</td></tr>`).join('')||'<tr><td colspan=5 class=empty>该月无数据</td></tr>'}
+    </tbody></table></div></section>
+    <section class="card"><h2 id="up-detail-title">点击左侧人员查看趋势</h2><div id="upDetailChart" class="chart" style="height:220px"></div><div id="up-detail-spaces"></div></section>
+  </div>
+  <section class="card section-gap"><div class="card-head"><h2>部门汇总（${month}）</h2></div><div class="table-wrap"><table class="data-table"><thead><tr><th>部门</th><th class="num">上传数</th><th class="num">上传人数</th></tr></thead><tbody>
+    ${dept.items.map(x=>`<tr><td>${x.department_name}</td><td class="num">${nf(x.files)}</td><td class="num">${x.uploaders}</td></tr>`).join('')}
+  </tbody></table></div></section>`,
+  `<select class="input" id="up-month">${monthOpts}</select><label class="chip" style="cursor:pointer"><input type="checkbox" id="up-excl" ${excl?'checked':''} style="margin-right:4px">排除未映射/机器人</label>`);
+  renderChart('upChart',{tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},grid:{left:8,right:8,top:12,bottom:8,containLabel:true},
+    xAxis:{type:'category',data:d.items.slice(0,15).map(x=>x.name||x.user_id.slice(0,6)),axisLabel:{color:'#6b7280',fontSize:11,interval:0,rotate:d.items.length>8?30:0},axisTick:{show:false}},
+    yAxis:{type:'value',splitLine:{lineStyle:{color:'#f3f4f6'}},axisLabel:{color:'#6b7280',fontSize:11}},
+    series:[{type:'bar',barMaxWidth:26,data:d.items.slice(0,15).map(x=>x.files),itemStyle:{color:COLOR.routine,borderRadius:[3,3,0,0]}}]});
+  document.querySelector('#up-month').onchange=e=>uploaders(e.target.value,document.querySelector('#up-excl').checked);
+  document.querySelector('#up-excl').onchange=e=>uploaders(document.querySelector('#up-month').value,e.target.checked);
+  document.querySelectorAll('[data-up]').forEach(r=>r.onclick=async()=>{const u=await api('/api/v1/metrics/uploaders/'+r.dataset.up);
+    document.querySelector('#up-detail-title').textContent=`${u.name||u.user_id} · 月度上传趋势（累计 ${nf(u.months.reduce((a,m)=>a+m.count,0))}）`;
+    renderChart('upDetailChart',{tooltip:{trigger:'axis'},grid:{left:8,right:8,top:12,bottom:8,containLabel:true},
+      xAxis:{type:'category',data:u.months.map(m=>m.month),axisLabel:{color:'#6b7280',fontSize:10},axisTick:{show:false}},
+      yAxis:{type:'value',splitLine:{lineStyle:{color:'#f3f4f6'}},axisLabel:{color:'#6b7280',fontSize:10}},
+      series:[{type:'bar',barMaxWidth:18,data:u.months.map(m=>m.count),itemStyle:{color:COLOR.routine,borderRadius:[3,3,0,0]}}]});
+    document.querySelector('#up-detail-spaces').innerHTML='<p class="hint" style="margin-top:10px">主要上传知识库：</p>'+u.top_workspaces.map(s=>`<span class="chip" style="margin:2px">${s.name} ${nf(s.files)}</span>`).join(' ')})}
+
 async function documents(){const d=await api('/api/v1/documents');
   if(!Object.keys(state.coverageNames).length){try{const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}catch(e){}}
   state.bl={query:'',ws:'',offset:0};
@@ -213,7 +251,7 @@ function renderUser(u){const box=document.querySelector('#userBox');if(!box)retu
   document.querySelector('#logout').onclick=async()=>{await fetch('api/auth/logout',{method:'POST'});location.reload()}}
 
 /* ---- shell nav ---- */
-const views={overview,increments,documents,workspaces,models,diagnostics};
+const views={overview,increments,uploaders,documents,workspaces,models,diagnostics};
 function navigate(view){state.view=view;document.body.classList.remove('sidebar-open');
   document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
   views[view]().catch(e=>{if(app.querySelector('.login-card'))return;disposeCharts();app.innerHTML=`<section class="card"><h2>加载失败</h2><p class="hint">${e.message}</p><button class="secondary" onclick="location.reload()">重试</button></section>`})}

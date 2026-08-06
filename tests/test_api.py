@@ -63,6 +63,34 @@ def test_baseline_endpoints_and_notification_outbox():
         assert "notify_enabled" in listing and isinstance(listing["items"], list)
 
 
+def test_uploader_stats_read_only_aggregates():
+    from app.db import EmployeeMap, SessionLocal, UploaderMonthStat
+
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            if not db.get(EmployeeMap, "u-100"):
+                db.add_all([
+                    UploaderMonthStat(snapshot_id="snap-t", workspace_id="ws1", workspace_name="研发库",
+                                      creator_user_id="u-100", month="2026-07", file_count=7),
+                    UploaderMonthStat(snapshot_id="snap-t", workspace_id="ws1", workspace_name="研发库",
+                                      creator_user_id="u-robot", month="2026-07", file_count=99),
+                    EmployeeMap(user_id="u-100", employee_key="uk-100", name="张三", department_name="研发中心",
+                                biz_group_name="平台组", matched=True, include_official=True),
+                ])
+                db.commit()
+        months = client.get("/api/v1/metrics/uploaders/months").json()
+        assert any(m["month"] == "2026-07" for m in months["months"])
+        data = client.get("/api/v1/metrics/uploaders", params={"month": "2026-07"}).json()
+        assert [item["name"] for item in data["items"]] == ["张三"]
+        assert data["unmatched_files"] == 99
+        both = client.get("/api/v1/metrics/uploaders", params={"month": "2026-07", "exclude_unmatched": "false"}).json()
+        assert len(both["items"]) == 2
+        detail = client.get("/api/v1/metrics/uploaders/u-100").json()
+        assert detail["months"] == [{"month": "2026-07", "count": 7}]
+        dept = client.get("/api/v1/metrics/departments", params={"month": "2026-07"}).json()
+        assert any(item["department_name"] == "研发中心" and item["files"] == 7 for item in dept["items"])
+
+
 def test_auth_guard_blocks_api_when_enabled():
     from app.config import get_settings
 

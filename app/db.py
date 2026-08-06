@@ -171,8 +171,40 @@ class HistoricalFileNode(Base):
     name: Mapped[str] = mapped_column(String(512), default="")
     node_type: Mapped[str] = mapped_column(String(64), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
+    creator_user_id: Mapped[str] = mapped_column(id_string(), default="")
     source_created_at: Mapped[str] = mapped_column(String(64), default="")
     source_updated_at: Mapped[str] = mapped_column(String(64), default="")
+
+
+class UploaderMonthStat(Base):
+    """Pre-aggregated (uploader x workspace x month) file counts.
+
+    Dashboards read ONLY this small table — never the raw node rows — so a
+    page load costs a few indexed reads on the shared MySQL, not a scan.
+    Rows are rebuilt per workspace when a scan finishes that workspace.
+    """
+    __tablename__ = "uploader_month_stats"
+    __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "creator_user_id", "month", name="uq_uploader_ws_month"),)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[str] = mapped_column(id_string(64), index=True)
+    workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
+    workspace_name: Mapped[str] = mapped_column(String(255), default="")
+    creator_user_id: Mapped[str] = mapped_column(id_string(), index=True)
+    month: Mapped[str] = mapped_column(String(7), index=True)
+    file_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class EmployeeMap(Base):
+    """bi_center identity resolution cache: DingTalk userId -> org attribution."""
+    __tablename__ = "employee_map"
+    user_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    employee_key: Mapped[str] = mapped_column(id_string(), default="")
+    name: Mapped[str] = mapped_column(String(128), default="")
+    department_name: Mapped[str] = mapped_column(String(255), default="")
+    biz_group_name: Mapped[str] = mapped_column(String(255), default="")
+    matched: Mapped[bool] = mapped_column(Boolean, default=False)
+    include_official: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuthSession(Base):

@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from . import metrics
+from . import metrics, orgmap
 from .config import get_settings
 from .db import Document, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
@@ -118,6 +118,31 @@ def metrics_coverage(db: Session = Depends(db_session)):
 @app.get("/api/v1/metrics/workspaces/{workspace_id}/months")
 def metrics_workspace_months(workspace_id: str, db: Session = Depends(db_session)):
     return metrics.workspace_months(db, workspace_id)
+
+
+@app.get("/api/v1/metrics/uploaders/months")
+def uploader_months_api(db: Session = Depends(db_session)):
+    return metrics.uploader_months(db)
+
+
+@app.get("/api/v1/metrics/uploaders")
+def uploaders_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                  exclude_unmatched: bool = True, limit: int = Query(default=50, ge=1, le=200),
+                  db: Session = Depends(db_session)):
+    preview = metrics.uploaders(db, month, exclude_unmatched=False, limit=200)
+    orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
+    return metrics.uploaders(db, month, exclude_unmatched=exclude_unmatched, limit=limit)
+
+
+@app.get("/api/v1/metrics/uploaders/{user_id}")
+def uploader_detail_api(user_id: str, db: Session = Depends(db_session)):
+    orgmap.ensure_employees(db, get_settings(), [user_id])
+    return metrics.uploader_detail(db, user_id)
+
+
+@app.get("/api/v1/metrics/departments")
+def departments_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"), db: Session = Depends(db_session)):
+    return metrics.department_rollup(db, month)
 
 
 @app.get("/api/v1/baseline/workspaces/{workspace_id}/folders")

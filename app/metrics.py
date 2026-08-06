@@ -19,7 +19,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .db import Document, HistoricalFileNode, HistoricalSnapshot, Workspace
+from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, UploaderMonthStat, Workspace
 
 BULK_DAY_MIN = 200
 BULK_DAY_SHARE = 0.25
@@ -36,11 +36,26 @@ def _change_stamp(db: Session) -> tuple:
     )
 
 
+def primary_snapshot_id(db: Session) -> str:
+    """The one baseline snapshot that headline increment numbers come from.
+
+    Later snapshots (e.g. the uploader-attribution scan in the new workspace-id
+    namespace) must NOT leak into the increment series, or the headline totals
+    would silently double-count the same knowledge bases.
+    """
+    for snapshot in db.scalars(select(HistoricalSnapshot)).all():
+        if (snapshot.definition or {}).get("is_primary_baseline"):
+            return snapshot.snapshot_id
+    return "wiki-baseline-2026-08-05"
+
+
 def _collect(db: Session) -> dict[str, Any]:
     """One pass over both sources, deduplicated by node_id."""
+    baseline = primary_snapshot_id(db)
     files: dict[str, tuple[str, str]] = {}  # node_id -> (workspace_id, created_at)
     for workspace_id, node_id, created in db.execute(
-            select(HistoricalFileNode.workspace_id, HistoricalFileNode.node_id, HistoricalFileNode.source_created_at)):
+            select(HistoricalFileNode.workspace_id, HistoricalFileNode.node_id, HistoricalFileNode.source_created_at)
+            .where(HistoricalFileNode.snapshot_id == baseline)):
         files[node_id] = (workspace_id, created or "")
     for workspace_id, node_id, created in db.execute(
             select(Document.workspace_id, Document.node_id, Document.source_created_at)
@@ -93,7 +108,8 @@ def collected(db: Session) -> dict[str, Any]:
 
 
 def snapshot_context(db: Session) -> dict[str, Any]:
-    snapshot = db.scalars(select(HistoricalSnapshot).order_by(HistoricalSnapshot.collected_at.desc())).first()
+    snapshot = db.get(HistoricalSnapshot, primary_snapshot_id(db)) or \
+        db.scalars(select(HistoricalSnapshot).order_by(HistoricalSnapshot.collected_at.desc())).first()
     if not snapshot:
         return {"snapshot_id": None, "definition": {}, "collected_at": None}
     return {"snapshot_id": snapshot.snapshot_id, "definition": snapshot.definition or {},
@@ -178,3 +194,97 @@ def workspace_months(db: Session, workspace_id: str) -> dict[str, Any]:
     return {"workspace_id": workspace_id,
             "months": [{"month": month, "count": months[month]} for month in sorted(months)],
             "total_files": data["space_totals"].get(workspace_id, 0)}
+
+
+# ---- uploader attribution (reads pre-aggregated rows only; see UploaderMonthStat) ----
+
+def uploader_snapshot_id(db: Session) -> str:
+    return db.scalar(select(func.max(UploaderMonthStat.snapshot_id))) or ""
+
+
+def _employee_rows(db: Session, user_ids: list[str]) -> dict[str, EmployeeMap]:
+    if not user_ids:
+        return {}
+    rows = db.scalars(select(EmployeeMap).where(EmployeeMap.user_id.in_(user_ids))).all()
+    return {row.user_id: row for row in rows}
+
+
+def _person(user_id: str, employee: EmployeeMap | None) -> dict[str, Any]:
+    if employee and employee.matched:
+        return {"user_id": user_id, "name": employee.name, "department_name": employee.department_name,
+                "biz_group_name": employee.biz_group_name, "matched": True, "include_official": employee.include_official}
+    return {"user_id": user_id, "name": (employee.name if employee else "") or "", "department_name": "未映射",
+            "biz_group_name": "未映射", "matched": False, "include_official": False}
+
+
+def uploader_months(db: Session) -> dict[str, Any]:
+    snapshot = uploader_snapshot_id(db)
+    rows = db.execute(select(UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
+                      .where(UploaderMonthStat.snapshot_id == snapshot)
+                      .group_by(UploaderMonthStat.month).order_by(UploaderMonthStat.month)).all()
+    uploader_count = db.scalar(select(func.count(func.distinct(UploaderMonthStat.creator_user_id)))
+                               .where(UploaderMonthStat.snapshot_id == snapshot)) or 0
+    space_count = db.scalar(select(func.count(func.distinct(UploaderMonthStat.workspace_id)))
+                            .where(UploaderMonthStat.snapshot_id == snapshot)) or 0
+    return {"snapshot_id": snapshot, "months": [{"month": m, "total": int(c)} for m, c in rows],
+            "uploader_count": uploader_count, "workspace_count": space_count}
+
+
+def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limit: int = 50) -> dict[str, Any]:
+    snapshot = uploader_snapshot_id(db)
+    stmt = (select(UploaderMonthStat.creator_user_id,
+                   func.sum(UploaderMonthStat.file_count).label("files"),
+                   func.count(func.distinct(UploaderMonthStat.workspace_id)))
+            .where(UploaderMonthStat.snapshot_id == snapshot))
+    if month:
+        stmt = stmt.where(UploaderMonthStat.month == month)
+    rows = db.execute(stmt.group_by(UploaderMonthStat.creator_user_id)
+                      .order_by(func.sum(UploaderMonthStat.file_count).desc()).limit(500)).all()
+    employees = _employee_rows(db, [r[0] for r in rows])
+    items = []
+    unmatched_files = 0
+    for user_id, files, spaces in rows:
+        person = _person(user_id, employees.get(user_id))
+        entry = {**person, "files": int(files), "workspaces": int(spaces)}
+        if not person["matched"]:
+            unmatched_files += int(files)
+            if exclude_unmatched:
+                continue
+        items.append(entry)
+    total = sum(item["files"] for item in items)
+    return {"snapshot_id": snapshot, "month": month, "exclude_unmatched": exclude_unmatched,
+            "items": items[:limit], "total_files": total, "unmatched_files": unmatched_files,
+            "note": "未映射含数字员工/离职/外部账号；bi_center 契约仅把 matched 且 includeInOfficialStats 的身份计入正式统计。"}
+
+
+def uploader_detail(db: Session, user_id: str) -> dict[str, Any]:
+    snapshot = uploader_snapshot_id(db)
+    months = db.execute(select(UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
+                        .where(UploaderMonthStat.snapshot_id == snapshot, UploaderMonthStat.creator_user_id == user_id)
+                        .group_by(UploaderMonthStat.month).order_by(UploaderMonthStat.month)).all()
+    spaces = db.execute(select(UploaderMonthStat.workspace_name, func.sum(UploaderMonthStat.file_count))
+                        .where(UploaderMonthStat.snapshot_id == snapshot, UploaderMonthStat.creator_user_id == user_id)
+                        .group_by(UploaderMonthStat.workspace_name)
+                        .order_by(func.sum(UploaderMonthStat.file_count).desc()).limit(10)).all()
+    employee = _employee_rows(db, [user_id]).get(user_id)
+    return {**_person(user_id, employee),
+            "months": [{"month": m, "count": int(c)} for m, c in months],
+            "top_workspaces": [{"name": n or "(未知库)", "files": int(c)} for n, c in spaces]}
+
+
+def department_rollup(db: Session, month: str = "") -> dict[str, Any]:
+    snapshot = uploader_snapshot_id(db)
+    stmt = select(UploaderMonthStat.creator_user_id, func.sum(UploaderMonthStat.file_count)) \
+        .where(UploaderMonthStat.snapshot_id == snapshot)
+    if month:
+        stmt = stmt.where(UploaderMonthStat.month == month)
+    rows = db.execute(stmt.group_by(UploaderMonthStat.creator_user_id)).all()
+    employees = _employee_rows(db, [r[0] for r in rows])
+    departments: dict[str, dict[str, Any]] = {}
+    for user_id, files in rows:
+        person = _person(user_id, employees.get(user_id))
+        bucket = departments.setdefault(person["department_name"], {"department_name": person["department_name"], "files": 0, "uploaders": 0})
+        bucket["files"] += int(files)
+        bucket["uploaders"] += 1
+    items = sorted(departments.values(), key=lambda item: -item["files"])
+    return {"month": month, "items": items}
