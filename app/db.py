@@ -11,19 +11,30 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def id_string(length: int = 128):
+    """Case-sensitive string type for external identifiers.
+
+    DingTalk node/workspace ids are case-sensitive random strings; under
+    MySQL's default *_ci collation, ids differing only in case collide (the
+    2026-08 full scan contained 10 such pairs). SQLite keeps the plain type
+    because it does not know MySQL collation names.
+    """
+    return String(length).with_variant(String(length, collation="utf8mb4_bin"), "mysql")
+
+
 class Base(DeclarativeBase):
     pass
 
 
 class Workspace(Base):
     __tablename__ = "workspaces"
-    workspace_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str] = mapped_column(Text, default="")
     url: Mapped[str] = mapped_column(String(1024), default="")
     source_created_at: Mapped[str] = mapped_column(String(64), default="")
     source_updated_at: Mapped[str] = mapped_column(String(64), default="")
-    creator_key: Mapped[str] = mapped_column(String(128), default="")
+    creator_key: Mapped[str] = mapped_column(id_string(), default="")
     owner_department_id: Mapped[str] = mapped_column(String(128), default="")
     owner_department_name: Mapped[str] = mapped_column(String(255), default="未映射")
     owner_biz_group_name: Mapped[str] = mapped_column(String(255), default="未映射")
@@ -35,14 +46,14 @@ class WorkspaceRole(Base):
     __tablename__ = "workspace_roles"
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
-    employee_key: Mapped[str] = mapped_column(String(128), index=True)
+    employee_key: Mapped[str] = mapped_column(id_string(), index=True)
     role: Mapped[str] = mapped_column(String(32))  # administrator | reviewer
     display_name: Mapped[str] = mapped_column(String(128), default="")
 
 
 class Document(Base):
     __tablename__ = "documents"
-    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
     name: Mapped[str] = mapped_column(String(512))
     category: Mapped[str] = mapped_column(String(64), default="")
@@ -53,7 +64,7 @@ class Document(Base):
     is_folder: Mapped[bool] = mapped_column(Boolean, default=False)
     source_created_at: Mapped[str] = mapped_column(String(64), default="")
     source_updated_at: Mapped[str] = mapped_column(String(64), default="")
-    uploader_key: Mapped[str] = mapped_column(String(128), default="")
+    uploader_key: Mapped[str] = mapped_column(id_string(), default="")
     uploader_name: Mapped[str] = mapped_column(String(128), default="未映射")
     department_name: Mapped[str] = mapped_column(String(255), default="未映射")
     biz_group_name: Mapped[str] = mapped_column(String(255), default="未映射")
@@ -67,7 +78,7 @@ class Document(Base):
 
 class ReviewInstance(Base):
     __tablename__ = "review_instances"
-    review_instance_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    review_instance_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("documents.node_id"), index=True)
     ai_score: Mapped[float] = mapped_column(Float)
     verdict: Mapped[str] = mapped_column(String(32))
@@ -88,13 +99,13 @@ class ReviewDecision(Base):
     review_instance_id: Mapped[str] = mapped_column(ForeignKey("review_instances.review_instance_id"), index=True)
     decision: Mapped[str] = mapped_column(String(32))
     comment: Mapped[str] = mapped_column(Text, default="")
-    reviewer_key: Mapped[str] = mapped_column(String(128))
+    reviewer_key: Mapped[str] = mapped_column(id_string())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ReviewJob(Base):
     __tablename__ = "review_jobs"
-    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("documents.node_id"), index=True)
     trigger: Mapped[str] = mapped_column(String(32), default="manual")
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
@@ -107,7 +118,7 @@ class ReviewJob(Base):
 
 class SyncRun(Base):
     __tablename__ = "sync_runs"
-    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     mode: Mapped[str] = mapped_column(String(32), default="incremental")
     workspaces_seen: Mapped[int] = mapped_column(Integer, default=0)
@@ -136,7 +147,7 @@ class ModelConfig(Base):
 class HistoricalSnapshot(Base):
     """An immutable, metadata-only baseline used for historical governance metrics."""
     __tablename__ = "historical_snapshots"
-    snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     source: Mapped[str] = mapped_column(String(64), default="dingtalk")
     scope: Mapped[str] = mapped_column(String(128), default="accessible_org_wiki_spaces")
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Shanghai")
@@ -154,8 +165,8 @@ class HistoricalFileNode(Base):
     __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "node_id", name="uq_history_snapshot_node"),)
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
-    workspace_id: Mapped[str] = mapped_column(String(128), index=True)
-    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
+    node_id: Mapped[str] = mapped_column(id_string(), index=True)
     name: Mapped[str] = mapped_column(String(512), default="")
     node_type: Mapped[str] = mapped_column(String(64), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
