@@ -27,6 +27,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="DingTalk Knowledge Governance", version="1.0.0", lifespan=lifespan)
 
+from .auth import guard_middleware, register_auth_routes  # noqa: E402
+
+app.middleware("http")(guard_middleware)
+register_auth_routes(app)
+
 
 def db_session():
     db = SessionLocal()

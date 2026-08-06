@@ -63,6 +63,23 @@ def test_baseline_endpoints_and_notification_outbox():
         assert "notify_enabled" in listing and isinstance(listing["items"], list)
 
 
+def test_auth_guard_blocks_api_when_enabled():
+    from app.config import get_settings
+
+    os.environ["KG_AUTH_ENABLED"] = "true"
+    get_settings.cache_clear()
+    try:
+        with TestClient(app) as client:
+            assert client.get("/api/health").status_code == 200
+            assert client.get("/api/auth/me").status_code == 401
+            assert client.get("/api/v1/dashboard/overview").status_code == 401
+            login = client.get("/api/auth/login-url", params={"return_url": "/"})
+            assert login.status_code in (200, 400)
+    finally:
+        os.environ["KG_AUTH_ENABLED"] = "false"
+        get_settings.cache_clear()
+
+
 def test_connectivity_never_claims_unconfigured_integrations_are_healthy():
     with TestClient(app) as client:
         payload = client.get("/api/v1/diagnostics/connectivity").json()

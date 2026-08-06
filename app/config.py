@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # Push stays off until the robot permission is granted and a test send passes.
     notify_enabled: bool = False
     robot_code: str = ""  # defaults to the app key at call time when empty
+    # DingTalk login guard for /api/*. Off by default so local dev and tests
+    # run open; the server .env turns it on with a real secret.
+    auth_enabled: bool = False
+    auth_secret: str = "dev-only-not-secret"
+    dingtalk_corp_id: str = Field(default="", validation_alias="DINGTALK_CORP_ID")
 
 
 @lru_cache

@@ -1,4 +1,8 @@
-const api=(url,options={})=>fetch(url,{headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.detail?.message||data.detail||'请求失败');return data});
+/* Relative URLs keep the app working both at / (tunnel/dev) and behind the
+   /knowledge_governance/ prefix, where nginx strips the prefix. */
+const api=(url,options={})=>fetch(url.replace(/^\//,''),{headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));
+  if(r.status===401){renderLogin();throw new Error(data.detail?.message||'请先登录')}
+  if(!r.ok)throw new Error(data.detail?.message||data.detail||'请求失败');return data});
 const app=document.querySelector('#app');
 const state={view:'overview',coverageNames:{}};
 const nf=v=>Number(v||0).toLocaleString('zh-CN');
@@ -193,12 +197,31 @@ async function diagnostics(){const[d,n]=await Promise.all([api('/api/v1/diagnost
   if(send)send.onclick=async()=>{const uid=document.querySelector('#test-uid').value.trim();if(!uid)return toast('请填写 userId');
     try{await api('/api/v1/notifications/test',{method:'POST',body:JSON.stringify({user_id:uid})});toast('已发送，请在钉钉查收')}catch(e){toast(e.message)}}}
 
+/* ---- auth gate ---- */
+function renderLogin(){disposeCharts();document.body.classList.remove('sidebar-open');
+  app.innerHTML=`<div class="login-wrap"><section class="card login-card"><div class="login-brand"><span class="brand-mark">知</span><div><b>钉钉知识库治理</b><br><small>入库可追溯 · 质量可评审 · 增量可统计</small></div></div>
+  <p class="hint">使用钉钉账号登录后访问治理数据。</p>
+  <button class="primary" id="ding-login" style="width:100%">钉钉扫码登录</button>
+  <p class="hint" id="login-err"></p></section></div>`;
+  document.querySelector('#ding-login').onclick=async()=>{try{
+    const r=await fetch('api/auth/login-url?return_url='+encodeURIComponent(location.href)).then(x=>x.json());
+    if(!r.login_url)throw new Error(r.detail?.message||'登录服务不可用');
+    location.href=r.login_url}catch(e){document.querySelector('#login-err').textContent=e.message}}}
+function renderUser(u){const box=document.querySelector('#userBox');if(!box)return;
+  if(!u||!state.authEnabled){box.innerHTML='<span class="avatar">管</span>';return}
+  box.innerHTML=`<span class="avatar" title="${u.union_id}">${(u.name||'员')[0]}</span><span class="user-name">${u.name||''}</span><button class="secondary" id="logout" style="padding:5px 10px;font-size:12px">退出</button>`;
+  document.querySelector('#logout').onclick=async()=>{await fetch('api/auth/logout',{method:'POST'});location.reload()}}
+
 /* ---- shell nav ---- */
 const views={overview,increments,documents,workspaces,models,diagnostics};
 function navigate(view){state.view=view;document.body.classList.remove('sidebar-open');
   document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.view===view));
-  views[view]().catch(e=>{disposeCharts();app.innerHTML=`<section class="card"><h2>加载失败</h2><p class="hint">${e.message}</p><button class="secondary" onclick="location.reload()">重试</button></section>`})}
+  views[view]().catch(e=>{if(app.querySelector('.login-card'))return;disposeCharts();app.innerHTML=`<section class="card"><h2>加载失败</h2><p class="hint">${e.message}</p><button class="secondary" onclick="location.reload()">重试</button></section>`})}
 document.querySelectorAll('.nav').forEach(b=>b.onclick=()=>navigate(b.dataset.view));
 document.querySelector('#menuBtn').onclick=()=>document.body.classList.toggle('sidebar-open');
 document.querySelector('#backdrop').onclick=()=>document.body.classList.remove('sidebar-open');
-navigate('overview');
+(async()=>{try{
+  const r=await fetch('api/auth/me');const d=await r.json().catch(()=>({}));
+  if(r.status===401){state.authEnabled=true;renderLogin();return}
+  state.authEnabled=!!d.auth_enabled;renderUser(d.user);navigate('overview')
+}catch(e){navigate('overview')}})();

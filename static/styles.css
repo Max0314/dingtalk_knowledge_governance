@@ -114,6 +114,13 @@ b{font-weight:600}
 .toast{position:fixed;left:50%;bottom:34px;transform:translate(-50%,16px);background:#111827;color:#fff;border-radius:8px;padding:10px 18px;font-size:13px;opacity:0;pointer-events:none;transition:.25s;z-index:60}
 .toast.show{opacity:.95;transform:translate(-50%,0)}
 
+/* auth */
+.user-box{display:flex;align-items:center;gap:8px}
+.user-name{font-size:13px;color:#374151;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.login-wrap{min-height:60vh;display:grid;place-items:center}
+.login-card{width:340px;max-width:92vw;text-align:center;padding:30px 26px}
+.login-brand{display:flex;align-items:center;gap:12px;justify-content:center;margin-bottom:14px;text-align:left}
+
 /* responsive */
 @media (max-width:1024px){.metrics{grid-template-columns:repeat(2,1fr)}.two-cols{grid-template-columns:1fr}}
 @media (max-width:900px){

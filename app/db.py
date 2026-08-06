@@ -175,6 +175,19 @@ class HistoricalFileNode(Base):
     source_updated_at: Mapped[str] = mapped_column(String(64), default="")
 
 
+class AuthSession(Base):
+    """Server-side login sessions. Only the SHA-256 of the cookie token is stored."""
+    __tablename__ = "auth_sessions"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    union_id: Mapped[str] = mapped_column(id_string(), index=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    avatar: Mapped[str] = mapped_column(String(1024), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Notification(Base):
     """Outbox for review-result pushes. Rows are auditable and immutable-ish:
     the worker only moves status pending -> sent/failed and stamps the error."""
