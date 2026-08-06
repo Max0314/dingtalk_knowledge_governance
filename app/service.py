@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .db import Document, ModelConfig, ReviewInstance, ReviewJob, SyncRun, Workspace, WorkspaceRole, utcnow
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_score_content
+from .notify import enqueue_review_notification
 from .scoring import RULE_VERSION, score_document
 
 
@@ -65,6 +66,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     if result["fingerprint"]:
         doc.content_fingerprint = result["fingerprint"]
     db.add(instance)
+    db.flush()
+    enqueue_review_notification(db, settings, doc, instance)
     db.commit()
     db.refresh(instance)
     # Explicitly release body reference after persistence of derived data only.

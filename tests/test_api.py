@@ -27,6 +27,42 @@ def test_dashboard_and_document_endpoints():
         assert queued.status_code == 202
 
 
+def test_baseline_endpoints_and_notification_outbox():
+    from app.config import get_settings
+    from app.db import Document, HistoricalFileNode, HistoricalSnapshot, Notification, ReviewInstance, SessionLocal
+    from app.notify import enqueue_review_notification
+
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            if not db.get(HistoricalSnapshot, "test-snap"):
+                db.add(HistoricalSnapshot(snapshot_id="test-snap", total_file_nodes=2))
+                db.add_all([
+                    HistoricalFileNode(snapshot_id="test-snap", workspace_id="demo-workspace", node_id="hist-A",
+                                       parent_node_id="folder-1", name="历史文档甲.docx", extension="docx",
+                                       source_created_at="2026-07-15T10:00:00+08:00"),
+                    HistoricalFileNode(snapshot_id="test-snap", workspace_id="demo-workspace", node_id="hist-B",
+                                       parent_node_id="folder-1", name="历史文档乙.pdf", extension="pdf",
+                                       source_created_at="2026-07-16T10:00:00+08:00"),
+                ])
+                db.commit()
+        folders = client.get("/api/v1/baseline/workspaces/demo-workspace/folders").json()
+        assert folders["items"] and folders["items"][0]["parent_node_id"] == "folder-1"
+        files = client.get("/api/v1/baseline/files", params={"workspace_id": "demo-workspace", "query": "历史"}).json()
+        assert files["total"] == 2
+
+        # A failed review enqueues exactly when notify is enabled and uploader is known.
+        with SessionLocal() as db:
+            doc = db.query(Document).filter(Document.node_id == "demo-001").one()
+            instance = db.query(ReviewInstance).filter(ReviewInstance.node_id == doc.node_id).first()
+            settings = get_settings().model_copy(update={"notify_enabled": True})
+            instance.verdict = "return"
+            row = enqueue_review_notification(db, settings, doc, instance)
+            assert row is not None and row.target_union_id == doc.uploader_key
+            db.rollback()
+        listing = client.get("/api/v1/notifications").json()
+        assert "notify_enabled" in listing and isinstance(listing["items"], list)
+
+
 def test_connectivity_never_claims_unconfigured_integrations_are_healthy():
     with TestClient(app) as client:
         payload = client.get("/api/v1/diagnostics/connectivity").json()

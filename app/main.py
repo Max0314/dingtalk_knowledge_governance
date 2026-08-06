@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from . import metrics
 from .config import get_settings
-from .db import Document, ModelConfig, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .service import document_dict, review_dict, seed_demo, sync_from_dingtalk, workspace_dict
 
@@ -113,6 +113,67 @@ def metrics_coverage(db: Session = Depends(db_session)):
 @app.get("/api/v1/metrics/workspaces/{workspace_id}/months")
 def metrics_workspace_months(workspace_id: str, db: Session = Depends(db_session)):
     return metrics.workspace_months(db, workspace_id)
+
+
+@app.get("/api/v1/baseline/workspaces/{workspace_id}/folders")
+def baseline_folders(workspace_id: str, limit: int = Query(default=200, ge=1, le=500), db: Session = Depends(db_session)):
+    """Directory groups reconstructed from the frozen scan. Folder names were
+    not captured by the baseline scan, so groups are keyed by parent node id."""
+    rows = db.execute(
+        select(HistoricalFileNode.parent_node_id, func.count(), func.min(HistoricalFileNode.source_created_at), func.max(HistoricalFileNode.source_created_at))
+        .where(HistoricalFileNode.workspace_id == workspace_id)
+        .group_by(HistoricalFileNode.parent_node_id)
+        .order_by(func.count().desc()).limit(limit)).all()
+    total_folders = db.scalar(select(func.count(func.distinct(HistoricalFileNode.parent_node_id))).where(HistoricalFileNode.workspace_id == workspace_id)) or 0
+    return {"workspace_id": workspace_id, "total_folders": total_folders,
+            "note": "基线扫描未记录目录名称，目录以节点 ID 标识；下一次含目录的全量扫描后补全名称。",
+            "items": [{"parent_node_id": r[0] or "(根目录)", "file_count": r[1], "earliest": (r[2] or "")[:10], "latest": (r[3] or "")[:10]} for r in rows]}
+
+
+@app.get("/api/v1/baseline/files")
+def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", offset: int = Query(default=0, ge=0),
+                   limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
+    stmt = select(HistoricalFileNode)
+    if workspace_id:
+        stmt = stmt.where(HistoricalFileNode.workspace_id == workspace_id)
+    if folder:
+        stmt = stmt.where(HistoricalFileNode.parent_node_id == ("" if folder == "(根目录)" else folder))
+    if query:
+        stmt = stmt.where(HistoricalFileNode.name.contains(query))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.scalars(stmt.order_by(HistoricalFileNode.source_created_at.desc()).offset(offset).limit(limit)).all()
+    return {"total": total, "offset": offset, "limit": limit,
+            "items": [{"node_id": r.node_id, "workspace_id": r.workspace_id, "parent_node_id": r.parent_node_id,
+                       "name": r.name, "extension": r.extension, "created_at": r.source_created_at, "updated_at": r.source_updated_at} for r in rows]}
+
+
+class NotifyTestRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=64)
+    title: str = "知识库治理推送测试"
+    text: str = "### 知识库治理推送测试\n如果你看到这条消息，机器人发送链路已打通。"
+
+
+@app.post("/api/v1/notifications/test")
+async def notification_test(payload: NotifyTestRequest):
+    try:
+        result = await DingtalkClient(get_settings()).send_robot_markdown([payload.user_id], payload.title, payload.text)
+        return {"status": "sent", "result": result}
+    except IntegrationError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
+
+
+@app.get("/api/v1/notifications")
+def notifications(status: str = "", limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(db_session)):
+    stmt = select(Notification).order_by(Notification.created_at.desc()).limit(limit)
+    if status:
+        stmt = stmt.where(Notification.status == status)
+    settings = get_settings()
+    return {"notify_enabled": settings.notify_enabled,
+            "robot_code": settings.robot_code or settings.dingtalk_app_key or "(未配置)",
+            "items": [{"id": n.id, "node_id": n.node_id, "status": n.status, "error_code": n.error_code,
+                       "title": n.title, "target_user_id": n.target_user_id,
+                       "created_at": n.created_at.isoformat() if n.created_at else None,
+                       "sent_at": n.sent_at.isoformat() if n.sent_at else None} for n in db.scalars(stmt).all()]}
 
 
 @app.get("/api/v1/workspaces")

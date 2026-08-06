@@ -89,10 +89,24 @@ async function increments(year){const q=year?`?year=${year}`:'';const d=await ap
   document.querySelector('#csvBtn').onclick=()=>{const lines=['月份,全量新增,批量导入,日常新增,批量日'].concat(d.rows.map(r=>`${r.month},${r.total},${r.bulk_import},${r.routine},"${r.bulk_days.map(b=>`${b.day}:${b.files}`).join(';')}"`));
     const blob=new Blob(['﻿'+lines.join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`知识库月度增量${year?'-'+year:''}.csv`;a.click();URL.revokeObjectURL(a.href)}}
 
+function blTable(d){if(!d.items.length)return '<div class="empty">未找到匹配文件。</div>';
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>文件名</th><th>知识库</th><th>类型</th><th>入库时间</th></tr></thead><tbody>${d.items.map(f=>`<tr><td><b>${f.name}</b><br><small>${f.node_id}</small></td><td>${state.coverageNames[f.workspace_id]||f.workspace_id}</td><td>${f.extension||'—'}</td><td>${(f.created_at||'').slice(0,10)}</td></tr>`).join('')}</tbody></table></div>
+  <div class="controls section-gap"><span class="hint">共 ${nf(d.total)} 个 · 第 ${Math.floor(d.offset/d.limit)+1} / ${Math.max(1,Math.ceil(d.total/d.limit))} 页</span><button class="secondary" id="bl-prev" ${d.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="bl-next" ${d.offset+d.limit>=d.total?'disabled':''}>下一页</button></div>`}
+async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',offset:p.offset,limit:50});
+  const d=await api('/api/v1/baseline/files?'+qs);const box=document.querySelector('#bl-results');box.innerHTML=blTable(d);
+  const prev=document.querySelector('#bl-prev'),next=document.querySelector('#bl-next');
+  if(prev)prev.onclick=()=>{p.offset=Math.max(0,p.offset-50);blSearch()};
+  if(next)next.onclick=()=>{p.offset+=50;blSearch()}}
 async function documents(){const d=await api('/api/v1/documents');
-  shell('文档治理','查看文档入库时间、AI 评审实例与重评历史；文档修改后由同步自动重评。',`
-  <section class="card"><div class="card-head"><div class="controls"><input class="input" id="search" placeholder="搜索文档名称"><button class="secondary" id="search-btn">查询</button></div><button class="primary" id="sync">执行增量同步</button></div><div id="document-table">${docTable(d.items)}</div></section>`);
+  if(!Object.keys(state.coverageNames).length){try{const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}catch(e){}}
+  state.bl={query:'',ws:'',offset:0};
+  const wsOpts=['<option value="">全部知识库</option>'].concat(Object.entries(state.coverageNames).map(([k,v])=>`<option value="${k}">${v}</option>`)).join('');
+  shell('文档治理','基线文件可直接检索；实时同步文档在凭据开通后自动进入评审流程。',`
+  <section class="card"><div class="card-head"><h2>基线文件检索（53,908 个，2026-08-05 快照）</h2><div class="controls"><select class="input" id="bl-ws">${wsOpts}</select><input class="input" id="bl-q" placeholder="按文件名搜索"><button class="secondary" id="bl-btn">查询</button></div></div><div id="bl-results"><div class="empty">输入关键字或选择知识库开始检索。</div></div></section>
+  <section class="card section-gap"><div class="card-head"><div class="controls"><input class="input" id="search" placeholder="搜索已同步文档"><button class="secondary" id="search-btn">查询</button></div><button class="primary" id="sync" title="需要钉钉凭据权限开通后使用">执行增量同步</button></div><div id="document-table">${docTable(d.items)}</div></section>`);
   bindDocRows();
+  document.querySelector('#bl-btn').onclick=()=>{state.bl.query=document.querySelector('#bl-q').value;state.bl.ws=document.querySelector('#bl-ws').value;state.bl.offset=0;blSearch()};
+  document.querySelector('#bl-q').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#bl-btn').click()};
   document.querySelector('#search-btn').onclick=async()=>{const q=document.querySelector('#search').value;const r=await api('/api/v1/documents?query='+encodeURIComponent(q));document.querySelector('#document-table').innerHTML=docTable(r.items);bindDocRows()};
   document.querySelector('#sync').onclick=async()=>{toast('同步已提交…');try{const r=await api('/api/v1/sync-runs',{method:'POST'});toast(r.status==='succeeded'?'增量同步完成':'同步未成功：'+(r.error_code||'请看连接诊断'));if(r.status==='succeeded')documents()}catch(e){toast(e.message)}}}
 
@@ -120,10 +134,13 @@ async function workspaces(){const d=await api('/api/v1/metrics/coverage');d.item
   ${d.unreachable&&d.unreachable.length?`<section class="card section-gap"><div class="card-head"><h2>当前授权不可达（按宜搭 2026-04-27 快照，Top ${d.unreachable.length}）</h2><span class="chip amber">待授权</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th class="num">文件数</th></tr></thead><tbody>${d.unreachable.map(u=>`<tr><td>${u.name}</td><td class="num">${nf(u.files)}</td></tr>`).join('')}</tbody></table></div><p class="hint">这些知识库需要把服务身份加为成员后才能纳入统计与评审。</p></section>`:''}`);
   document.querySelectorAll('[data-ws]').forEach(x=>x.onclick=()=>workspaceDetail(x.dataset.ws))}
 
-async function workspaceDetail(id){const[m,g]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),api('/api/v1/workspaces/'+id).catch(()=>null)]);
+async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),api('/api/v1/workspaces/'+id).catch(()=>null),api('/api/v1/baseline/workspaces/'+id+'/folders?limit=100').catch(()=>({items:[],total_folders:0,note:''}))]);
   const name=state.coverageNames[id]||id;
   shell('知识库详情',name,`
   <section class="card"><div class="card-head"><h2>月度入库分布（基线 + 增量，共 ${nf(m.total_files)} 个文件）</h2><button class="secondary" id="back">返回列表</button></div><div id="wsChart" class="chart"></div></section>
+  ${fd.items.length?`<section class="card section-gap"><div class="card-head"><h2>目录分布（共 ${nf(fd.total_folders)} 个目录，按文件数 Top ${fd.items.length}）</h2><span class="hint">${fd.note}</span></div><div class="grid two-cols"><div class="table-wrap" style="max-height:340px;overflow-y:auto"><table class="data-table"><thead><tr><th>目录（节点 ID）</th><th class="num">文件数</th><th>时间跨度</th></tr></thead><tbody>
+    ${fd.items.map(f=>`<tr class="rowlink" data-folder="${f.parent_node_id}"><td><small>${f.parent_node_id}</small></td><td class="num">${nf(f.file_count)}</td><td><small>${f.earliest} ~ ${f.latest}</small></td></tr>`).join('')}
+  </tbody></table></div><div><div class="controls"><input class="input" id="ws-q" placeholder="在本库内按文件名搜索" style="flex:1"><button class="secondary" id="ws-q-btn">搜索</button></div><div id="bl-results" class="section-gap"><div class="empty">点击左侧目录或输入关键字查看文件。</div></div></div></div></section>`:''}
   ${g?`<section class="grid two-cols section-gap"><form class="card" id="governance-form"><h2>治理归属与角色</h2><div class="form-grid" style="margin-top:12px">
     <label class="form-field"><span class="field-label">归属部门 ID</span><input class="input" name="owner_department_id" value="${g.owner_department_id||''}"></label>
     <label class="form-field"><span class="field-label">归属部门名称</span><input class="input" name="owner_department_name" value="${g.owner_department_name||''}"></label>
@@ -133,6 +150,12 @@ async function workspaceDetail(id){const[m,g]=await Promise.all([api('/api/v1/me
     <p class="hint">员工归属以 bi_center 契约为准；仅 matched 且 includeInOfficialStats 的身份进入正式统计。</p><button class="primary">保存治理配置</button></form>
   <section class="card"><h2>基本信息</h2><p class="hint">知识库 ID：${id}</p><p class="hint">创建：${fmt((g.source_created_at||'').slice(0,10))} · 最近更新：${fmt((g.source_updated_at||'').slice(0,10))}</p>${g.url?`<p class="hint"><a href="${g.url}" target="_blank" rel="noopener">在钉钉中打开 ↗</a></p>`:''}<p class="hint">实时同步文档数：${nf(g.document_count)}</p></section></section>`:''}`);
   renderChart('wsChart',stackedOption(m.months.map(x=>({month:x.month,routine:x.count,bulk_import:0}))));
+  state.bl={query:'',ws:id,offset:0};
+  document.querySelectorAll('[data-folder]').forEach(x=>x.onclick=()=>{state.bl={query:'',ws:id,offset:0,folder:x.dataset.folder};blSearch()});
+  const wsBtn=document.querySelector('#ws-q-btn');
+  if(wsBtn)wsBtn.onclick=()=>{state.bl={query:document.querySelector('#ws-q').value,ws:id,offset:0};blSearch()};
+  const wsQ=document.querySelector('#ws-q');
+  if(wsQ)wsQ.onkeydown=e=>{if(e.key==='Enter')wsBtn.click()};
   document.querySelector('#back').onclick=()=>navigate('workspaces');
   const form=document.querySelector('#governance-form');
   if(form)form.onsubmit=async e=>{e.preventDefault();const f=new FormData(e.currentTarget),arr=k=>String(f.get(k)||'').split(',').map(x=>x.trim()).filter(Boolean);
@@ -153,15 +176,22 @@ async function models(){const d=await api('/api/v1/model-configs');
   document.querySelector('#model-form').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.currentTarget);await api('/api/v1/model-configs',{method:'POST',body:JSON.stringify({name:f.get('name'),base_url:f.get('base_url'),model_name:f.get('model_name'),api_key_env_name:f.get('api_key_env_name'),timeout_seconds:Number(f.get('timeout_seconds')),enabled:f.get('enabled')==='true',version:f.get('version')})});toast('模型配置已保存');models()};
   document.querySelectorAll('[data-model-check]').forEach(b=>b.onclick=async()=>{const r=await api('/api/v1/model-configs/'+b.dataset.modelCheck+'/connection-check',{method:'POST'});toast(r.message)})}
 
-async function diagnostics(){const d=await api('/api/v1/diagnostics/connectivity');
+async function diagnostics(){const[d,n]=await Promise.all([api('/api/v1/diagnostics/connectivity'),api('/api/v1/notifications?limit=10').catch(()=>null)]);
   shell('连接诊断',d.body_storage,`
   <section class="card"><h2>外部接口状态</h2>${d.items.map(x=>`<div class="diagnostic"><span class="health ${x.status}"></span><div><b>${x.name}</b><br><small>${x.status}</small></div><span class="message">${x.message}</span></div>`).join('')}<div class="section-gap"><button class="primary" id="refresh">刷新诊断</button></div></section>
+  ${n?`<section class="card section-gap"><div class="card-head"><h2>评审结果推送（机器人）</h2><span class="chip ${n.notify_enabled?'green':'gray'}">${n.notify_enabled?'已启用':'未启用（KG_NOTIFY_ENABLED）'}</span></div>
+    <p class="hint">robotCode：${n.robot_code} · 不合格评审自动入队，worker 逐条发送并留痕。</p>
+    <div class="controls"><input class="input" id="test-uid" placeholder="接收人 userId（如 01115324500438248944）" style="min-width:280px"><button class="secondary" id="test-send">发送测试消息</button></div>
+    ${n.items.length?`<div class="table-wrap section-gap"><table class="data-table"><thead><tr><th>时间</th><th>标题</th><th>接收人</th><th>状态</th><th>错误码</th></tr></thead><tbody>${n.items.map(x=>`<tr><td><small>${(x.created_at||'').replace('T',' ').slice(0,19)}</small></td><td>${x.title||'—'}</td><td><small>${x.target_user_id||'—'}</small></td><td><span class="badge ${x.status==='sent'?'pass':x.status==='failed'?'return':''}">${x.status}</span></td><td><small>${x.error_code||'—'}</small></td></tr>`).join('')}</tbody></table></div>`:'<p class="hint section-gap">暂无推送记录。</p>'}</section>`:''}
   <section class="card section-gap"><h2>上线前检查</h2>
-    <p class="hint">1. 钉钉企业应用开通 Wiki.Workspace.Read、Wiki.Node.Read，operatorId 使用数字员工 UnionID。</p>
+    <p class="hint">1. 钉钉企业应用开通知识库读取与机器人发送权限，并发布版本；operatorId 使用数字员工 UnionID。</p>
     <p class="hint">2. 数字员工需为目标知识库成员；缺失的库在「知识库管理」的待授权清单中。</p>
     <p class="hint">3. bi_center 只读 Token 用于员工/部门归属映射（employeeKey=UnionID）。</p>
     <p class="hint">4. 仅在合规确认后配置正文临时获取网关与模型正文传输策略。</p></section>`);
-  document.querySelector('#refresh').onclick=diagnostics}
+  document.querySelector('#refresh').onclick=diagnostics;
+  const send=document.querySelector('#test-send');
+  if(send)send.onclick=async()=>{const uid=document.querySelector('#test-uid').value.trim();if(!uid)return toast('请填写 userId');
+    try{await api('/api/v1/notifications/test',{method:'POST',body:JSON.stringify({user_id:uid})});toast('已发送，请在钉钉查收')}catch(e){toast(e.message)}}}
 
 /* ---- shell nav ---- */
 const views={overview,increments,documents,workspaces,models,diagnostics};

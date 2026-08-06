@@ -175,6 +175,24 @@ class HistoricalFileNode(Base):
     source_updated_at: Mapped[str] = mapped_column(String(64), default="")
 
 
+class Notification(Base):
+    """Outbox for review-result pushes. Rows are auditable and immutable-ish:
+    the worker only moves status pending -> sent/failed and stamps the error."""
+    __tablename__ = "notifications"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(32), default="robot_o2o")
+    node_id: Mapped[str] = mapped_column(id_string(), default="", index=True)
+    review_instance_id: Mapped[str] = mapped_column(id_string(64), default="")
+    target_union_id: Mapped[str] = mapped_column(id_string(), default="")
+    target_user_id: Mapped[str] = mapped_column(id_string(), default="")
+    title: Mapped[str] = mapped_column(String(255), default="")
+    body: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    error_code: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 def build_engine():
     settings = get_settings()
     if settings.database_url.startswith("sqlite:///"):

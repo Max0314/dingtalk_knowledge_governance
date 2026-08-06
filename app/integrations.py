@@ -1,6 +1,7 @@
 """External read-only adapters. No adapter writes into DingTalk or bi_center."""
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any
@@ -69,6 +70,42 @@ class DingtalkClient:
         payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 30))})
         items = payload.get("nodes", payload.get("data", []))
         return {"items": [normalize_node(item) for item in items], "next_token": payload.get("nextToken", ""), "parent_node_id": parent_node_id}
+
+    async def resolve_user_id(self, union_id: str) -> str:
+        """unionId -> userId via the legacy contact endpoint (same access token)."""
+        if not union_id:
+            return ""
+        token = await self._token_value()
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(
+                "https://oapi.dingtalk.com/topapi/user/getbyunionid",
+                params={"access_token": token}, json={"unionid": union_id},
+            )
+        if response.is_error:
+            raise IntegrationError("dingtalk_union_resolve_failed", f"unionId 解析失败（HTTP {response.status_code}）。", response.status_code)
+        payload = response.json()
+        if payload.get("errcode") != 0:
+            raise IntegrationError("dingtalk_union_resolve_denied", f"unionId 解析被拒：{payload.get('errmsg', '')}", 403)
+        return str(payload.get("result", {}).get("userid", ""))
+
+    async def send_robot_markdown(self, user_ids: list[str], title: str, text: str) -> dict[str, Any]:
+        """One-to-one robot push. Requires the robot capability plus its send scope."""
+        if not user_ids:
+            raise IntegrationError("dingtalk_no_recipient", "缺少接收人 userId。", 400)
+        robot_code = self.settings.robot_code or self.settings.dingtalk_app_key
+        token = await self._token_value()
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+                headers={"x-acs-dingtalk-access-token": token},
+                json={"robotCode": robot_code, "userIds": user_ids[:20], "msgKey": "sampleMarkdown",
+                      "msgParam": json.dumps({"title": title, "text": text}, ensure_ascii=False)},
+            )
+        if response.status_code == 403:
+            raise IntegrationError("dingtalk_robot_permission_denied", "机器人发送权限不足，请在开发者后台开通并发布版本。", 403)
+        if response.is_error:
+            raise IntegrationError("dingtalk_robot_send_failed", f"机器人消息发送失败（HTTP {response.status_code}）。", response.status_code)
+        return response.json()
 
     async def fetch_ephemeral_content(self, node_id: str) -> str:
         """Fetches text only when an explicitly verified content gateway is configured.

@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     bi_center_internal_token: str = Field(default="", validation_alias="BI_CENTER_INTERNAL_TOKEN")
     model_api_key: str = ""
     model_allow_content_transfer: bool = False
+    # Push stays off until the robot permission is granted and a test send passes.
+    notify_enabled: bool = False
+    robot_code: str = ""  # defaults to the app key at call time when empty
 
 
 @lru_cache
