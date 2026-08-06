@@ -49,24 +49,30 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
-async def fetch_nodes(client: DingtalkClient, operator: str, workspace_id: str, parent: str, next_token: str) -> dict:
-    token = await client._token_value()
+async def _get_retry(client: DingtalkClient, path: str, params: dict) -> dict:
+    """GET with retry/backoff. Enumeration and node pages share this: the
+    detached first run died to a single transient failure during workspace
+    enumeration, which had no retry — never again."""
     last = ""
     for attempt in range(RETRIES):
         try:
-            params = {"workspaceId": workspace_id, "operatorId": operator, "parentNodeId": parent, "maxResults": 30}
-            if next_token:
-                params["nextToken"] = next_token
+            token = await client._token_value()
             async with httpx.AsyncClient(timeout=25) as http:
-                response = await http.get("https://api.dingtalk.com/v2.0/wiki/nodes", params=params,
+                response = await http.get(f"https://api.dingtalk.com/v2.0{path}",
+                                          params={k: v for k, v in params.items() if v not in (None, "")},
                                           headers={"x-acs-dingtalk-access-token": token})
             if response.status_code == 200:
                 return response.json()
-            last = f"HTTP {response.status_code}"
+            last = f"HTTP {response.status_code} {response.text[:120]}"
         except httpx.HTTPError as exc:
             last = f"{type(exc).__name__}"
         await asyncio.sleep(1.5 * (attempt + 1))
     raise RuntimeError(last)
+
+
+async def fetch_nodes(client: DingtalkClient, operator: str, workspace_id: str, parent: str, next_token: str) -> dict:
+    return await _get_retry(client, "/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator,
+                                                    "parentNodeId": parent, "nextToken": next_token, "maxResults": 30})
 
 
 async def scan_workspace(client: DingtalkClient, operator: str, space: dict, state: dict) -> None:
@@ -89,6 +95,8 @@ async def scan_workspace(client: DingtalkClient, operator: str, space: dict, sta
                     nodes[node["node_id"]] = {**node, "parent": parent}
             next_token = payload.get("nextToken", "")
             await asyncio.sleep(CALL_PAUSE)
+            if state["calls"] % 50 == 0:
+                save_state(state)  # live progress even inside a large workspace
             if not next_token:
                 break
 
@@ -139,12 +147,14 @@ async def main() -> None:
             db.commit()
 
     state = load_state()
+    save_state(state)
     spaces = []
     token = ""
     while True:
-        page = await client.list_workspaces(operator, next_token=token, max_results=30)
-        spaces += page["items"]
-        token = page.get("next_token", "")
+        payload = await _get_retry(client, "/wiki/workspaces", {"operatorId": operator, "nextToken": token, "maxResults": 30})
+        spaces += [{"workspace_id": w.get("workspaceId", ""), "name": w.get("name", ""), "root_node_id": w.get("rootNodeId", "")}
+                   for w in payload.get("workspaces", [])]
+        token = payload.get("nextToken", "")
         if not token:
             break
     todo = [s for s in spaces if s["workspace_id"] not in state["done"] and s["name"] not in EXCLUDED_NAMES]
@@ -170,4 +180,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        import traceback
+        Path("/app/uploader_scan_error.log").write_text(traceback.format_exc(), encoding="utf-8")
+        raise
