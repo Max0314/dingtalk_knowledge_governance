@@ -46,8 +46,10 @@ class DingtalkClient:
 
     async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         token = await self._token_value()
+        # httpx serializes None as an empty string; DingTalk rejects e.g. nextToken= with HTTP 400.
+        cleaned = {key: value for key, value in params.items() if value not in (None, "")}
         async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(f"https://api.dingtalk.com/v2.0{path}", params=params, headers={"x-acs-dingtalk-access-token": token})
+            response = await client.get(f"https://api.dingtalk.com/v2.0{path}", params=cleaned, headers={"x-acs-dingtalk-access-token": token})
         if response.status_code == 403:
             raise IntegrationError("dingtalk_permission_denied", "钉钉权限不足，请检查 Wiki.Workspace.Read、Wiki.Node.Read 和 operatorId 的访问权限。", 403)
         if response.is_error:
