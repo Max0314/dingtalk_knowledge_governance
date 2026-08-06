@@ -169,8 +169,11 @@ def build_engine():
         db_path = settings.database_url.removeprefix("sqlite:///")
         if db_path and db_path != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    extra = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {"pool_pre_ping": True}
-    return create_engine(settings.database_url, connect_args=extra)
+    if settings.database_url.startswith("sqlite"):
+        return create_engine(settings.database_url, connect_args={"check_same_thread": False})
+    # pool_pre_ping is an engine option, not a DBAPI connect arg; pool_recycle
+    # keeps pooled connections younger than MySQL's wait_timeout.
+    return create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=3600)
 
 
 engine = build_engine()
