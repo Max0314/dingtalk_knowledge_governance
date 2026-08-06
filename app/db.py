@@ -220,6 +220,17 @@ class AuthSession(Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class StreamEvent(Base):
+    """Raw DingTalk push events (Stream mode), kept for processing and audit."""
+    __tablename__ = "stream_events"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(128), index=True)
+    biz_id: Mapped[str] = mapped_column(String(128), default="")
+    payload: Mapped[str] = mapped_column(Text, default="")
+    processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class Notification(Base):
     """Outbox for review-result pushes. Rows are auditable and immutable-ish:
     the worker only moves status pending -> sent/failed and stamps the error."""

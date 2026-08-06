@@ -3,10 +3,12 @@ from .config import get_settings
 from .db import SessionLocal, init_db
 from .notify import process_pending_notifications
 from .service import process_next_job, seed_demo
+from .stream import start_stream_consumer
 
 
 def main() -> None:
     settings = get_settings(); init_db()
+    start_stream_consumer(settings)
     with SessionLocal() as db:
         if settings.demo_mode: seed_demo(db)
     while True:

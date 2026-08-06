@@ -192,6 +192,18 @@ async def notification_test(payload: NotifyTestRequest):
         raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
+@app.get("/api/v1/stream-events")
+def stream_events(limit: int = Query(default=20, ge=1, le=100), event_type: str = "", db: Session = Depends(db_session)):
+    from .db import StreamEvent
+    stmt = select(StreamEvent).order_by(StreamEvent.received_at.desc()).limit(limit)
+    if event_type:
+        stmt = stmt.where(StreamEvent.event_type == event_type)
+    return {"stream_enabled": get_settings().stream_enabled,
+            "items": [{"id": e.id, "event_type": e.event_type, "biz_id": e.biz_id,
+                       "received_at": e.received_at.isoformat() if e.received_at else None,
+                       "payload": e.payload[:2000]} for e in db.scalars(stmt).all()]}
+
+
 @app.get("/api/v1/notifications")
 def notifications(status: str = "", limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(db_session)):
     stmt = select(Notification).order_by(Notification.created_at.desc()).limit(limit)

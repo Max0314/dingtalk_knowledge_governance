@@ -72,7 +72,7 @@ async def _get_retry(client: DingtalkClient, path: str, params: dict) -> dict:
 
 async def fetch_nodes(client: DingtalkClient, operator: str, workspace_id: str, parent: str, next_token: str) -> dict:
     return await _get_retry(client, "/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator,
-                                                    "parentNodeId": parent, "nextToken": next_token, "maxResults": 30})
+                                                    "parentNodeId": parent, "nextToken": next_token, "maxResults": 100})
 
 
 async def scan_workspace(client: DingtalkClient, operator: str, space: dict, state: dict) -> None:

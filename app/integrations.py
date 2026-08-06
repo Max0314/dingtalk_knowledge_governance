@@ -66,10 +66,12 @@ class DingtalkClient:
     async def workspace_detail(self, workspace_id: str, operator_id: str) -> dict[str, Any]:
         return normalize_workspace(await self._get(f"/wiki/workspaces/{workspace_id}", {"operatorId": operator_id}))
 
-    async def list_nodes(self, workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 30) -> dict[str, Any]:
+    async def list_nodes(self, workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 100) -> dict[str, Any]:
         if not parent_node_id:
             parent_node_id = (await self.workspace_detail(workspace_id, operator_id)).get("root_node_id", "")
-        payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 30))})
+        # The documented page cap is 30, but the API accepts 100 (verified live
+        # 2026-08-06) — a 70% cut in enumeration quota.
+        payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 100))})
         items = payload.get("nodes", payload.get("data", []))
         return {"items": [normalize_node(item) for item in items], "next_token": payload.get("nextToken", ""), "parent_node_id": parent_node_id}
 

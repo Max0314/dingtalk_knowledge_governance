@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     # Push stays off until the robot permission is granted and a test send passes.
     notify_enabled: bool = False
     robot_code: str = ""  # defaults to the app key at call time when empty
+    # Stream-mode event consumer (file-change events land in stream_events).
+    stream_enabled: bool = False
     # DingTalk login guard for /api/*. Off by default so local dev and tests
     # run open; the server .env turns it on with a real secret.
     auth_enabled: bool = False
