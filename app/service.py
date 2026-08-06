@@ -98,10 +98,11 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
             run.documents_seen += 1
             doc = db.get(Document, item["node_id"])
             is_new = doc is None
+            changed = doc is not None and doc.source_updated_at != item.get("updated_at", "")
             if not doc:
                 doc = Document(node_id=item["node_id"], workspace_id=workspace_id, name=item["name"])
                 db.add(doc); run.documents_new += 1
-            elif doc.source_updated_at != item.get("updated_at", ""):
+            elif changed:
                 run.documents_changed += 1
             for field in ("name", "category", "extension", "url", "size", "word_count", "source_created_at", "source_updated_at"):
                 setattr(doc, field, item.get(field, "") if item.get(field) is not None else "")
@@ -117,9 +118,12 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
                 doc.org_matched = True
             else:
                 doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-            if is_new and not doc.is_folder:
+            if (is_new or changed) and not doc.is_folder:
                 db.flush()
-                db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id, trigger="sync", requested_by="system"))
+                pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
+                if not pending:
+                    db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
+                                     trigger="sync" if is_new else "sync_change", requested_by="system"))
 
         async def walk(workspace_id: str, parent_node_id: str) -> None:
             next_token = ""

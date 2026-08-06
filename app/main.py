@@ -8,6 +8,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from . import metrics
 from .config import get_settings
 from .db import Document, ModelConfig, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
@@ -71,23 +72,47 @@ def health():
 
 
 @app.get("/api/v1/dashboard/overview")
-def dashboard(month: str = Query(default=""), db: Session = Depends(db_session)):
-    documents = db.scalar(select(func.count()).select_from(Document).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))) or 0
+def dashboard(db: Session = Depends(db_session)):
     workspaces = db.scalar(select(func.count()).select_from(Workspace)) or 0
     reviews = db.scalars(select(ReviewInstance).order_by(ReviewInstance.created_at.desc())).all()
     average = round(sum(x.ai_score for x in reviews) / len(reviews), 1) if reviews else None
-    month_prefix = month or datetime.now(timezone.utc).strftime("%Y-%m")
-    new_docs = db.scalar(select(func.count()).select_from(Document).where(Document.source_created_at.startswith(month_prefix), Document.is_folder.is_(False))) or 0
-    history = []
-    for i in range(5, -1, -1):
-        # In DB portability-friendly form use source date prefix and let UI render the recent buckets.
-        history.append({"month": month_prefix if i == 0 else f"历史-{i}", "count": new_docs if i == 0 else 0})
+    increments = metrics.monthly_increments(db)
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    month_row = next((row for row in increments["rows"] if row["month"] == current_month), None)
     latest = []
     for doc in db.scalars(select(Document).where(Document.is_folder.is_(False)).order_by(Document.discovered_at.desc()).limit(8)).all():
         review = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == doc.node_id).order_by(ReviewInstance.created_at.desc()))
         count = db.scalar(select(func.count()).select_from(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)) or 0
         latest.append(document_dict(doc, review, max(0, count - 1)))
-    return {"metrics": {"workspace_count": workspaces, "document_count": documents, "month_increment": new_docs, "average_ai_score": average}, "monthly": history, "latest_documents": latest}
+    coverage_summary = metrics.coverage(db)["summary"] if workspaces else {"visible_workspaces": 0, "scanned": 0, "empty": 0, "excluded": 0}
+    return {
+        "metrics": {
+            "workspace_count": workspaces,
+            "total_files": increments["total_files"],
+            "month_increment": month_row["total"] if month_row else 0,
+            "average_ai_score": average,
+        },
+        "coverage_summary": coverage_summary,
+        "org_context": increments["baseline"]["definition"].get("org_context", {}),
+        "monthly": increments["rows"][-14:],
+        "yearly": increments["yearly"],
+        "latest_documents": latest,
+    }
+
+
+@app.get("/api/v1/metrics/monthly-increments")
+def metrics_monthly(year: str = Query(default="", pattern=r"^$|^\d{4}$"), db: Session = Depends(db_session)):
+    return metrics.monthly_increments(db, year)
+
+
+@app.get("/api/v1/metrics/coverage")
+def metrics_coverage(db: Session = Depends(db_session)):
+    return metrics.coverage(db)
+
+
+@app.get("/api/v1/metrics/workspaces/{workspace_id}/months")
+def metrics_workspace_months(workspace_id: str, db: Session = Depends(db_session)):
+    return metrics.workspace_months(db, workspace_id)
 
 
 @app.get("/api/v1/workspaces")

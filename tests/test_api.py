@@ -12,7 +12,13 @@ def test_dashboard_and_document_endpoints():
         assert client.get("/api/health").json()["status"] == "ok"
         overview = client.get("/api/v1/dashboard/overview")
         assert overview.status_code == 200
-        assert overview.json()["metrics"]["document_count"] >= 3
+        assert overview.json()["metrics"]["total_files"] >= 3
+        increments = client.get("/api/v1/metrics/monthly-increments")
+        assert increments.status_code == 200
+        assert sum(row["total"] for row in increments.json()["rows"]) >= 3
+        coverage = client.get("/api/v1/metrics/coverage")
+        assert coverage.status_code == 200
+        assert coverage.json()["summary"]["visible_workspaces"] >= 1
         docs = client.get("/api/v1/documents").json()["items"]
         assert docs
         detail = client.get(f"/api/v1/documents/{docs[0]['node_id']}")

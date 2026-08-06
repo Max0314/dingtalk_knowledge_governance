@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "kg-local",
+      "runtimeExecutable": "C:\\Users\\陈鹏列\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
+      "runtimeArgs": ["scripts/dev_server.py"],
+      "port": 39021
+    }
+  ]
+}

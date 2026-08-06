@@ -1,12 +1,16 @@
 """Import a completed metadata-only DingTalk history snapshot into the governance DB.
 
-Two input formats:
-  * collector JSON: {"status": "completed", "nodes": [...], "totals": {...}}
-  * scan NDJSON (*.ndjson): one node object per line, as produced by the
-    2026-08-05 full wiki scan (runtime/dataset/wiki_scan_nodes.ndjson).
-    Totals are derived from the nodes; duplicate node_ids are collapsed.
+Inputs:
+  --input          collector JSON ({"status":"completed","nodes":[...]}) or scan
+                   NDJSON (one node per line, from the 2026-08-05 full scan)
+  --snapshot-id    immutable id; re-import of an existing id is refused
+  --workspaces     optional wiki_workspaces.json (dws space list capture) to
+                   upsert Workspace rows so the UI knows names and URLs
+  --context        optional JSON with coverage context stored into the
+                   snapshot definition: org_context, excluded_workspaces,
+                   unreachable_top
 
-Snapshots are immutable: re-importing an existing snapshot_id is refused.
+Metadata only: no document body is read or stored.
 """
 from __future__ import annotations
 
@@ -15,7 +19,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.db import HistoricalFileNode, HistoricalSnapshot, SessionLocal, init_db
+from app.db import HistoricalFileNode, HistoricalSnapshot, SessionLocal, Workspace, init_db
 
 
 def load_collector_json(path: Path) -> list[dict]:
@@ -38,17 +42,37 @@ def load_ndjson(path: Path) -> list[dict]:
     return list(nodes.values())
 
 
+def upsert_workspaces(db, path: Path) -> int:
+    items = json.loads(path.read_text(encoding="utf-8"))["items"]
+    for raw in items:
+        workspace = db.get(Workspace, raw["workspaceId"])
+        if not workspace:
+            workspace = Workspace(workspace_id=raw["workspaceId"], name=raw.get("name", ""))
+            db.add(workspace)
+        workspace.name = raw.get("name", workspace.name)
+        workspace.url = raw.get("spaceUrl", "") or workspace.url
+        workspace.source_created_at = raw.get("created_at", "") or workspace.source_created_at
+        workspace.source_updated_at = raw.get("updated_at", "") or workspace.source_updated_at
+    return len(items)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Collector JSON or scan NDJSON with metadata-only nodes.")
+    parser.add_argument("--input", required=True)
     parser.add_argument("--snapshot-id", required=True)
     parser.add_argument("--scope", default="current_authorization_accessible_org_wiki_spaces")
+    parser.add_argument("--workspaces", default="")
+    parser.add_argument("--context", default="")
     args = parser.parse_args()
 
     path = Path(args.input)
     nodes = load_ndjson(path) if path.suffix == ".ndjson" else load_collector_json(path)
     if not nodes:
         raise SystemExit("No file nodes found in the input.")
+
+    definition = {"include": "non-folder nodes", "year_attribution": "source createTime in Asia/Shanghai", "body_storage": "disabled"}
+    if args.context:
+        definition.update(json.loads(Path(args.context).read_text(encoding="utf-8")))
 
     def year_count(year: str) -> int:
         return sum(1 for item in nodes if (item.get("created_at") or "").startswith(year))
@@ -57,6 +81,7 @@ def main() -> None:
     with SessionLocal() as db:
         if db.get(HistoricalSnapshot, args.snapshot_id):
             raise SystemExit(f"Snapshot {args.snapshot_id} already exists; immutable snapshots cannot be overwritten.")
+        workspace_count = upsert_workspaces(db, Path(args.workspaces)) if args.workspaces else 0
         snapshot = HistoricalSnapshot(
             snapshot_id=args.snapshot_id,
             source="dingtalk",
@@ -64,7 +89,7 @@ def main() -> None:
             timezone="Asia/Shanghai",
             status="completed",
             collected_at=datetime.now(timezone.utc),
-            definition={"include": "non-folder nodes", "year_attribution": "source createTime in Asia/Shanghai", "body_storage": "disabled"},
+            definition=definition,
             total_file_nodes=len(nodes),
             created_2025=year_count("2025"),
             created_2026=year_count("2026"),
@@ -76,6 +101,7 @@ def main() -> None:
                 snapshot_id=args.snapshot_id,
                 workspace_id=item["workspace_id"],
                 node_id=item["node_id"],
+                parent_node_id=item.get("parent_node_id", ""),
                 name=item.get("name", ""),
                 node_type=item.get("node_type", ""),
                 extension=item.get("extension", ""),
@@ -84,7 +110,7 @@ def main() -> None:
             ) for item in nodes[offset:offset + 500])
             db.flush()
         db.commit()
-    print(json.dumps({"snapshot_id": args.snapshot_id, "nodes": len(nodes), "status": "imported"}, ensure_ascii=False))
+    print(json.dumps({"snapshot_id": args.snapshot_id, "nodes": len(nodes), "workspaces": workspace_count, "status": "imported"}, ensure_ascii=False))
 
 
 if __name__ == "__main__":

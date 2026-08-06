@@ -167,6 +167,7 @@ class HistoricalFileNode(Base):
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
     node_id: Mapped[str] = mapped_column(id_string(), index=True)
+    parent_node_id: Mapped[str] = mapped_column(id_string(), default="")
     name: Mapped[str] = mapped_column(String(512), default="")
     node_type: Mapped[str] = mapped_column(String(64), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
