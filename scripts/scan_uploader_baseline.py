@@ -77,7 +77,7 @@ async def fetch_nodes(client: DingtalkClient, operator: str, workspace_id: str, 
 
 async def scan_workspace(client: DingtalkClient, operator: str, space: dict, state: dict) -> None:
     workspace_id, name = space["workspace_id"], space["name"]
-    nodes: dict[str, dict] = {}
+    nodes: dict[str, dict] = {}  # files AND folders — the folder names are the topology
     stack = [space.get("root_node_id", "")]
     while stack:
         parent = stack.pop()
@@ -91,7 +91,7 @@ async def scan_workspace(client: DingtalkClient, operator: str, space: dict, sta
                 node = normalize_node(raw)
                 if node["has_children"]:
                     stack.append(node["node_id"])
-                if node["type"] == "FILE" and node["node_id"]:
+                if node["node_id"]:
                     nodes[node["node_id"]] = {**node, "parent": parent}
             next_token = payload.get("nextToken", "")
             await asyncio.sleep(CALL_PAUSE)
@@ -100,22 +100,27 @@ async def scan_workspace(client: DingtalkClient, operator: str, space: dict, sta
             if not next_token:
                 break
 
+    items = list(nodes.values())
+    files = [item for item in items if item["type"] == "FILE"]
     with SessionLocal() as db:
         db.execute(delete(HistoricalFileNode).where(HistoricalFileNode.snapshot_id == SNAPSHOT_ID,
                                                     HistoricalFileNode.workspace_id == workspace_id))
         db.execute(delete(UploaderMonthStat).where(UploaderMonthStat.snapshot_id == SNAPSHOT_ID,
                                                    UploaderMonthStat.workspace_id == workspace_id))
-        items = list(nodes.values())
         for offset in range(0, len(items), 500):
             db.add_all(HistoricalFileNode(
                 snapshot_id=SNAPSHOT_ID, workspace_id=workspace_id, node_id=item["node_id"],
-                parent_node_id=item["parent"], name=item["name"], node_type="file",
-                extension=item["extension"], creator_user_id=item["creator_id"],
+                parent_node_id=item["parent"], name=item["name"],
+                node_type="file" if item["type"] == "FILE" else "folder",
+                extension=item["extension"], category=item.get("category", ""),
+                url=item.get("url", ""), size=int(item.get("size") or 0),
+                word_count=int(item.get("word_count") or 0),
+                creator_user_id=item["creator_id"], modifier_user_id=item.get("modifier_id", ""),
                 source_created_at=item["created_at"], source_updated_at=item["updated_at"],
             ) for item in items[offset:offset + 500])
             db.flush()
         aggregate: dict[tuple[str, str], int] = {}
-        for item in items:
+        for item in files:
             month = (item["created_at"] or "")[:7]
             if len(month) == 7:
                 key = (item["creator_id"], month)
@@ -125,12 +130,13 @@ async def scan_workspace(client: DingtalkClient, operator: str, space: dict, sta
                    for (creator, month), count in aggregate.items())
         snapshot = db.get(HistoricalSnapshot, SNAPSHOT_ID)
         definition = dict(snapshot.definition or {})
-        definition.setdefault("workspaces", {})[workspace_id] = name
+        definition.setdefault("workspaces", {})[workspace_id] = {"name": name, "root": space.get("root_node_id", "")}
         snapshot.definition = definition
-        snapshot.total_file_nodes = (snapshot.total_file_nodes or 0) + len(items)
+        snapshot.total_file_nodes = (snapshot.total_file_nodes or 0) + len(files)
         db.commit()
-    state["done"][workspace_id] = {"name": name, "files": len(items)}
-    state["files"] += len(items)
+    state["done"][workspace_id] = {"name": name, "files": len(files), "folders": len(items) - len(files)}
+    state["files"] += len(files)
+    state["folders"] = state.get("folders", 0) + len(items) - len(files)
 
 
 async def main() -> None:
@@ -174,6 +180,12 @@ async def main() -> None:
     with SessionLocal() as db:
         snapshot = db.get(HistoricalSnapshot, SNAPSHOT_ID)
         snapshot.status = state["status"]
+        definition = dict(snapshot.definition or {})
+        definition["scan_stats"] = {"calls": state["calls"], "files": state["files"],
+                                    "folders": state.get("folders", 0), "spaces_done": len(state["done"]),
+                                    "failures": state["failures"], "started_at": state.get("started_at", ""),
+                                    "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        snapshot.definition = definition
         db.commit()
     print(json.dumps({"status": state["status"], "done": len(state["done"]), "files": state["files"],
                       "calls": state["calls"], "failures": len(state["failures"])}, ensure_ascii=False), flush=True)

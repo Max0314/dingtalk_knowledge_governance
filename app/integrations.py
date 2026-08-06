@@ -160,7 +160,7 @@ def normalize_workspace(item: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_node(item: dict[str, Any]) -> dict[str, Any]:
     stats = item.get("statisticalInfo") or {}
-    return {"source": "dingtalk", "node_id": item.get("nodeId", ""), "workspace_id": item.get("workspaceId", ""), "name": item.get("name", ""), "type": item.get("type", ""), "category": item.get("category", ""), "extension": item.get("extension", ""), "url": item.get("url", ""), "size": item.get("size", 0) or 0, "has_children": bool(item.get("hasChildren")), "word_count": stats.get("wordCount", 0) or 0, "permission_role": item.get("permissionRole", ""), "creator_id": item.get("creatorId", ""), "created_at": item.get("createTime", ""), "updated_at": item.get("modifiedTime", "")}
+    return {"source": "dingtalk", "node_id": item.get("nodeId", ""), "workspace_id": item.get("workspaceId", ""), "name": item.get("name", ""), "type": item.get("type", ""), "category": item.get("category", ""), "extension": item.get("extension", ""), "url": item.get("url", "") or item.get("docUrl", ""), "size": item.get("size", 0) or 0, "has_children": bool(item.get("hasChildren")), "word_count": stats.get("wordCount", 0) or 0, "permission_role": item.get("permissionRole", ""), "creator_id": item.get("creatorId", ""), "modifier_id": item.get("modifierId", ""), "created_at": item.get("createTime", ""), "updated_at": item.get("modifiedTime", "")}
 
 
 async def model_connection_check(config: dict[str, Any], settings: Settings) -> dict[str, Any]:

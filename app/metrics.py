@@ -43,10 +43,14 @@ def primary_snapshot_id(db: Session) -> str:
     namespace) must NOT leak into the increment series, or the headline totals
     would silently double-count the same knowledge bases.
     """
-    for snapshot in db.scalars(select(HistoricalSnapshot)).all():
+    snapshots = db.scalars(select(HistoricalSnapshot).order_by(HistoricalSnapshot.collected_at)).all()
+    for snapshot in snapshots:
         if (snapshot.definition or {}).get("is_primary_baseline"):
             return snapshot.snapshot_id
-    return "wiki-baseline-2026-08-05"
+    for snapshot in snapshots:
+        if snapshot.snapshot_id == "wiki-baseline-2026-08-05":
+            return snapshot.snapshot_id
+    return snapshots[0].snapshot_id if snapshots else ""
 
 
 def _collect(db: Session) -> dict[str, Any]:

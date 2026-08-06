@@ -171,7 +171,12 @@ class HistoricalFileNode(Base):
     name: Mapped[str] = mapped_column(String(512), default="")
     node_type: Mapped[str] = mapped_column(String(64), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
+    category: Mapped[str] = mapped_column(String(64), default="")
+    url: Mapped[str] = mapped_column(String(1024), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    word_count: Mapped[int] = mapped_column(Integer, default=0)
     creator_user_id: Mapped[str] = mapped_column(id_string(), default="")
+    modifier_user_id: Mapped[str] = mapped_column(id_string(), default="")
     source_created_at: Mapped[str] = mapped_column(String(64), default="")
     source_updated_at: Mapped[str] = mapped_column(String(64), default="")
 

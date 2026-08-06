@@ -146,24 +146,34 @@ def departments_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
 
 
 @app.get("/api/v1/baseline/workspaces/{workspace_id}/folders")
-def baseline_folders(workspace_id: str, limit: int = Query(default=200, ge=1, le=500), db: Session = Depends(db_session)):
-    """Directory groups reconstructed from the frozen scan. Folder names were
-    not captured by the baseline scan, so groups are keyed by parent node id."""
+def baseline_folders(workspace_id: str, snapshot_id: str = "", limit: int = Query(default=200, ge=1, le=500), db: Session = Depends(db_session)):
+    """Directory groups within one snapshot. When the snapshot recorded folder
+    nodes (the 2026-08 uploader scan does), folder names come back too."""
+    snapshot = snapshot_id or metrics.primary_snapshot_id(db)
     rows = db.execute(
         select(HistoricalFileNode.parent_node_id, func.count(), func.min(HistoricalFileNode.source_created_at), func.max(HistoricalFileNode.source_created_at))
-        .where(HistoricalFileNode.workspace_id == workspace_id)
+        .where(HistoricalFileNode.workspace_id == workspace_id, HistoricalFileNode.snapshot_id == snapshot,
+               HistoricalFileNode.node_type != "folder")
         .group_by(HistoricalFileNode.parent_node_id)
         .order_by(func.count().desc()).limit(limit)).all()
-    total_folders = db.scalar(select(func.count(func.distinct(HistoricalFileNode.parent_node_id))).where(HistoricalFileNode.workspace_id == workspace_id)) or 0
-    return {"workspace_id": workspace_id, "total_folders": total_folders,
-            "note": "基线扫描未记录目录名称，目录以节点 ID 标识；下一次含目录的全量扫描后补全名称。",
-            "items": [{"parent_node_id": r[0] or "(根目录)", "file_count": r[1], "earliest": (r[2] or "")[:10], "latest": (r[3] or "")[:10]} for r in rows]}
+    folder_names = {r[0]: r[1] for r in db.execute(
+        select(HistoricalFileNode.node_id, HistoricalFileNode.name)
+        .where(HistoricalFileNode.workspace_id == workspace_id, HistoricalFileNode.snapshot_id == snapshot,
+               HistoricalFileNode.node_type == "folder")).all()}
+    total_folders = len(rows)
+    return {"workspace_id": workspace_id, "snapshot_id": snapshot, "total_folders": total_folders,
+            "note": "" if folder_names else "该快照未记录目录名称，目录以节点 ID 标识。",
+            "items": [{"parent_node_id": r[0] or "(根目录)", "folder_name": folder_names.get(r[0], ""),
+                       "file_count": r[1], "earliest": (r[2] or "")[:10], "latest": (r[3] or "")[:10]} for r in rows]}
 
 
 @app.get("/api/v1/baseline/files")
-def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", offset: int = Query(default=0, ge=0),
+def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", snapshot_id: str = "",
+                   offset: int = Query(default=0, ge=0),
                    limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
-    stmt = select(HistoricalFileNode)
+    stmt = select(HistoricalFileNode).where(
+        HistoricalFileNode.snapshot_id == (snapshot_id or metrics.primary_snapshot_id(db)),
+        HistoricalFileNode.node_type != "folder")
     if workspace_id:
         stmt = stmt.where(HistoricalFileNode.workspace_id == workspace_id)
     if folder:
