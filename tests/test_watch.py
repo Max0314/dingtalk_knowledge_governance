@@ -38,7 +38,9 @@ class FakeClient:
                           "has_children": node.get("has_children", False), "creator_id": "tester",
                           "created_at": node.get("created_at", "2026-08-07T09:00:00"),
                           "updated_at": node.get("updated_at", "2026-08-07T09:00:00")})
-        return {"items": items, "next_token": "", "parent_node_id": parent_node_id or "root"}
+        # The real listing re-emits nodes (observed ~2x on a personal space);
+        # duplicating here locks in the walker's same-cycle dedup.
+        return {"items": items * 2, "next_token": "", "parent_node_id": parent_node_id or "root"}
 
 
 def node(node_id, parent="root", **extra):

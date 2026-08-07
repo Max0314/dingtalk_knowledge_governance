@@ -125,8 +125,11 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     doc.watch_misses = 0
     if is_new or changed:
         doc.uploader_key = item.get("creator_id", "") or doc.uploader_key
-        # bi_center is the single source of organization truth. Never infer a department locally.
-        resolved = await BiCenterClient(settings).resolve_batch([{"unionId": doc.uploader_key}], datetime.now(timezone.utc).strftime("%Y-%m")) if doc.uploader_key else []
+        # bi_center is the single source of organization truth. Never infer a
+        # department locally. The old wiki namespace reports creators as
+        # UnionIDs, the new one as numeric userIds — send the matching key.
+        identity_input = {"userId": doc.uploader_key} if doc.uploader_key.isdigit() else {"unionId": doc.uploader_key}
+        resolved = await BiCenterClient(settings).resolve_batch([identity_input], datetime.now(timezone.utc).strftime("%Y-%m")) if doc.uploader_key else []
         identity = resolved[0] if resolved else {}
         if identity.get("matched") and identity.get("includeInOfficialStats"):
             doc.uploader_key = identity.get("employeeKey", doc.uploader_key)
@@ -276,6 +279,11 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
             while True:
                 page = await client.list_nodes(workspace_id, operator, parent_node_id, next_token, max_results=100)
                 for item in page["items"]:
+                    # The listing demonstrably re-emits nodes (a personal-space
+                    # walk yielded ~2x rows); a second sight in the same cycle
+                    # must be skipped or the pending INSERT collides on the PK.
+                    if item["node_id"] in seen:
+                        continue
                     seen.add(item["node_id"])
                     await _upsert_document(db, settings, run, workspace_id, item, enqueue=not seeding,
                                            trigger_new="watch", trigger_change="watch_change")
@@ -295,10 +303,17 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
                 doc.is_deleted = True
         run.status, run.finished_at = "succeeded", utcnow()
     except IntegrationError as exc:
+        db.rollback()
         run.status, run.error_code, run.finished_at = "failed", f"{exc.code}:{exc.status_code}"[:64], utcnow()
     except Exception:
+        db.rollback()
         run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        run.status, run.error_code, run.finished_at = "failed", "watch_commit_failed", utcnow()
+        db.commit()
     return run
 
 

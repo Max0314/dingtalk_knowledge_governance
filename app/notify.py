@@ -66,7 +66,10 @@ def process_pending_notifications(db: Session, settings: Settings, batch: int = 
             row.status, row.error_code = "skipped", "notify_disabled"
             continue
         try:
-            user_id = row.target_user_id or asyncio.run(client.resolve_user_id(row.target_union_id))
+            # New-namespace uploader keys are already numeric userIds; only
+            # UnionIDs need the conversion round-trip.
+            user_id = row.target_user_id or (row.target_union_id if row.target_union_id.isdigit()
+                                             else asyncio.run(client.resolve_user_id(row.target_union_id)))
             if not user_id:
                 row.status, row.error_code = "failed", "user_id_not_resolved"
                 continue
