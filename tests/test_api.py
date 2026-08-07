@@ -45,9 +45,11 @@ def test_baseline_endpoints_and_notification_outbox():
                                        source_created_at="2026-07-16T10:00:00+08:00"),
                 ])
                 db.commit()
-        folders = client.get("/api/v1/baseline/workspaces/demo-workspace/folders").json()
+        # snapshot_id passed explicitly: uploader stats seeded by a sibling test
+        # would otherwise win the default-snapshot pick and empty the listing.
+        folders = client.get("/api/v1/baseline/workspaces/demo-workspace/folders", params={"snapshot_id": "test-snap"}).json()
         assert folders["items"] and folders["items"][0]["parent_node_id"] == "folder-1"
-        files = client.get("/api/v1/baseline/files", params={"workspace_id": "demo-workspace", "query": "历史"}).json()
+        files = client.get("/api/v1/baseline/files", params={"workspace_id": "demo-workspace", "query": "历史", "snapshot_id": "test-snap"}).json()
         assert files["total"] == 2
 
         # A failed review enqueues exactly when notify is enabled and uploader is known.

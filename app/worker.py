@@ -10,6 +10,7 @@ logger = logging.getLogger("kg.worker")
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     settings = get_settings(); init_db()
     start_stream_consumer(settings)
     with SessionLocal() as db:

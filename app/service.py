@@ -230,22 +230,30 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
             if space["workspace_id"] in seen_ids:
                 continue
             seen_ids.add(space["workspace_id"])
-            resolved.append({"token": token, "workspace_id": space["workspace_id"], "name": space.get("name", "")})
+            # Keep the whole normalized listing item: the detail endpoint fails
+            # for some (personal) spaces, so the walk must reuse rootNodeId and
+            # metadata from the listing — exactly what the baseline scanner does.
+            resolved.append({"token": token, "workspace_id": space["workspace_id"], "name": space.get("name", ""),
+                             "space": space})
     _watch_cache.update(at=time.time(), key=key, resolved=resolved, unresolved=unresolved)
     return {"resolved": resolved, "unresolved": unresolved}
 
 
-async def watch_workspace(db: Session, settings: Settings, workspace_id: str) -> SyncRun:
+async def watch_workspace(db: Session, settings: Settings, workspace_id: str, space: dict | None = None) -> SyncRun:
     """One complete walk of one workspace. The first walk (empty mirror) seeds
     without queueing reviews — 482 pre-existing files must not flood the queue
     on day one; every later walk queues reviews for new/changed files and
-    counts absences toward soft deletion."""
+    counts absences toward soft deletion.
+
+    ``space`` is the normalized workspace listing item; when given, the walk
+    trusts its rootNodeId instead of calling the detail endpoint, which fails
+    for some personal spaces."""
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode="watch")
     db.add(run); db.commit()
     client = DingtalkClient(settings)
     operator = settings.dingtalk_sync_operator_id
     try:
-        raw = await client.workspace_detail(workspace_id, operator)
+        raw = space if space and space.get("root_node_id") else await client.workspace_detail(workspace_id, operator)
         ws = db.get(Workspace, workspace_id)
         if not ws:
             ws = Workspace(workspace_id=workspace_id, name=raw.get("name", "") or workspace_id)
@@ -287,7 +295,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str) ->
                 doc.is_deleted = True
         run.status, run.finished_at = "succeeded", utcnow()
     except IntegrationError as exc:
-        run.status, run.error_code, run.finished_at = "failed", exc.code, utcnow()
+        run.status, run.error_code, run.finished_at = "failed", f"{exc.code}:{exc.status_code}"[:64], utcnow()
     except Exception:
         run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
     db.commit()
@@ -298,7 +306,7 @@ async def run_watch_cycle_async(db: Session, settings: Settings) -> dict:
     targets = await resolve_watch_targets(settings)
     runs = []
     for target in targets["resolved"]:
-        run = await watch_workspace(db, settings, target["workspace_id"])
+        run = await watch_workspace(db, settings, target["workspace_id"], target.get("space"))
         runs.append({"workspace_id": target["workspace_id"], "name": target["name"], "run_id": run.run_id,
                      "mode": run.mode, "status": run.status, "documents_seen": run.documents_seen,
                      "documents_new": run.documents_new, "documents_changed": run.documents_changed,
