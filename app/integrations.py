@@ -144,7 +144,8 @@ class BiCenterClient:
         if response.is_error:
             raise IntegrationError("bi_center_request_failed", f"bi_center 身份解析失败（HTTP {response.status_code}）。", response.status_code)
         body = response.json()
-        return body.get("data", {}).get("items", body.get("items", []))
+        data = body.get("data", {}) or {}
+        return data.get("results", data.get("items", body.get("items", [])))
 
     async def check(self) -> dict[str, Any]:
         if not self.configured():
