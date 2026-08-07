@@ -240,8 +240,92 @@ def uploader_months(db: Session) -> dict[str, Any]:
                                .where(UploaderMonthStat.snapshot_id == snapshot)) or 0
     space_count = db.scalar(select(func.count(func.distinct(UploaderMonthStat.workspace_id)))
                             .where(UploaderMonthStat.snapshot_id == snapshot)) or 0
+    yearly: dict[str, int] = {}
+    for m, c in rows:
+        yearly[m[:4]] = yearly.get(m[:4], 0) + int(c)
     return {"snapshot_id": snapshot, "months": [{"month": m, "total": int(c)} for m, c in rows],
+            "yearly": {y: yearly[y] for y in sorted(yearly)},
+            "total_files": sum(yearly.values()),
             "uploader_count": uploader_count, "workspace_count": space_count}
+
+
+def uploader_breakdown(db: Session, user_id: str, year: str = "", month: str = "") -> dict[str, Any]:
+    """One person's uploads: monthly series, per-day series for a chosen month,
+    and workspace distribution for the chosen period. Day granularity reads the
+    node table through the (snapshot, creator) index — a few thousand rows at
+    most for one person."""
+    snapshot = uploader_snapshot_id(db)
+    period = month or year
+    months = db.execute(select(UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
+                        .where(UploaderMonthStat.snapshot_id == snapshot, UploaderMonthStat.creator_user_id == user_id)
+                        .group_by(UploaderMonthStat.month).order_by(UploaderMonthStat.month)).all()
+    ws_stmt = select(UploaderMonthStat.workspace_name, func.sum(UploaderMonthStat.file_count)) \
+        .where(UploaderMonthStat.snapshot_id == snapshot, UploaderMonthStat.creator_user_id == user_id)
+    if period:
+        ws_stmt = ws_stmt.where(UploaderMonthStat.month.startswith(period))
+    workspaces = db.execute(ws_stmt.group_by(UploaderMonthStat.workspace_name)
+                            .order_by(func.sum(UploaderMonthStat.file_count).desc()).limit(30)).all()
+    days: list[dict[str, Any]] = []
+    if month:
+        day_rows = db.execute(select(func.substr(HistoricalFileNode.source_created_at, 1, 10), func.count())
+                              .where(HistoricalFileNode.snapshot_id == snapshot,
+                                     HistoricalFileNode.creator_user_id == user_id,
+                                     HistoricalFileNode.node_type == "file",
+                                     HistoricalFileNode.source_created_at.startswith(month))
+                              .group_by(func.substr(HistoricalFileNode.source_created_at, 1, 10))).all()
+        days = [{"day": d, "count": int(c)} for d, c in sorted(day_rows)]
+    employee = _employee_rows(db, [user_id]).get(user_id)
+    period_total = sum(int(c) for m, c in months if not period or m.startswith(period))
+    return {**_person(user_id, employee), "year": year, "month": month,
+            "months": [{"month": m, "count": int(c)} for m, c in months],
+            "days": days,
+            "workspaces": [{"name": n or "(未知库)", "files": int(c)} for n, c in workspaces],
+            "period_total": period_total,
+            "all_total": sum(int(c) for _, c in months)}
+
+
+def org_rollup(db: Session, year: str = "", month: str = "") -> dict[str, Any]:
+    """Department -> business-group -> person tree with stock (all-time) and
+    period delta. Built from the small aggregate table plus the identity cache."""
+    snapshot = uploader_snapshot_id(db)
+    period = month or year
+    rows = db.execute(select(UploaderMonthStat.creator_user_id, UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
+                      .where(UploaderMonthStat.snapshot_id == snapshot)
+                      .group_by(UploaderMonthStat.creator_user_id, UploaderMonthStat.month)).all()
+    employees = _employee_rows(db, list({r[0] for r in rows}))
+    departments: dict[str, dict[str, Any]] = {}
+    for user_id, m, files in rows:
+        person = _person(user_id, employees.get(user_id))
+        dept = departments.setdefault(person["department_name"], {
+            "department_name": person["department_name"], "stock": 0, "delta": 0,
+            "uploaders": set(), "is_robot": person.get("is_robot", False), "groups": {}})
+        group = dept["groups"].setdefault(person["biz_group_name"], {
+            "biz_group_name": person["biz_group_name"], "stock": 0, "delta": 0, "uploaders": set(), "people": {}})
+        people = group["people"].setdefault(user_id, {"user_id": user_id, "name": person["name"] or user_id,
+                                                      "matched": person["matched"], "stock": 0, "delta": 0})
+        count = int(files)
+        in_period = (not period) or m.startswith(period)
+        for bucket in (dept, group):
+            bucket["stock"] += count
+            if in_period:
+                bucket["delta"] += count
+            bucket["uploaders"].add(user_id)
+        people["stock"] += count
+        if in_period:
+            people["delta"] += count
+    items = []
+    for dept in departments.values():
+        groups = []
+        for group in dept["groups"].values():
+            people = sorted(group["people"].values(), key=lambda p: (-p["delta"], -p["stock"]))
+            groups.append({"biz_group_name": group["biz_group_name"], "stock": group["stock"],
+                           "delta": group["delta"], "uploaders": len(group["uploaders"]),
+                           "people": people})
+        groups.sort(key=lambda g: (-g["delta"], -g["stock"]))
+        items.append({"department_name": dept["department_name"], "stock": dept["stock"], "delta": dept["delta"],
+                      "uploaders": len(dept["uploaders"]), "is_robot": dept["is_robot"], "groups": groups})
+    items.sort(key=lambda d: (-d["delta"], -d["stock"]))
+    return {"snapshot_id": snapshot, "year": year, "month": month, "items": items}
 
 
 def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limit: int = 50, department: str = "") -> dict[str, Any]:

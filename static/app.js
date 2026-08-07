@@ -94,53 +94,75 @@ async function increments(year){const q=year?`?year=${year}`:'';const d=await ap
     const blob=new Blob(['﻿'+lines.join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`知识库月度增量${year?'-'+year:''}.csv`;a.click();URL.revokeObjectURL(a.href)}}
 
 function blTable(d){if(!d.items.length)return '<div class="empty">未找到匹配文件。</div>';
-  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>文件名</th><th>知识库</th><th>类型</th><th>入库时间</th></tr></thead><tbody>${d.items.map(f=>`<tr><td><b>${f.name}</b><br><small>${f.node_id}</small></td><td>${state.coverageNames[f.workspace_id]||f.workspace_id}</td><td>${f.extension||'—'}</td><td>${(f.created_at||'').slice(0,10)}</td></tr>`).join('')}</tbody></table></div>
+  return `<div class="table-wrap"><table class="data-table"><thead><tr><th>文件名</th><th class="hide-sm">类型</th><th>入库时间</th><th></th></tr></thead><tbody>${d.items.map(f=>`<tr><td><b>${f.name}</b><br><small>${(f.created_at||'').slice(0,10)}</small></td><td class="hide-sm">${f.extension||'—'}</td><td>${(f.created_at||'').slice(0,10)}</td><td>${f.url?`<a class="link-btn" href="${f.url}" target="_blank" rel="noopener">打开 ↗</a>`:'—'}</td></tr>`).join('')}</tbody></table></div>
   <div class="controls section-gap"><span class="hint">共 ${nf(d.total)} 个 · 第 ${Math.floor(d.offset/d.limit)+1} / ${Math.max(1,Math.ceil(d.total/d.limit))} 页</span><button class="secondary" id="bl-prev" ${d.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="bl-next" ${d.offset+d.limit>=d.total?'disabled':''}>下一页</button></div>`}
 async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',offset:p.offset,limit:50});
   const d=await api('/api/v1/baseline/files?'+qs);const box=document.querySelector('#bl-results');box.innerHTML=blTable(d);
   const prev=document.querySelector('#bl-prev'),next=document.querySelector('#bl-next');
   if(prev)prev.onclick=()=>{p.offset=Math.max(0,p.offset-50);blSearch()};
   if(next)next.onclick=()=>{p.offset+=50;blSearch()}}
-async function uploaders(month,excl,deptFilter){const meta=await api('/api/v1/metrics/uploaders/months');
-  if(!meta.months.length){shell('上传统计','按人 / 部门统计知识库上传量（数据来自带创建人的全量扫描）。',`<section class="card"><div class="empty">带创建人的扫描尚未完成（快照 ${meta.snapshot_id||'未开始'}）。扫描进行中会逐库出现数据，稍后刷新。</div></section>`);return}
-  month=month??meta.months[meta.months.length-1].month;excl=excl!==false;deptFilter=deptFilter||'';
-  const qs=new URLSearchParams({month,exclude_unmatched:excl,limit:50,department:deptFilter});
-  const [d,dept]=await Promise.all([api('/api/v1/metrics/uploaders?'+qs),api('/api/v1/metrics/departments?month='+month)]);
-  const monthOpts=meta.months.map(m=>`<option value="${m.month}" ${m.month===month?'selected':''}>${m.month}（${nf(m.total)}）</option>`).join('');
-  const deptOpts=['<option value="">全部部门</option>'].concat(dept.items.filter(x=>!['未映射','系统/机器人'].includes(x.department_name)).map(x=>`<option value="${x.department_name}" ${x.department_name===deptFilter?'selected':''}>${x.department_name}（${nf(x.files)}）</option>`)).join('');
-  shell('上传统计',`快照 ${d.snapshot_id} · 覆盖 ${meta.workspace_count} 库 · ${d.note}`,`
+async function uploaders(){const meta=await api('/api/v1/metrics/uploaders/months');
+  if(!meta.months.length){shell('数据看板','按人 / 部门 / 业务组多维统计知识库上传。',`<section class="card"><div class="empty">带创建人的扫描尚未完成。</div></section>`);return}
+  const st=state.dash=state.dash||{year:meta.months[meta.months.length-1].month.slice(0,4),month:'',excl:true,dept:'',group:'',person:null};
+  const org=await api('/api/v1/metrics/org?'+new URLSearchParams({year:st.month?'':st.year,month:st.month}));
+  const years=Object.keys(meta.yearly).sort();
+  const monthsOfYear=meta.months.filter(m=>m.month.startsWith(st.year));
+  const visibleOrg=org.items.filter(d=>!st.excl||!['系统/机器人','未映射'].includes(d.department_name));
+  const periodDelta=org.items.reduce((a,d)=>a+d.delta,0);
+  const periodHuman=org.items.filter(d=>!['系统/机器人','未映射'].includes(d.department_name)).reduce((a,d)=>a+d.delta,0);
+  const periodLabel=st.month||st.year+' 全年';
+  const yearPills=years.map(y=>`<button class="pill ${(st.month?st.month.startsWith(y):y===st.year)?'active':''}" data-year="${y}">${y}</button>`).join('');
+  const monthOpts=['<option value="">全年</option>'].concat(monthsOfYear.map(m=>`<option value="${m.month}" ${m.month===st.month?'selected':''}>${m.month.slice(5)}月（${nf(m.total)}）</option>`)).join('');
+  let level='dept',rows=visibleOrg,currentDept=null,currentGroup=null;
+  if(st.dept){currentDept=org.items.find(d=>d.department_name===st.dept);if(currentDept){level='group';rows=currentDept.groups;
+    if(st.group){currentGroup=currentDept.groups.find(g=>g.biz_group_name===st.group);if(currentGroup){level='person';rows=currentGroup.people}}}}
+  const crumbs=`<div class="crumbs"><button class="crumb ${level==='dept'?'current':''}" data-crumb="root">全部部门</button>${st.dept?`<span class="sep">›</span><button class="crumb ${level==='group'?'current':''}" data-crumb="dept">${st.dept}</button>`:''}${st.group?`<span class="sep">›</span><button class="crumb current" data-crumb="group">${st.group}</button>`:''}</div>`;
+  const orgTable=level==='dept'
+    ?`<table class="data-table"><thead><tr><th>部门</th><th class="num">保有量</th><th class="num">${periodLabel}增量</th><th class="num hide-sm">上传人数</th></tr></thead><tbody>${rows.map(d=>`<tr class="rowlink" data-drill-dept="${d.department_name}"><td><b>${d.department_name}</b>${d.is_robot?'<span class="row-tag">系统</span>':''}</td><td class="num">${nf(d.stock)}</td><td class="num ${d.delta?'delta-pos':'delta-zero'}">${d.delta?'+'+nf(d.delta):'0'}</td><td class="num hide-sm">${d.uploaders}</td></tr>`).join('')}</tbody></table>`
+    :level==='group'
+    ?`<table class="data-table"><thead><tr><th>业务组</th><th class="num">保有量</th><th class="num">${periodLabel}增量</th><th class="num hide-sm">上传人数</th></tr></thead><tbody>${rows.map(g=>`<tr class="rowlink" data-drill-group="${g.biz_group_name}"><td><b>${g.biz_group_name}</b></td><td class="num">${nf(g.stock)}</td><td class="num ${g.delta?'delta-pos':'delta-zero'}">${g.delta?'+'+nf(g.delta):'0'}</td><td class="num hide-sm">${g.uploaders}</td></tr>`).join('')}</tbody></table>`
+    :`<table class="data-table"><thead><tr><th>成员</th><th class="num">保有量</th><th class="num">${periodLabel}增量</th></tr></thead><tbody>${rows.map(pp=>`<tr class="rowlink" data-drill-person="${pp.user_id}"><td><b>${pp.name}</b>${pp.matched?'':'<span class="row-tag">未映射</span>'}</td><td class="num">${nf(pp.stock)}</td><td class="num ${pp.delta?'delta-pos':'delta-zero'}">${pp.delta?'+'+nf(pp.delta):'0'}</td></tr>`).join('')}</tbody></table>`;
+  shell('数据看板',`快照 ${meta.snapshot_id} · 全量口径 · 保有量为累计，增量为所选期间`,`
+  <div class="filter-card">${yearPills}<select class="input" id="db-month">${monthOpts}</select><label class="chip" style="cursor:pointer"><input type="checkbox" id="db-excl" ${st.excl?'checked':''} style="margin-right:4px">排除系统/未映射</label><span class="hint hide-sm" style="margin-left:auto">部门 → 业务组 → 成员逐级下钻；点趋势柱可切月</span></div>
   <div class="grid metrics">
-    ${statCard(month+' 全量上传',nf(d.total_files),'知识资产口径：含机器人与未映射')}
-    ${statCard('其中人工上传',nf(d.human_files),'bi_center 匹配的在职员工')}
-    ${statCard('机器人 / 系统',nf(d.robot_files),'数字员工同步等；另有未映射 '+nf(d.unmatched_files))}
-    ${statCard('上传人数',d.uploader_count,'有上传的已映射员工')}
+    ${['2025','2026'].map(y=>`<article class="card kpi ${y==='2026'?'green':''}"><div class="metric-label">${y} 年全量增长</div><div class="metric-value">${nf(meta.yearly[y]||0)}</div><div class="metric-note">含系统导入</div></article>`).join('')}
+    <article class="card kpi amber"><div class="metric-label">${periodLabel}新增</div><div class="metric-value">${nf(periodDelta)}</div><div class="metric-note">其中人工 ${nf(periodHuman)}</div></article>
+    <article class="card kpi gray"><div class="metric-label">文件总保有量</div><div class="metric-value">${nf(meta.total_files)}</div><div class="metric-note">${meta.workspace_count} 库 · ${meta.uploader_count} 位上传人</div></article>
   </div>
-  <section class="card section-gap"><div class="card-head"><h2>${month} 人员上传 Top 15${deptFilter?` · ${deptFilter}`:''}</h2></div><div id="upChart" class="chart"></div></section>
+  <section class="card section-gap"><div class="card-head"><h2>${st.year} 年月度上传趋势</h2><span class="hint">点击柱形筛选该月</span></div><div id="dbTrend" class="chart"></div></section>
   <div class="grid two-cols section-gap">
-    <section class="card"><div class="card-head"><h2>人员明细</h2></div><div class="table-wrap" style="max-height:420px;overflow-y:auto"><table class="data-table"><thead><tr><th>#</th><th>员工</th><th>部门 / 业务组</th><th class="num">上传数</th><th class="num">涉及库</th></tr></thead><tbody>
-      ${d.items.map((x,i)=>`<tr class="rowlink" data-up="${x.user_id}"><td>${i+1}</td><td><b>${x.name||x.user_id}</b>${x.matched?'':' <span class=\"chip amber\">未映射</span>'}</td><td>${x.department_name}<br><small>${x.biz_group_name}</small></td><td class="num"><b>${nf(x.files)}</b></td><td class="num">${x.workspaces}</td></tr>`).join('')||'<tr><td colspan=5 class=empty>该月无数据</td></tr>'}
-    </tbody></table></div></section>
-    <section class="card"><h2 id="up-detail-title">点击左侧人员查看趋势</h2><div id="upDetailChart" class="chart" style="height:220px"></div><div id="up-detail-spaces"></div></section>
-  </div>
-  <section class="card section-gap"><div class="card-head"><h2>部门汇总（${month}）</h2><span class="hint">点击部门行可筛选人员明细</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>部门</th><th class="num">上传数</th><th class="num">上传人数</th></tr></thead><tbody>
-    ${dept.items.map(x=>`<tr class="rowlink" data-dept="${x.department_name}"><td>${x.department_name}${x.department_name===deptFilter?' <span class="chip blue">当前筛选</span>':''}</td><td class="num">${nf(x.files)}</td><td class="num">${x.uploaders}</td></tr>`).join('')}
-  </tbody></table></div></section>`,
-  `<select class="input" id="up-month">${monthOpts}</select><select class="input" id="up-dept">${deptOpts}</select><label class="chip" style="cursor:pointer"><input type="checkbox" id="up-excl" ${excl?'checked':''} style="margin-right:4px">排除未映射/机器人</label>`);
-  renderChart('upChart',{tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},grid:{left:8,right:8,top:12,bottom:8,containLabel:true},
-    xAxis:{type:'category',data:d.items.slice(0,15).map(x=>x.name||x.user_id.slice(0,6)),axisLabel:{color:'#6b7280',fontSize:11,interval:0,rotate:d.items.length>8?30:0},axisTick:{show:false}},
+    <section class="card"><div class="card-head">${crumbs}</div><div class="table-wrap" style="max-height:430px;overflow-y:auto">${orgTable}</div></section>
+    <section class="card person-panel" id="personPanel">${st.person?'<div class="empty">加载中…</div>':'<h2>成员明细</h2><div class="empty">在左侧下钻到成员并点击，查看其每日上传与知识库分布。</div>'}</section>
+  </div>`);
+  renderChart('dbTrend',{tooltip:{trigger:'axis',axisPointer:{type:'shadow'}},grid:{left:8,right:8,top:16,bottom:8,containLabel:true},
+    xAxis:{type:'category',data:monthsOfYear.map(m=>m.month.slice(5)+'月'),axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:11}},
     yAxis:{type:'value',splitLine:{lineStyle:{color:'#f3f4f6'}},axisLabel:{color:'#6b7280',fontSize:11}},
-    series:[{type:'bar',barMaxWidth:26,data:d.items.slice(0,15).map(x=>x.files),itemStyle:{color:COLOR.routine,borderRadius:[3,3,0,0]}}]});
-  document.querySelector('#up-month').onchange=e=>uploaders(e.target.value,document.querySelector('#up-excl').checked,document.querySelector('#up-dept').value);
-  document.querySelector('#up-excl').onchange=e=>uploaders(document.querySelector('#up-month').value,e.target.checked,document.querySelector('#up-dept').value);
-  document.querySelector('#up-dept').onchange=e=>uploaders(document.querySelector('#up-month').value,document.querySelector('#up-excl').checked,e.target.value);
-  document.querySelectorAll('[data-dept]').forEach(r=>r.onclick=()=>{const dn=r.dataset.dept;if(['未映射','系统/机器人'].includes(dn))return;uploaders(month,excl,dn===deptFilter?'':dn)});
-  document.querySelectorAll('[data-up]').forEach(r=>r.onclick=async()=>{const u=await api('/api/v1/metrics/uploaders/'+r.dataset.up);
-    document.querySelector('#up-detail-title').textContent=`${u.name||u.user_id} · 月度上传趋势（累计 ${nf(u.months.reduce((a,m)=>a+m.count,0))}）`;
-    renderChart('upDetailChart',{tooltip:{trigger:'axis'},grid:{left:8,right:8,top:12,bottom:8,containLabel:true},
-      xAxis:{type:'category',data:u.months.map(m=>m.month),axisLabel:{color:'#6b7280',fontSize:10},axisTick:{show:false}},
-      yAxis:{type:'value',splitLine:{lineStyle:{color:'#f3f4f6'}},axisLabel:{color:'#6b7280',fontSize:10}},
-      series:[{type:'bar',barMaxWidth:18,data:u.months.map(m=>m.count),itemStyle:{color:COLOR.routine,borderRadius:[3,3,0,0]}}]});
-    document.querySelector('#up-detail-spaces').innerHTML='<p class="hint" style="margin-top:10px">主要上传知识库：</p>'+u.top_workspaces.map(s=>`<span class="chip" style="margin:2px">${s.name} ${nf(s.files)}</span>`).join(' ')})}
+    series:[{type:'bar',barMaxWidth:30,data:monthsOfYear.map(m=>({value:m.total,itemStyle:{color:m.month===st.month?'#1d4ed8':'#2563eb',borderRadius:[3,3,0,0]}})),cursor:'pointer'}]});
+  const trendChart=charts.get('dbTrend');
+  if(trendChart){trendChart.off('click');trendChart.on('click',pt=>{const m=monthsOfYear[pt.dataIndex]?.month;st.month=(st.month===m?'':m);st.person=null;uploaders()})}
+  document.querySelectorAll('[data-year]').forEach(b=>b.onclick=()=>{st.year=b.dataset.year;st.month='';st.dept='';st.group='';st.person=null;uploaders()});
+  document.querySelector('#db-month').onchange=e=>{st.month=e.target.value;st.person=null;uploaders()};
+  document.querySelector('#db-excl').onchange=e=>{st.excl=e.target.checked;uploaders()};
+  document.querySelectorAll('[data-crumb]').forEach(b=>b.onclick=()=>{const c=b.dataset.crumb;if(c==='root'){st.dept='';st.group=''}else if(c==='dept'){st.group=''}st.person=null;uploaders()});
+  document.querySelectorAll('[data-drill-dept]').forEach(r=>r.onclick=()=>{st.dept=r.dataset.drillDept;st.group='';st.person=null;uploaders()});
+  document.querySelectorAll('[data-drill-group]').forEach(r=>r.onclick=()=>{st.group=r.dataset.drillGroup;st.person=null;uploaders()});
+  document.querySelectorAll('[data-drill-person]').forEach(r=>r.onclick=()=>{st.person=r.dataset.drillPerson;loadPerson(st)});
+  if(st.person)loadPerson(st)}
+
+async function loadPerson(st){const panel=document.querySelector('#personPanel');if(!panel)return;
+  const d=await api('/api/v1/metrics/uploaders/'+st.person+'/breakdown?'+new URLSearchParams({year:st.month?'':st.year,month:st.month}));
+  const label=st.month?st.month:st.year+' 全年';
+  const series=st.month?d.days.map(x=>({k:x.day.slice(8)+'日',v:x.count})):d.months.filter(m=>m.month.startsWith(st.year)).map(x=>({k:x.month.slice(5)+'月',v:x.count}));
+  panel.innerHTML=`<div class="card-head" style="margin-bottom:6px"><h2 style="margin:0">${d.name||d.user_id}</h2><span class="chip ${d.matched?'blue':'amber'}">${d.department_name}${d.biz_group_name&&d.biz_group_name!==d.department_name?' · '+d.biz_group_name:''}</span></div>
+  <p class="hint">${label}上传 <b>${nf(d.period_total)}</b> 篇 · 历史累计 ${nf(d.all_total)} 篇</p>
+  <div id="personChart" class="chart" style="height:190px"></div>
+  <p class="hint" style="margin-top:8px">知识库分布（${label}）：</p>
+  <div>${d.workspaces.map(w=>`<span class="ws-chip">${w.name} <b>${nf(w.files)}</b></span>`).join('')||'<span class="hint">该期间无上传</span>'}</div>`;
+  const el=document.getElementById('personChart');
+  if(el&&window.echarts){const c=echarts.init(el);charts.set('personChart',c);c.setOption({tooltip:{trigger:'axis'},grid:{left:6,right:6,top:10,bottom:4,containLabel:true},
+    xAxis:{type:'category',data:series.map(x=>x.k),axisTick:{show:false},axisLabel:{color:'#6b7280',fontSize:10,interval:series.length>15?'auto':0}},
+    yAxis:{type:'value',splitLine:{lineStyle:{color:'#f3f4f6'}},axisLabel:{color:'#6b7280',fontSize:10}},
+    series:[{type:'bar',barMaxWidth:16,data:series.map(x=>x.v),itemStyle:{color:'#2563eb',borderRadius:[3,3,0,0]}}]});requestAnimationFrame(()=>{if(!c.isDisposed())c.resize()})}}
 
 async function documents(){const d=await api('/api/v1/documents');
   if(!Object.keys(state.coverageNames).length){try{const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}catch(e){}}
@@ -226,20 +248,49 @@ async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1
   if(form)form.onsubmit=async e=>{e.preventDefault();const f=new FormData(e.currentTarget),arr=k=>String(f.get(k)||'').split(',').map(x=>x.trim()).filter(Boolean);
     await api('/api/v1/workspaces/'+id+'/governance',{method:'PATCH',body:JSON.stringify({owner_department_id:f.get('owner_department_id'),owner_department_name:f.get('owner_department_name'),owner_biz_group_name:f.get('owner_biz_group_name'),administrators:arr('administrators'),reviewers:arr('reviewers')})});toast('治理配置已保存')}}
 
-async function models(){const d=await api('/api/v1/model-configs');
-  shell('模型配置',`评分规则 ${d.rule_version}；${d.api_key_policy}`,`
-  <section class="grid two-cols"><form class="card" id="model-form"><h2>AI 评审模型</h2><div class="form-grid" style="margin-top:12px">
-    <label class="form-field"><span class="field-label">配置名称</span><input class="input" name="name" required placeholder="knowledge-review-prod"></label>
-    <label class="form-field"><span class="field-label">版本</span><input class="input" name="version" value="v1"></label>
-    <label class="form-field full"><span class="field-label">OpenAI 兼容 API 基础地址</span><input class="input" name="base_url" placeholder="https://api.example.com/v1"></label>
-    <label class="form-field"><span class="field-label">模型名称</span><input class="input" name="model_name" placeholder="model-name"></label>
-    <label class="form-field"><span class="field-label">API Key 环境变量名</span><input class="input" name="api_key_env_name" value="KG_MODEL_API_KEY"></label>
-    <label class="form-field"><span class="field-label">超时（秒）</span><input class="input" name="timeout_seconds" type="number" min="1" max="60" value="30"></label>
-    <label class="form-field"><span class="field-label">启用模型</span><select class="input" name="enabled"><option value="false">否，使用规则引擎</option><option value="true">是</option></select></label></div>
-    <p class="hint">模型仅在显式开启正文传输策略后接收临时正文；密钥不进数据库。</p><button class="primary">保存模型配置</button></form>
-  <section class="card"><h2>已保存配置</h2>${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>名称</th><th>模型</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${x.name}</td><td>${x.model_name||'—'}</td><td>${x.version}</td><td>${x.enabled?'<span class="badge pass">已启用</span>':'<span class="badge">未启用</span>'}</td><td><button class="secondary" data-model-check="${x.id}">连通性测试</button></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">尚未配置模型，评分使用可审计的 V1.1 规则引擎。</div>'}</section></section>`);
-  document.querySelector('#model-form').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.currentTarget);await api('/api/v1/model-configs',{method:'POST',body:JSON.stringify({name:f.get('name'),base_url:f.get('base_url'),model_name:f.get('model_name'),api_key_env_name:f.get('api_key_env_name'),timeout_seconds:Number(f.get('timeout_seconds')),enabled:f.get('enabled')==='true',version:f.get('version')})});toast('模型配置已保存');models()};
-  document.querySelectorAll('[data-model-check]').forEach(b=>b.onclick=async()=>{const r=await api('/api/v1/model-configs/'+b.dataset.modelCheck+'/connection-check',{method:'POST'});toast(r.message)})}
+const MODEL_PRESETS=['qwen3.7-plus','qwen3.7-max','qwen3.6-plus','qwen3.6-flash','deepseek-v4-pro','deepseek-v4-flash','deepseek-v3.2','kimi-k2.7-code','kimi-k2.6','kimi-k2.5','glm-5.2','glm-5.1','glm-5','MiniMax-M2.5'];
+async function models(editing){const d=await api('/api/v1/model-configs');
+  const cur=editing?d.items.find(x=>x.id===editing):null;
+  const f=cur||{name:'',provider:'openai_compatible',base_url:'',model_name:'',temperature:null,thinking_mode:'',timeout_seconds:60,enabled:false,version:'v1',has_key:false,api_key_masked:''};
+  shell('模型配置',`评分规则 ${d.rule_version} · ${d.api_key_policy}`,`
+  <div class="grid two-cols">
+  <form class="card" id="model-form"><div class="card-head"><h2>${cur?'编辑：'+cur.name:'新建模型配置'}</h2>${cur?'<button type="button" class="secondary" id="cancel-edit">取消编辑</button>':''}</div>
+    <div class="form-grid">
+    <label class="form-field"><span class="field-label">配置名称</span><input class="input" name="name" required value="${f.name}" ${cur?'readonly':''} placeholder="knowledge-review-prod"></label>
+    <label class="form-field"><span class="field-label">服务提供商</span><input class="input" name="provider" value="${f.provider}" list="providers"><datalist id="providers"><option value="openai_compatible"><option value="tokenplan"><option value="dashscope"></datalist></label>
+    <label class="form-field full"><span class="field-label">API 基础地址（OpenAI 兼容）</span><input class="input" name="base_url" value="${f.base_url}" placeholder="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"></label>
+    <label class="form-field"><span class="field-label">模型名称</span><input class="input" name="model_name" value="${f.model_name}" list="models"><datalist id="models">${MODEL_PRESETS.map(m=>`<option value="${m}">`).join('')}</datalist></label>
+    <label class="form-field"><span class="field-label">API Key ${f.has_key?`<span class="mini-note">已保存 ${f.api_key_masked}，留空沿用</span>`:''}</span><input class="input" name="api_key" type="password" autocomplete="new-password" placeholder="${f.has_key?'留空保持不变':'sk-...'}"></label>
+    <label class="form-field"><span class="field-label">温度（留空用模型默认）</span><input class="input" name="temperature" type="number" min="0" max="2" step="0.1" value="${f.temperature??''}"></label>
+    <label class="form-field"><span class="field-label">思考模式</span><select class="input" name="thinking_mode"><option value="" ${!f.thinking_mode?'selected':''}>模型默认</option><option value="on" ${f.thinking_mode==='on'?'selected':''}>开启</option><option value="off" ${f.thinking_mode==='off'?'selected':''}>关闭</option></select></label>
+    <label class="form-field"><span class="field-label">超时（秒）</span><input class="input" name="timeout_seconds" type="number" min="1" max="120" value="${f.timeout_seconds}"></label>
+    <label class="form-field"><span class="field-label">版本标记</span><input class="input" name="version" value="${f.version}"></label>
+    <label class="form-field"><span class="field-label">启用</span><select class="input" name="enabled"><option value="false" ${!f.enabled?'selected':''}>否（用规则引擎）</option><option value="true" ${f.enabled?'selected':''}>是（唯一启用）</option></select></label>
+    </div>
+    <p class="hint">评审正文仅在任务执行期间存在于内存/tmpfs，评完即释放；Key 只回显掩码。</p>
+    <button class="primary">${cur?'保存修改':'创建配置'}</button></form>
+  <section class="card"><h2>已保存配置</h2>${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>名称 / 模型</th><th class="hide-sm">参数</th><th>状态</th><th></th></tr></thead><tbody>
+    ${d.items.map(x=>`<tr><td><b>${x.name}</b><br><small>${x.model_name||'—'} · ${x.base_url.replace('https://','').slice(0,28)}…</small></td><td class="hide-sm"><small>温度 ${x.temperature??'默认'} · 思考 ${x.thinking_mode==='on'?'开':x.thinking_mode==='off'?'关':'默认'} · Key ${x.has_key?x.api_key_masked:'ENV'}</small></td><td>${x.enabled?'<span class="badge pass">启用中</span>':'<span class="badge">停用</span>'}</td>
+    <td><div class="controls"><button class="secondary" data-edit="${x.id}">编辑</button><button class="secondary" data-check="${x.id}">测试</button><button class="secondary" data-history="${x.id}">历史</button></div></td></tr>`).join('')}
+  </tbody></table></div><div id="history-box" class="section-gap"></div>`:'<div class="empty">尚未配置模型，评分使用可审计的 V1.1 规则引擎。</div>'}</section></div>`);
+  const form=document.querySelector('#model-form');
+  form.onsubmit=async e=>{e.preventDefault();const fd=new FormData(form);
+    const body={name:fd.get('name'),provider:fd.get('provider'),base_url:fd.get('base_url'),model_name:fd.get('model_name'),
+      api_key:fd.get('api_key')||'',api_key_env_name:'KG_MODEL_API_KEY',
+      temperature:fd.get('temperature')===''?null:Number(fd.get('temperature')),
+      thinking_mode:fd.get('thinking_mode'),timeout_seconds:Number(fd.get('timeout_seconds')),
+      enabled:fd.get('enabled')==='true',version:fd.get('version')};
+    try{if(cur){await api('/api/v1/model-configs/'+cur.id,{method:'PUT',body:JSON.stringify(body)})}else{await api('/api/v1/model-configs',{method:'POST',body:JSON.stringify(body)})}
+      toast('已保存');models()}catch(err){toast(err.message)}};
+  const cancel=document.querySelector('#cancel-edit');if(cancel)cancel.onclick=()=>models();
+  document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>models(Number(b.dataset.edit)));
+  document.querySelectorAll('[data-check]').forEach(b=>b.onclick=async()=>{b.disabled=true;try{const r=await api('/api/v1/model-configs/'+b.dataset.check+'/connection-check',{method:'POST'});toast(r.status+'：'+r.message)}catch(e){toast(e.message)}b.disabled=false});
+  document.querySelectorAll('[data-history]').forEach(b=>b.onclick=async()=>{const id=b.dataset.history;const h=await api('/api/v1/model-configs/'+id+'/history');
+    document.querySelector('#history-box').innerHTML=`<h2>历史版本（配置 #${id}）</h2>${h.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>动作</th><th>模型 / 参数</th><th></th></tr></thead><tbody>
+      ${h.items.map(it=>`<tr><td><small>${(it.saved_at||'').replace('T',' ').slice(0,16)}</small></td><td><span class="badge">${{create:'创建',update:'修改前留档',rollback:'回滚后'}[it.action]||it.action}</span></td><td><small>${it.model_name} · 温度${it.temperature??'默认'} · 思考${it.thinking_mode||'默认'} · ${it.version} · Key ${it.api_key_masked||'ENV'}</small></td><td><button class="secondary" data-rb="${it.id}" data-cfg="${id}">回滚到此</button></td></tr>`).join('')}
+    </tbody></table></div>`:'<p class="hint">暂无历史。</p>'}`;
+    document.querySelectorAll('[data-rb]').forEach(r=>r.onclick=async()=>{if(!confirm('回滚到该历史版本？当前状态会先留档。'))return;
+      await api('/api/v1/model-configs/'+r.dataset.cfg+'/rollback/'+r.dataset.rb,{method:'POST'});toast('已回滚');models()})})}
 
 async function diagnostics(){const[d,n]=await Promise.all([api('/api/v1/diagnostics/connectivity'),api('/api/v1/notifications?limit=10').catch(()=>null)]);
   shell('连接诊断',d.body_storage,`

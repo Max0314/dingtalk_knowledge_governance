@@ -52,7 +52,10 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n")
     model = active_model(db)
     if content and model and settings.model_allow_content_transfer:
-        model_result = asyncio.run(model_score_content({"base_url": model.base_url, "model_name": model.model_name, "api_key_env_name": model.api_key_env_name, "timeout_seconds": model.timeout_seconds}, content, doc.name))
+        model_result = asyncio.run(model_score_content({"base_url": model.base_url, "model_name": model.model_name,
+                                                        "api_key": model.api_key, "api_key_env_name": model.api_key_env_name,
+                                                        "temperature": model.temperature, "thinking_mode": model.thinking_mode,
+                                                        "timeout_seconds": model.timeout_seconds}, content, doc.name))
         if model_result:
             result["ai_score"] = model_result["score"]
             result["findings"].extend(model_result["findings"])

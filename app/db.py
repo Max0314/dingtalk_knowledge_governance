@@ -1,7 +1,7 @@
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from .config import get_settings
@@ -137,11 +137,28 @@ class ModelConfig(Base):
     provider: Mapped[str] = mapped_column(String(64), default="openai_compatible")
     base_url: Mapped[str] = mapped_column(String(1024), default="")
     model_name: Mapped[str] = mapped_column(String(255), default="")
+    # Stored key (operator decision 2026-08-07). Never returned in full by any
+    # API — reads expose only a masked tail. Empty means fall back to the env
+    # variable named below.
+    api_key: Mapped[str] = mapped_column(Text, default="")
     api_key_env_name: Mapped[str] = mapped_column(String(128), default="KG_MODEL_API_KEY")
+    temperature: Mapped[float | None] = mapped_column(Float, nullable=True)
+    thinking_mode: Mapped[str] = mapped_column(String(16), default="")  # "" | on | off
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=30)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     version: Mapped[str] = mapped_column(String(64), default="v1")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ModelConfigHistory(Base):
+    """Every save keeps the previous state, so any config can be rolled back."""
+    __tablename__ = "model_config_history"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    config_id: Mapped[int] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(32), default="update")  # create | update | rollback
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    saved_by: Mapped[str] = mapped_column(String(128), default="")
+    saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class HistoricalSnapshot(Base):
@@ -162,7 +179,8 @@ class HistoricalSnapshot(Base):
 class HistoricalFileNode(Base):
     """Metadata only: no document body, attachment bytes, or extracted content."""
     __tablename__ = "historical_file_nodes"
-    __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "node_id", name="uq_history_snapshot_node"),)
+    __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "node_id", name="uq_history_snapshot_node"),
+                      Index("ix_hfn_snapshot_creator", "snapshot_id", "creator_user_id"))
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), index=True)

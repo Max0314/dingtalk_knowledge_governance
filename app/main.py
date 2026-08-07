@@ -65,8 +65,11 @@ class ModelRequest(BaseModel):
     provider: str = "openai_compatible"
     base_url: str = ""
     model_name: str = ""
+    api_key: str = ""  # blank keeps the stored key
     api_key_env_name: str = "KG_MODEL_API_KEY"
-    timeout_seconds: int = Field(default=30, ge=1, le=60)
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    thinking_mode: str = Field(default="", pattern="^$|^(on|off)$")
+    timeout_seconds: int = Field(default=30, ge=1, le=120)
     enabled: bool = False
     version: str = "v1"
 
@@ -140,6 +143,23 @@ def uploader_detail_api(user_id: str, db: Session = Depends(db_session)):
     return metrics.uploader_detail(db, user_id)
 
 
+@app.get("/api/v1/metrics/uploaders/{user_id}/breakdown")
+def uploader_breakdown_api(user_id: str, year: str = Query(default="", pattern=r"^$|^\d{4}$"),
+                           month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                           db: Session = Depends(db_session)):
+    orgmap.ensure_employees(db, get_settings(), [user_id])
+    return metrics.uploader_breakdown(db, user_id, year=year, month=month)
+
+
+@app.get("/api/v1/metrics/org")
+def org_rollup_api(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
+                   month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                   db: Session = Depends(db_session)):
+    preview = metrics.uploaders(db, "", exclude_unmatched=False, limit=500)
+    orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
+    return metrics.org_rollup(db, year=year, month=month)
+
+
 @app.get("/api/v1/metrics/departments")
 def departments_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"), db: Session = Depends(db_session)):
     return metrics.department_rollup(db, month)
@@ -149,7 +169,7 @@ def departments_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
 def baseline_folders(workspace_id: str, snapshot_id: str = "", limit: int = Query(default=200, ge=1, le=500), db: Session = Depends(db_session)):
     """Directory groups within one snapshot. When the snapshot recorded folder
     nodes (the 2026-08 uploader scan does), folder names come back too."""
-    snapshot = snapshot_id or metrics.primary_snapshot_id(db)
+    snapshot = snapshot_id or metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
     rows = db.execute(
         select(HistoricalFileNode.parent_node_id, func.count(), func.min(HistoricalFileNode.source_created_at), func.max(HistoricalFileNode.source_created_at))
         .where(HistoricalFileNode.workspace_id == workspace_id, HistoricalFileNode.snapshot_id == snapshot,
@@ -172,7 +192,7 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
                    offset: int = Query(default=0, ge=0),
                    limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     stmt = select(HistoricalFileNode).where(
-        HistoricalFileNode.snapshot_id == (snapshot_id or metrics.primary_snapshot_id(db)),
+        HistoricalFileNode.snapshot_id == (snapshot_id or metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)),
         HistoricalFileNode.node_type != "folder")
     if workspace_id:
         stmt = stmt.where(HistoricalFileNode.workspace_id == workspace_id)
@@ -184,7 +204,9 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
     rows = db.scalars(stmt.order_by(HistoricalFileNode.source_created_at.desc()).offset(offset).limit(limit)).all()
     return {"total": total, "offset": offset, "limit": limit,
             "items": [{"node_id": r.node_id, "workspace_id": r.workspace_id, "parent_node_id": r.parent_node_id,
-                       "name": r.name, "extension": r.extension, "created_at": r.source_created_at, "updated_at": r.source_updated_at} for r in rows]}
+                       "name": r.name, "extension": r.extension, "url": r.url, "size": r.size,
+                       "creator_user_id": r.creator_user_id,
+                       "created_at": r.source_created_at, "updated_at": r.source_updated_at} for r in rows]}
 
 
 class NotifyTestRequest(BaseModel):
@@ -318,16 +340,58 @@ def review_decision(review_instance_id: str, body: DecisionRequest, db: Session 
     return {"review_instance_id": review_instance_id, "decision": body.decision, "reviewer_key": actor()}
 
 
+def _mask_key(key: str) -> str:
+    if not key:
+        return ""
+    return ("*" * 6 + key[-4:]) if len(key) > 8 else "*" * 8
+
+
+def _model_dict(x: ModelConfig) -> dict:
+    return {"id": x.id, "name": x.name, "provider": x.provider, "base_url": x.base_url,
+            "model_name": x.model_name, "api_key_masked": _mask_key(x.api_key), "has_key": bool(x.api_key),
+            "api_key_env_name": x.api_key_env_name, "temperature": x.temperature,
+            "thinking_mode": x.thinking_mode, "timeout_seconds": x.timeout_seconds,
+            "enabled": x.enabled, "version": x.version, "updated_at": x.updated_at.isoformat()}
+
+
+def _model_snapshot(x: ModelConfig) -> dict:
+    return {"name": x.name, "provider": x.provider, "base_url": x.base_url, "model_name": x.model_name,
+            "api_key": x.api_key, "api_key_env_name": x.api_key_env_name, "temperature": x.temperature,
+            "thinking_mode": x.thinking_mode, "timeout_seconds": x.timeout_seconds,
+            "enabled": x.enabled, "version": x.version}
+
+
+def _record_history(db: Session, item: ModelConfig, action: str) -> None:
+    from .db import ModelConfigHistory
+    db.add(ModelConfigHistory(config_id=item.id, action=action, snapshot=_model_snapshot(item), saved_by=actor()))
+
+
 @app.get("/api/v1/model-configs")
 def model_configs(db: Session = Depends(db_session)):
-    return {"items": [{"id": x.id, "name": x.name, "provider": x.provider, "base_url": x.base_url, "model_name": x.model_name, "api_key_env_name": x.api_key_env_name, "timeout_seconds": x.timeout_seconds, "enabled": x.enabled, "version": x.version, "updated_at": x.updated_at.isoformat()} for x in db.scalars(select(ModelConfig).order_by(ModelConfig.updated_at.desc())).all()], "rule_version": "V1.1", "api_key_policy": "API Key 仅从容器环境变量读取，不进入数据库或接口响应。"}
+    return {"items": [_model_dict(x) for x in db.scalars(select(ModelConfig).order_by(ModelConfig.updated_at.desc())).all()],
+            "rule_version": "V1.1",
+            "api_key_policy": "API Key 可页面配置（仅存数据库、接口只回掩码）或环境变量注入；留空表示沿用已存密钥。"}
+
+
+def _apply_model_body(item: ModelConfig, body: "ModelRequest") -> None:
+    data = body.model_dump()
+    if not data.get("api_key"):
+        data.pop("api_key", None)  # blank means keep the stored key
+    for key, value in data.items():
+        setattr(item, key, value)
 
 
 @app.post("/api/v1/model-configs")
 def create_model(body: ModelRequest, db: Session = Depends(db_session)):
-    if db.scalar(select(ModelConfig).where(ModelConfig.name == body.name)): raise HTTPException(409, "模型配置名称已存在")
-    if body.enabled: db.query(ModelConfig).update({ModelConfig.enabled: False})
-    item = ModelConfig(**body.model_dump()); db.add(item); db.commit(); db.refresh(item)
+    if db.scalar(select(ModelConfig).where(ModelConfig.name == body.name)):
+        raise HTTPException(409, "模型配置名称已存在")
+    if body.enabled:
+        db.query(ModelConfig).update({ModelConfig.enabled: False})
+    item = ModelConfig()
+    _apply_model_body(item, body)
+    db.add(item); db.flush()
+    _record_history(db, item, "create")
+    db.commit(); db.refresh(item)
     return {"id": item.id, "name": item.name, "version": item.version}
 
 
@@ -335,16 +399,54 @@ def create_model(body: ModelRequest, db: Session = Depends(db_session)):
 def update_model(config_id: int, body: ModelRequest, db: Session = Depends(db_session)):
     item = db.get(ModelConfig, config_id)
     if not item: raise HTTPException(404, "模型配置不存在")
-    if body.enabled: db.query(ModelConfig).filter(ModelConfig.id != config_id).update({ModelConfig.enabled: False})
-    for key, value in body.model_dump().items(): setattr(item, key, value)
+    _record_history(db, item, "update")  # keep the pre-change state
+    if body.enabled:
+        db.query(ModelConfig).filter(ModelConfig.id != config_id).update({ModelConfig.enabled: False})
+    _apply_model_body(item, body)
     db.commit(); return {"id": item.id, "name": item.name, "version": item.version}
+
+
+@app.get("/api/v1/model-configs/{config_id}/history")
+def model_history(config_id: int, db: Session = Depends(db_session)):
+    from .db import ModelConfigHistory
+    rows = db.scalars(select(ModelConfigHistory).where(ModelConfigHistory.config_id == config_id)
+                      .order_by(ModelConfigHistory.saved_at.desc()).limit(30)).all()
+    return {"items": [{"id": h.id, "action": h.action, "saved_by": h.saved_by,
+                       "saved_at": h.saved_at.isoformat() if h.saved_at else None,
+                       "model_name": (h.snapshot or {}).get("model_name", ""),
+                       "base_url": (h.snapshot or {}).get("base_url", ""),
+                       "temperature": (h.snapshot or {}).get("temperature"),
+                       "thinking_mode": (h.snapshot or {}).get("thinking_mode", ""),
+                       "version": (h.snapshot or {}).get("version", ""),
+                       "api_key_masked": _mask_key((h.snapshot or {}).get("api_key", ""))} for h in rows]}
+
+
+@app.post("/api/v1/model-configs/{config_id}/rollback/{history_id}")
+def model_rollback(config_id: int, history_id: int, db: Session = Depends(db_session)):
+    from .db import ModelConfigHistory
+    item = db.get(ModelConfig, config_id)
+    entry = db.get(ModelConfigHistory, history_id)
+    if not item or not entry or entry.config_id != config_id:
+        raise HTTPException(404, "配置或历史记录不存在")
+    _record_history(db, item, "update")
+    snapshot = dict(entry.snapshot or {})
+    snapshot.pop("name", None)  # name is identity, not part of a rollback
+    if snapshot.get("enabled"):
+        db.query(ModelConfig).filter(ModelConfig.id != config_id).update({ModelConfig.enabled: False})
+    for key, value in snapshot.items():
+        setattr(item, key, value)
+    _record_history(db, item, "rollback")
+    db.commit()
+    return {"id": item.id, "rolled_back_to": history_id}
 
 
 @app.post("/api/v1/model-configs/{config_id}/connection-check")
 async def model_check(config_id: int, db: Session = Depends(db_session)):
     item = db.get(ModelConfig, config_id)
     if not item: raise HTTPException(404, "模型配置不存在")
-    return await model_connection_check({"enabled": item.enabled, "base_url": item.base_url, "model_name": item.model_name, "api_key_env_name": item.api_key_env_name, "timeout_seconds": item.timeout_seconds}, get_settings())
+    return await model_connection_check({"enabled": item.enabled, "base_url": item.base_url, "model_name": item.model_name,
+                                         "api_key": item.api_key, "api_key_env_name": item.api_key_env_name,
+                                         "timeout_seconds": item.timeout_seconds}, get_settings())
 
 
 @app.get("/api/v1/diagnostics/connectivity")

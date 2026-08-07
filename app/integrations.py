@@ -164,14 +164,19 @@ def normalize_node(item: dict[str, Any]) -> dict[str, Any]:
     return {"source": "dingtalk", "node_id": item.get("nodeId", ""), "workspace_id": item.get("workspaceId", ""), "name": item.get("name", ""), "type": item.get("type", ""), "category": item.get("category", ""), "extension": item.get("extension", ""), "url": item.get("url", "") or item.get("docUrl", ""), "size": item.get("size", 0) or 0, "has_children": bool(item.get("hasChildren")), "word_count": stats.get("wordCount", 0) or 0, "permission_role": item.get("permissionRole", ""), "creator_id": item.get("creatorId", ""), "modifier_id": item.get("modifierId", ""), "created_at": item.get("createTime", ""), "updated_at": item.get("modifiedTime", "")}
 
 
+def resolve_model_key(config: dict[str, Any]) -> str:
+    """Stored key first, env fallback second."""
+    return config.get("api_key") or os.getenv(config.get("api_key_env_name", "KG_MODEL_API_KEY") or "KG_MODEL_API_KEY", "")
+
+
 async def model_connection_check(config: dict[str, Any], settings: Settings) -> dict[str, Any]:
     if not config.get("enabled"):
         return {"status": "disabled", "message": "模型配置未启用，评审将使用规则引擎。"}
     if not config.get("base_url") or not config.get("model_name"):
         return {"status": "not_configured", "message": "缺少模型基础地址或模型名称。"}
-    key = os.getenv(config.get("api_key_env_name", "KG_MODEL_API_KEY"), "")
+    key = resolve_model_key(config)
     if not key:
-        return {"status": "not_configured", "message": f"环境变量 {config.get('api_key_env_name', 'KG_MODEL_API_KEY')} 未注入。"}
+        return {"status": "not_configured", "message": "未配置 API Key（页面填写或注入环境变量均可）。"}
     try:
         async with httpx.AsyncClient(timeout=min(int(config.get("timeout_seconds", 30)), 60)) as client:
             response = await client.get(f"{config['base_url'].rstrip('/')}/models", headers={"Authorization": f"Bearer {key}"})
@@ -186,18 +191,25 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
     The model receives a bounded temporary body only after the caller has enforced the
     explicit data-transfer policy. Its output is schema-checked before use.
     """
-    key = os.getenv(config.get("api_key_env_name", "KG_MODEL_API_KEY"), "")
+    key = resolve_model_key(config)
     if not key or not content:
         return None
     prompt = ("你是企业知识库评审器。依据评分标准通用-V1.1对文档评分。"
               "只返回 JSON：{\"score\":0-100,\"findings\":[{\"rule\":\"章节号\",\"deduction\":整数,\"message\":\"不引用正文的简短问题\"}]}。"
               "不要复述或引用文档原文。文件名：" + filename + "\n正文：\n" + content[:60000])
+    payload: dict[str, Any] = {"model": config["model_name"], "response_format": {"type": "json_object"},
+                               "messages": [{"role": "system", "content": "Return strict JSON only."}, {"role": "user", "content": prompt}]}
+    payload["temperature"] = config.get("temperature") if config.get("temperature") is not None else 0
+    if config.get("thinking_mode") == "on":
+        payload["enable_thinking"] = True
+    elif config.get("thinking_mode") == "off":
+        payload["enable_thinking"] = False
     try:
-        async with httpx.AsyncClient(timeout=min(int(config.get("timeout_seconds", 30)), 60)) as client:
+        async with httpx.AsyncClient(timeout=min(int(config.get("timeout_seconds", 30)), 120)) as client:
             response = await client.post(
                 f"{config['base_url'].rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {key}"},
-                json={"model": config["model_name"], "temperature": 0, "response_format": {"type": "json_object"}, "messages": [{"role": "system", "content": "Return strict JSON only."}, {"role": "user", "content": prompt}]},
+                json=payload,
             )
         if response.is_error:
             return None
