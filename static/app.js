@@ -109,10 +109,10 @@ async function uploaders(month,excl){const meta=await api('/api/v1/metrics/uploa
   const monthOpts=meta.months.map(m=>`<option value="${m.month}" ${m.month===month?'selected':''}>${m.month}（${nf(m.total)}）</option>`).join('');
   shell('上传统计',`快照 ${d.snapshot_id} · 覆盖 ${meta.workspace_count} 库 · ${d.note}`,`
   <div class="grid metrics">
-    ${statCard(month+' 上传（已映射人员）',nf(d.total_files),excl?'已剔除未映射/机器人':'含未映射')}
-    ${statCard('上传人数',d.items.length,'当月有上传的已映射员工')}
-    ${statCard('未映射文件数',nf(d.unmatched_files),'数字员工 / 离职 / 外部账号')}
-    ${statCard('参与部门',dept.items.filter(x=>x.department_name!=='未映射').length,'按 bi_center 归属')}
+    ${statCard(month+' 全量上传',nf(d.total_files),'知识资产口径：含机器人与未映射')}
+    ${statCard('其中人工上传',nf(d.human_files),'bi_center 匹配的在职员工')}
+    ${statCard('机器人 / 系统',nf(d.robot_files),'数字员工同步等；另有未映射 '+nf(d.unmatched_files))}
+    ${statCard('上传人数',d.uploader_count,'有上传的已映射员工')}
   </div>
   <section class="card section-gap"><div class="card-head"><h2>${month} 人员上传 Top 15</h2></div><div id="upChart" class="chart"></div></section>
   <div class="grid two-cols section-gap">

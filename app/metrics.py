@@ -256,19 +256,27 @@ def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limi
                       .order_by(func.sum(UploaderMonthStat.file_count).desc()).limit(500)).all()
     employees = _employee_rows(db, [r[0] for r in rows])
     items = []
-    unmatched_files = 0
+    # Totals always count everything — robot and unmatched volume is knowledge
+    # too; the exclude flag only shapes the person RANKING below.
+    total = robot_files = unmatched_files = human_files = 0
     for user_id, files, spaces in rows:
         person = _person(user_id, employees.get(user_id))
         entry = {**person, "files": int(files), "workspaces": int(spaces)}
-        if not person["matched"]:
+        total += int(files)
+        if person.get("is_robot"):
+            robot_files += int(files)
+        elif not person["matched"]:
             unmatched_files += int(files)
-            if exclude_unmatched:
-                continue
+        else:
+            human_files += int(files)
+        if exclude_unmatched and not person["matched"]:
+            continue
         items.append(entry)
-    total = sum(item["files"] for item in items)
     return {"snapshot_id": snapshot, "month": month, "exclude_unmatched": exclude_unmatched,
-            "items": items[:limit], "total_files": total, "unmatched_files": unmatched_files,
-            "note": "未映射含数字员工/离职/外部账号；bi_center 契约仅把 matched 且 includeInOfficialStats 的身份计入正式统计。"}
+            "items": items[:limit], "total_files": total, "human_files": human_files,
+            "robot_files": robot_files, "unmatched_files": unmatched_files,
+            "uploader_count": sum(1 for user_id, _f, _s in rows if _person(user_id, employees.get(user_id))["matched"]),
+            "note": "总量含机器人与未映射（知识资产口径）；排行按开关剔除。bi_center 仅把 matched 且 includeInOfficialStats 计入正式员工。"}
 
 
 def uploader_detail(db: Session, user_id: str) -> dict[str, Any]:
