@@ -128,10 +128,10 @@ def uploader_months_api(db: Session = Depends(db_session)):
 @app.get("/api/v1/metrics/uploaders")
 def uploaders_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                   exclude_unmatched: bool = True, limit: int = Query(default=50, ge=1, le=200),
-                  db: Session = Depends(db_session)):
+                  department: str = "", db: Session = Depends(db_session)):
     preview = metrics.uploaders(db, month, exclude_unmatched=False, limit=200)
     orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
-    return metrics.uploaders(db, month, exclude_unmatched=exclude_unmatched, limit=limit)
+    return metrics.uploaders(db, month, exclude_unmatched=exclude_unmatched, limit=limit, department=department)
 
 
 @app.get("/api/v1/metrics/uploaders/{user_id}")
@@ -200,6 +200,26 @@ async def notification_test(payload: NotifyTestRequest):
         return {"status": "sent", "result": result}
     except IntegrationError as exc:
         raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
+
+
+@app.get("/api/v1/reviews")
+def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_review|return)$"),
+                 query: str = "", offset: int = Query(default=0, ge=0),
+                 limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
+    stmt = select(ReviewInstance, Document).join(Document, Document.node_id == ReviewInstance.node_id)
+    if verdict:
+        stmt = stmt.where(ReviewInstance.verdict == verdict)
+    if query:
+        stmt = stmt.where(Document.name.contains(query))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = db.execute(stmt.order_by(ReviewInstance.created_at.desc()).offset(offset).limit(limit)).all()
+    return {"total": total, "offset": offset, "limit": limit,
+            "items": [{"review_instance_id": r.review_instance_id, "node_id": d.node_id, "document_name": d.name,
+                       "workspace_id": d.workspace_id, "uploader_name": d.uploader_name,
+                       "department_name": d.department_name, "ai_score": round(r.ai_score, 1),
+                       "verdict": r.verdict, "review_scope": r.review_scope, "trigger": r.trigger,
+                       "rule_version": r.rule_version, "created_at": r.created_at.isoformat() if r.created_at else None}
+                      for r, d in rows]}
 
 
 @app.get("/api/v1/stream-events")

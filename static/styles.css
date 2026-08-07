@@ -13,6 +13,7 @@ b{font-weight:600}
 /* header */
 .app-brand{display:flex;align-items:center;gap:11px;min-width:0}
 .brand-mark{width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,var(--blue),#3b82f6);color:#fff;font-weight:700;font-size:17px;display:grid;place-items:center;flex:none}
+.brand-img{width:36px;height:36px;border-radius:9px;flex:none;object-fit:cover}
 .brand-text{display:flex;flex-direction:column;line-height:1.25;min-width:0}
 .brand-text b{font-size:16px;white-space:nowrap}
 .brand-text small{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}

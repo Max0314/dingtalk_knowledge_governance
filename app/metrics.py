@@ -244,7 +244,7 @@ def uploader_months(db: Session) -> dict[str, Any]:
             "uploader_count": uploader_count, "workspace_count": space_count}
 
 
-def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limit: int = 50) -> dict[str, Any]:
+def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limit: int = 50, department: str = "") -> dict[str, Any]:
     snapshot = uploader_snapshot_id(db)
     stmt = (select(UploaderMonthStat.creator_user_id,
                    func.sum(UploaderMonthStat.file_count).label("files"),
@@ -270,6 +270,8 @@ def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limi
         else:
             human_files += int(files)
         if exclude_unmatched and not person["matched"]:
+            continue
+        if department and person["department_name"] != department:
             continue
         items.append(entry)
     return {"snapshot_id": snapshot, "month": month, "exclude_unmatched": exclude_unmatched,
