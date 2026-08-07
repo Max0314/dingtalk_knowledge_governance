@@ -12,7 +12,7 @@ from . import metrics, orgmap
 from .config import get_settings
 from .db import Document, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
-from .service import document_dict, review_dict, seed_demo, sync_from_dingtalk, workspace_dict
+from .service import document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -458,7 +458,17 @@ async def connectivity(db: Session = Depends(db_session)):
     else: ding_result = {"status": "not_configured", "message": "缺少钉钉应用凭据或 DINGTALK_SYNC_OPERATOR_ID。"}
     model = db.scalar(select(ModelConfig).where(ModelConfig.enabled.is_(True)))
     model_result = await model_connection_check({"enabled": bool(model), "base_url": model.base_url if model else "", "model_name": model.model_name if model else "", "api_key_env_name": model.api_key_env_name if model else "KG_MODEL_API_KEY", "timeout_seconds": model.timeout_seconds if model else 30}, settings)
-    return {"items": [{"name": "钉钉知识库", **ding_result}, {"name": "bi_center 组织架构", **(await BiCenterClient(settings).check())}, {"name": "AI 评审模型", **model_result}], "body_storage": "正文仅在 worker 内存/tmpfs 临时处理，数据库不保存正文。"}
+    if not settings.watch_workspaces:
+        watch_result = {"status": "not_configured", "message": "未配置 KG_WATCH_WORKSPACES，定向监控关闭。"}
+    else:
+        last_watch = db.scalar(select(SyncRun).where(SyncRun.mode.in_(("watch", "watch_seed"))).order_by(SyncRun.created_at.desc()).limit(1))
+        if not last_watch:
+            watch_result = {"status": "pending", "message": f"已配置目标「{settings.watch_workspaces}」，等待 worker 首轮扫描。"}
+        elif last_watch.status == "succeeded":
+            watch_result = {"status": "healthy", "message": f"最近扫描（{last_watch.mode}）：文件 {last_watch.documents_seen}，新增 {last_watch.documents_new}，变更 {last_watch.documents_changed}，{last_watch.created_at.isoformat()}。"}
+        else:
+            watch_result = {"status": "failed", "message": f"最近扫描失败：{last_watch.error_code}", "code": last_watch.error_code}
+    return {"items": [{"name": "钉钉知识库", **ding_result}, {"name": "bi_center 组织架构", **(await BiCenterClient(settings).check())}, {"name": "AI 评审模型", **model_result}, {"name": "定向监控 watcher", **watch_result}], "body_storage": "正文仅在 worker 内存/tmpfs 临时处理，数据库不保存正文。"}
 
 
 @app.get("/api/v1/diagnostics/sync-runs")
@@ -470,6 +480,16 @@ def sync_runs(db: Session = Depends(db_session)):
 async def start_sync(mode: str = "incremental", db: Session = Depends(db_session)):
     run = await sync_from_dingtalk(db, get_settings(), mode)
     return {"run_id": run.run_id, "status": run.status, "error_code": run.error_code, "documents_new": run.documents_new, "documents_changed": run.documents_changed}
+
+
+@app.post("/api/v1/watch/run")
+async def run_watch_now(db: Session = Depends(db_session)):
+    """On-demand watch cycle (same code path as the worker tick), for testing
+    and for ops after adding a workspace to KG_WATCH_WORKSPACES."""
+    settings = get_settings()
+    if not settings.watch_workspaces:
+        raise HTTPException(400, "未配置 KG_WATCH_WORKSPACES。")
+    return await run_watch_cycle_async(db, settings)
 
 
 # Read-only DingTalk proxy endpoints for interactive directory browsing; each request supplies the real operator UnionID.

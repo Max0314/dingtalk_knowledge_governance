@@ -21,7 +21,19 @@ class Settings(BaseSettings):
     notify_enabled: bool = False
     robot_code: str = ""  # defaults to the app key at call time when empty
     # Stream-mode event consumer (file-change events land in stream_events).
+    # 2026-08-07: storage events verifiably do NOT fire for knowledge-base
+    # uploads, so this stays a diagnostic channel only — detection lives in the
+    # targeted watcher below.
     stream_enabled: bool = False
+    # Targeted workspace watcher: comma-separated workspace ids, exact names or
+    # name fragments (resolved against the operator's workspace list). The
+    # first complete walk of a workspace only seeds the mirror; later walks
+    # enqueue reviews for new/changed files and soft-delete missing ones.
+    watch_workspaces: str = ""
+    watch_interval_seconds: int = 300
+    # A document is soft-deleted after this many consecutive complete walks
+    # without seeing it (recycle-bin restores clear the flag again).
+    watch_delete_misses: int = 2
     # Machine accounts (comma-separated userIds) excluded from person rankings.
     # bi_center currently classifies the digital employee as an official
     # employee, so the service marks its own operator account explicitly.

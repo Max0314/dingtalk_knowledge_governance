@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import time
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import func, select
@@ -95,48 +96,66 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     return True
 
 
+async def _upsert_document(db: Session, settings: Settings, run: SyncRun, workspace_id: str, item: dict,
+                           enqueue: bool, trigger_new: str, trigger_change: str) -> None:
+    """Persist one listed node and, when appropriate, queue a review.
+
+    ``item`` is a ``normalize_node`` dict — the source timestamps live under
+    ``created_at``/``updated_at`` (mapping them onto ``source_*`` columns here
+    fixes the earlier field-name mismatch that zeroed both columns).
+    """
+    run.documents_seen += 1
+    doc = db.get(Document, item["node_id"])
+    is_new = doc is None
+    changed = doc is not None and doc.source_updated_at != (item.get("updated_at") or "")
+    if not doc:
+        doc = Document(node_id=item["node_id"], workspace_id=workspace_id, name=item["name"])
+        db.add(doc); run.documents_new += 1
+    elif changed:
+        run.documents_changed += 1
+    for field in ("name", "category", "extension", "url"):
+        setattr(doc, field, item.get(field) or "")
+    doc.size = item.get("size") or 0
+    doc.word_count = item.get("word_count") or 0
+    doc.source_created_at = item.get("created_at") or ""
+    doc.source_updated_at = item.get("updated_at") or ""
+    doc.is_folder = item["has_children"]
+    if doc.is_deleted:  # seen again — a recycle-bin restore, not a new document
+        doc.is_deleted = False
+    doc.watch_misses = 0
+    if is_new or changed:
+        doc.uploader_key = item.get("creator_id", "") or doc.uploader_key
+        # bi_center is the single source of organization truth. Never infer a department locally.
+        resolved = await BiCenterClient(settings).resolve_batch([{"unionId": doc.uploader_key}], datetime.now(timezone.utc).strftime("%Y-%m")) if doc.uploader_key else []
+        identity = resolved[0] if resolved else {}
+        if identity.get("matched") and identity.get("includeInOfficialStats"):
+            doc.uploader_key = identity.get("employeeKey", doc.uploader_key)
+            doc.uploader_name = identity.get("employeeName", "")
+            doc.department_name = identity.get("departmentName", "")
+            doc.biz_group_name = identity.get("bizGroupName", "")
+            doc.org_matched = True
+        else:
+            doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
+    if enqueue and (is_new or changed) and not doc.is_folder:
+        db.flush()
+        pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
+        if not pending:
+            db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
+                             trigger=trigger_new if is_new else trigger_change, requested_by="system"))
+
+
 async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incremental") -> SyncRun:
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode)
     db.add(run); db.commit()
     client = DingtalkClient(settings)
     try:
-        async def persist_node(workspace_id: str, item: dict) -> None:
-            run.documents_seen += 1
-            doc = db.get(Document, item["node_id"])
-            is_new = doc is None
-            changed = doc is not None and doc.source_updated_at != item.get("updated_at", "")
-            if not doc:
-                doc = Document(node_id=item["node_id"], workspace_id=workspace_id, name=item["name"])
-                db.add(doc); run.documents_new += 1
-            elif changed:
-                run.documents_changed += 1
-            for field in ("name", "category", "extension", "url", "size", "word_count", "source_created_at", "source_updated_at"):
-                setattr(doc, field, item.get(field, "") if item.get(field) is not None else "")
-            doc.is_folder, doc.uploader_key, doc.discovered_at = item["has_children"], item.get("creator_id", ""), utcnow()
-            # bi_center is the single source of organization truth. Never infer a department locally.
-            resolved = await BiCenterClient(settings).resolve_batch([{"unionId": doc.uploader_key}], datetime.now(timezone.utc).strftime("%Y-%m"))
-            identity = resolved[0] if resolved else {}
-            if identity.get("matched") and identity.get("includeInOfficialStats"):
-                doc.uploader_key = identity.get("employeeKey", doc.uploader_key)
-                doc.uploader_name = identity.get("employeeName", "")
-                doc.department_name = identity.get("departmentName", "")
-                doc.biz_group_name = identity.get("bizGroupName", "")
-                doc.org_matched = True
-            else:
-                doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-            if (is_new or changed) and not doc.is_folder:
-                db.flush()
-                pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
-                if not pending:
-                    db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
-                                     trigger="sync" if is_new else "sync_change", requested_by="system"))
-
         async def walk(workspace_id: str, parent_node_id: str) -> None:
             next_token = ""
             while True:
                 page = await client.list_nodes(workspace_id, settings.dingtalk_sync_operator_id, parent_node_id, next_token)
                 for item in page["items"]:
-                    await persist_node(workspace_id, item)
+                    await _upsert_document(db, settings, run, workspace_id, item, enqueue=True,
+                                           trigger_new="sync", trigger_change="sync_change")
                     if item["has_children"]:
                         await walk(workspace_id, item["node_id"])
                 next_token = page.get("next_token", "")
@@ -166,6 +185,130 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
         run.status, run.error_code, run.finished_at = "failed", "sync_execution_failed", utcnow()
     db.commit()
     return run
+
+
+# ---------------------------------------------------------------------------
+# Targeted workspace watcher (pillar replacing the falsified Stream channel):
+# a cheap complete walk of a handful of configured workspaces detects new,
+# changed and deleted files without any DingTalk-side configuration.
+# ---------------------------------------------------------------------------
+
+_watch_cache: dict = {"at": 0.0, "key": "", "resolved": [], "unresolved": []}
+WATCH_RESOLUTION_TTL_SECONDS = 3600
+
+
+async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict:
+    """Map KG_WATCH_WORKSPACES tokens (id, exact name or name fragment) to
+    workspace ids using the operator's workspace list. Cached for an hour so a
+    5-minute tick does not spend five list calls every round."""
+    tokens = [token.strip() for token in settings.watch_workspaces.split(",") if token.strip()]
+    if not tokens:
+        return {"resolved": [], "unresolved": []}
+    key = "|".join(tokens)
+    if not force and _watch_cache["key"] == key and time.time() - _watch_cache["at"] < WATCH_RESOLUTION_TTL_SECONDS and _watch_cache["resolved"]:
+        return {"resolved": _watch_cache["resolved"], "unresolved": _watch_cache["unresolved"]}
+    client = DingtalkClient(settings)
+    spaces: list[dict] = []
+    next_token = ""
+    while True:
+        page = await client.list_workspaces(settings.dingtalk_sync_operator_id, next_token)
+        spaces.extend(page["items"])
+        next_token = page.get("next_token", "")
+        if not next_token:
+            break
+    resolved: list[dict] = []
+    unresolved: list[str] = []
+    seen_ids: set[str] = set()
+    for token in tokens:
+        matches = ([space for space in spaces if space["workspace_id"] == token]
+                   or [space for space in spaces if space.get("name", "") == token]
+                   or [space for space in spaces if token in space.get("name", "")])
+        if not matches:
+            unresolved.append(token)
+            continue
+        for space in matches:
+            if space["workspace_id"] in seen_ids:
+                continue
+            seen_ids.add(space["workspace_id"])
+            resolved.append({"token": token, "workspace_id": space["workspace_id"], "name": space.get("name", "")})
+    _watch_cache.update(at=time.time(), key=key, resolved=resolved, unresolved=unresolved)
+    return {"resolved": resolved, "unresolved": unresolved}
+
+
+async def watch_workspace(db: Session, settings: Settings, workspace_id: str) -> SyncRun:
+    """One complete walk of one workspace. The first walk (empty mirror) seeds
+    without queueing reviews — 482 pre-existing files must not flood the queue
+    on day one; every later walk queues reviews for new/changed files and
+    counts absences toward soft deletion."""
+    run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode="watch")
+    db.add(run); db.commit()
+    client = DingtalkClient(settings)
+    operator = settings.dingtalk_sync_operator_id
+    try:
+        raw = await client.workspace_detail(workspace_id, operator)
+        ws = db.get(Workspace, workspace_id)
+        if not ws:
+            ws = Workspace(workspace_id=workspace_id, name=raw.get("name", "") or workspace_id)
+            db.add(ws)
+        for field in ("name", "description", "url"):
+            if raw.get(field):
+                setattr(ws, field, raw[field])
+        ws.source_created_at = raw.get("created_at", "") or ws.source_created_at
+        ws.source_updated_at = raw.get("updated_at", "") or ws.source_updated_at
+        ws.creator_key = raw.get("creator_id", "") or ws.creator_key
+        ws.synced_at = utcnow()
+        run.workspaces_seen = 1
+        seeding = (db.scalar(select(func.count()).select_from(Document).where(Document.workspace_id == workspace_id)) or 0) == 0
+        if seeding:
+            run.mode = "watch_seed"
+        seen: set[str] = set()
+
+        async def walk(parent_node_id: str) -> None:
+            next_token = ""
+            while True:
+                page = await client.list_nodes(workspace_id, operator, parent_node_id, next_token, max_results=100)
+                for item in page["items"]:
+                    seen.add(item["node_id"])
+                    await _upsert_document(db, settings, run, workspace_id, item, enqueue=not seeding,
+                                           trigger_new="watch", trigger_change="watch_change")
+                    if item["has_children"]:
+                        await walk(item["node_id"])
+                next_token = page.get("next_token", "")
+                if not next_token:
+                    return
+
+        await walk(raw.get("root_node_id", "") or "")
+        # Only a complete, successful walk may accuse a document of deletion.
+        for doc in db.scalars(select(Document).where(Document.workspace_id == workspace_id, Document.is_deleted.is_(False))).all():
+            if doc.node_id in seen:
+                continue
+            doc.watch_misses += 1
+            if doc.watch_misses >= max(1, settings.watch_delete_misses):
+                doc.is_deleted = True
+        run.status, run.finished_at = "succeeded", utcnow()
+    except IntegrationError as exc:
+        run.status, run.error_code, run.finished_at = "failed", exc.code, utcnow()
+    except Exception:
+        run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
+    db.commit()
+    return run
+
+
+async def run_watch_cycle_async(db: Session, settings: Settings) -> dict:
+    targets = await resolve_watch_targets(settings)
+    runs = []
+    for target in targets["resolved"]:
+        run = await watch_workspace(db, settings, target["workspace_id"])
+        runs.append({"workspace_id": target["workspace_id"], "name": target["name"], "run_id": run.run_id,
+                     "mode": run.mode, "status": run.status, "documents_seen": run.documents_seen,
+                     "documents_new": run.documents_new, "documents_changed": run.documents_changed,
+                     "error_code": run.error_code})
+    return {"resolved": targets["resolved"], "unresolved": targets["unresolved"], "runs": runs}
+
+
+def run_watch_cycle(db: Session, settings: Settings) -> dict:
+    """Synchronous entry for the worker loop."""
+    return asyncio.run(run_watch_cycle_async(db, settings))
 
 
 def seed_demo(db: Session) -> None:

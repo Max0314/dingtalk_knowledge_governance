@@ -72,6 +72,9 @@ class Document(Base):
     content_fingerprint: Mapped[str] = mapped_column(String(128), default="")
     discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Consecutive complete watcher walks that failed to see this node; the
+    # watcher soft-deletes at the configured threshold and resets on sight.
+    watch_misses: Mapped[int] = mapped_column(Integer, default=0)
     workspace: Mapped[Workspace] = relationship(back_populates="documents")
     reviews: Mapped[list["ReviewInstance"]] = relationship(back_populates="document")
 

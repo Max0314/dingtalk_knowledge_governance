@@ -1,6 +1,6 @@
 # 增量更新设计（基于 2026-08-06/07 实证）
 
-**状态：** 架构已验证，事件通道运行中，对账扫描器已具备，主基线切换待决策。
+**状态：** 定向监控 watcher 已实现（试点：陈鹏列个人库）；Stream 事件通道对知识库上传**已证伪**；对账扫描器已具备；主基线切换待决策。
 
 ## 1. 实证结论：为什么不能靠时间戳轮询
 
@@ -18,12 +18,18 @@
 ## 2. 三支柱架构
 
 ```
-支柱一  存储事件（Stream 推送，已上线）
-        POST /v1.0/storage/events/subscribe  scope=ORG 一次订阅全企业
-        事件: storage_dentry_create / update / delete
-        字段: dentryId, spaceId, unionId(操作人), extension, type
-        覆盖: 钉盘与二进制文件为主；配额零消耗；落 stream_events 表
-        限制: 知识库原生文档操作不触发（实测）
+支柱一  定向监控 watcher（已实现，app/service.py watch_*）
+        原支柱一 Stream 存储事件 2026-08-07 实测证伪：知识库上传不触发
+        storage 事件（stream.py 降级为纯诊断通道）。
+        替代机制: worker 每 KG_WATCH_INTERVAL_SECONDS(默认300s) 对
+        KG_WATCH_WORKSPACES（id/名称/名称片段，1h 缓存解析）做全量遍历：
+        首轮=播种不评审(mode watch_seed)；后续 首见=watch 评审、
+        updated_at 变化=watch_change 重评、连续 KG_WATCH_DELETE_MISSES
+        轮缺席=软删、复现=撤销软删。
+        成本: 个人库(~500节点)每轮 ~10 次调用，5 分钟档月耗 <0.1% 配额；
+        扩到重点库按目录数线性增长，全 135 库请用支柱三节奏。
+        可选增强: 库自动化「节点创建时→AI表格新增记录」（目标多维表必须
+        位于库内，逐库配置）或宜搭表单登记（读取链路待验证）。
 
 支柱二  文件操作行为 API（专属钉钉，开通审批中）
         GET /v1.0/exclusive/fileAuditLogs  游标分页(nextGmtCreate+nextBizId)
@@ -61,7 +67,9 @@
 
 ## 5. 待办
 
-1. 事件→镜像消费流水线（dedupe by eventId → dentry 反查 → 更新镜像 → 触发评审）
-2. 支柱二审批通过后：增量拉取器 + 与事件流互校
-3. 周期对账排产（建议每周日凌晨，看门狗模式）
-4. bi_center 数字员工身份策略反馈（当前 official=true 需上游修正）
+1. ~~事件→镜像消费流水线~~（Stream 证伪作废，由定向监控 watcher 取代，2026-08-07 已实现）
+2. 正文获取与二进制解析（docx/pdf/xlsx → tmpfs 临时抽取），评审从元数据档升级到内容档
+3. 支柱二审批通过后：增量拉取器 + 与 watcher 互校
+4. 周期对账排产（建议每周日凌晨，看门狗模式）
+5. bi_center 数字员工身份策略反馈（当前 official=true 需上游修正）
+6. 分类评审策略（file_class：文档/表格/图片/工程残留 → 评审口径矩阵）

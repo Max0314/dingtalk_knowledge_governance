@@ -26,6 +26,7 @@ Server deployment: see [docs/deployment-guide.md](docs/deployment-guide.md)
 ## Implemented capabilities
 
 - Read-only DingTalk workspace/node adapters, incremental sync batches, and connection diagnostics.
+- Targeted workspace watcher (`KG_WATCH_WORKSPACES`): periodic complete walks of pilot workspaces that seed silently, queue reviews for new/changed files, and soft-delete files missing for consecutive walks.
 - Document metadata, ingestion time, monthly counts, new/changed increments, immutable review instances, and derived rerun counts.
 - Read-only `bi_center` identity contract adapter using `employeeKey=UnionID`.
 - Explainable deductions based on the provided V1.1 rule; see [scoring mapping](docs/scoring-standard-v1.1-mapping.md).
