@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     robot_code: str = ""  # defaults to the app key at call time when empty
     # Stream-mode event consumer (file-change events land in stream_events).
     stream_enabled: bool = False
+    # Machine accounts (comma-separated userIds) excluded from person rankings.
+    # bi_center currently classifies the digital employee as an official
+    # employee, so the service marks its own operator account explicitly.
+    robot_user_ids: str = ""
     # DingTalk login guard for /api/*. Off by default so local dev and tests
     # run open; the server .env turns it on with a real secret.
     auth_enabled: bool = False

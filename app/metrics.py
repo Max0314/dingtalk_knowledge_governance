@@ -19,7 +19,12 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .config import get_settings
 from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, UploaderMonthStat, Workspace
+
+
+def robot_ids() -> set[str]:
+    return {value.strip() for value in get_settings().robot_user_ids.split(",") if value.strip()}
 
 BULK_DAY_MIN = 200
 BULK_DAY_SHARE = 0.25
@@ -214,11 +219,16 @@ def _employee_rows(db: Session, user_ids: list[str]) -> dict[str, EmployeeMap]:
 
 
 def _person(user_id: str, employee: EmployeeMap | None) -> dict[str, Any]:
+    if user_id in robot_ids():
+        return {"user_id": user_id, "name": (employee.name if employee else "") or "数字员工",
+                "department_name": "系统/机器人", "biz_group_name": "系统/机器人",
+                "matched": False, "include_official": False, "is_robot": True}
     if employee and employee.matched:
         return {"user_id": user_id, "name": employee.name, "department_name": employee.department_name,
-                "biz_group_name": employee.biz_group_name, "matched": True, "include_official": employee.include_official}
+                "biz_group_name": employee.biz_group_name, "matched": True,
+                "include_official": employee.include_official, "is_robot": False}
     return {"user_id": user_id, "name": (employee.name if employee else "") or "", "department_name": "未映射",
-            "biz_group_name": "未映射", "matched": False, "include_official": False}
+            "biz_group_name": "未映射", "matched": False, "include_official": False, "is_robot": False}
 
 
 def uploader_months(db: Session) -> dict[str, Any]:
