@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     # Comma list of file classes (app.fileclass) that auto-enter the review
     # queue. Empty falls back to the module default.
     review_classes: str = ""
+    # Composite score = rule_weight * rule-compliance + (1-rule_weight) * model
+    # content score, when a model review is available.
+    score_rule_weight: float = 0.4
     # Comma list of workspace ids allowed to receive review push messages.
     # Empty = no restriction (pilot behavior). Set before org-wide rollout.
     notify_workspaces: str = ""

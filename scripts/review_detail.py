@@ -25,6 +25,7 @@ def main() -> None:
         if not instance:
             print(json.dumps({"error": "no_review"}))
             return
+        model_block = (instance.dimensions or {}).get("model") or {}
         print(json.dumps({
             "name": doc.name if doc else "?", "file_class": doc.file_class if doc else "?",
             "storage_dentry_id_set": bool(doc.storage_dentry_id) if doc else False,
@@ -32,6 +33,10 @@ def main() -> None:
             "trigger": instance.trigger, "rule_version": instance.rule_version,
             "model_config_version": instance.model_config_version,
             "created_at": instance.created_at.isoformat(),
+            "dual_track": {key: model_block.get(key) for key in
+                           ("genre", "rule_score", "model_score", "composite", "model_dimensions")} if model_block else None,
+            "advisory_dims": [key for key, value in (instance.dimensions or {}).items()
+                              if isinstance(value, dict) and value.get("advisory")],
             "findings": [finding.get("message") for finding in (instance.findings or [])][:6],
         }, ensure_ascii=False, indent=2))
 

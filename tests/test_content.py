@@ -101,9 +101,51 @@ def test_model_score_recomputes_verdict(monkeypatch):
         db.commit()
         settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
         instance = service.run_review(db, settings, "content-2", "test")
-        assert instance.ai_score == 35 and instance.verdict == "return"  # verdict follows the final score
+        model_block = instance.dimensions["model"]
+        assert model_block["model_score"] == 35 and model_block["rule_score"] > 35
+        expected = round(0.4 * model_block["rule_score"] + 0.6 * 35)
+        assert instance.ai_score == expected  # composite, not a silent override
+        assert instance.verdict == ("pass" if expected >= 70 else "manual_review" if expected >= 60 else "return")
         assert instance.model_config_version == "test-v1"
         db.query(ModelConfig).filter(ModelConfig.name == "test-model").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_genre_demotes_document_rules_to_advisory(monkeypatch):
+    import app.content as content_module
+    from app import service
+    from app.db import ModelConfig
+
+    async def fake_fetch(settings, doc):
+        return ("步骤一：连接设备。\n步骤二：执行命令。\n步骤三：检查输出。", "storage_download")
+
+    async def fake_model(config, content, filename, file_class="document"):
+        return {"score": 90, "genre": "测试用例",
+                "dimensions": {"要素完整": 14, "准确清晰": 14, "结构可读": 13, "规范性": 13, "文体专属": 36},
+                "findings": []}
+
+    monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)
+    monkeypatch.setattr(service, "model_score_content", fake_model)
+    init_db()
+    with SessionLocal() as db:
+        if not db.get(Workspace, "content-ws"):
+            db.add(Workspace(workspace_id="content-ws", name="抽取测试库"))
+        db.add(ModelConfig(name="genre-model", base_url="http://x", model_name="m", api_key="k",
+                           enabled=True, version="genre-v1"))
+        if not db.get(Document, "content-3"):
+            db.add(Document(node_id="content-3", workspace_id="content-ws", name="登录流程测试用例.docx",
+                            extension="docx", file_class="document"))
+        db.commit()
+        settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
+        instance = service.run_review(db, settings, "content-3", "test")
+        dims = instance.dimensions
+        assert dims["model"]["genre"] == "测试用例"
+        assert any(dims.get(key, {}).get("advisory") for key in ("metadata", "structure", "abstract", "rag"))
+        # Advisory deductions do not count: rule score ignores document-shaped dims.
+        counted = sum(d["deduction"] for k, d in dims.items() if k != "model" and not d.get("advisory"))
+        assert dims["model"]["rule_score"] == 100 - counted
+        assert instance.ai_score == round(0.4 * dims["model"]["rule_score"] + 0.6 * 90)
+        db.query(ModelConfig).filter(ModelConfig.name == "genre-model").delete(synchronize_session=False)
         db.commit()
 
 

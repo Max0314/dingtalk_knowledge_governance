@@ -279,6 +279,55 @@ async def model_connection_check(config: dict[str, Any], settings: Settings) -> 
         return {"status": "failed", "message": "模型服务连接失败。"}
 
 
+GENRE_RUBRICS = """· 规范制度：适用范围明确、版本与生效信息完整、条款可执行不含糊、与现行流程无明显冲突
+· 方案设计：背景与目标清楚、方案对比或选型依据充分、实施计划可落地、风险与对策
+· 测试用例：前置条件与环境说明、步骤可复现、每步预期结果与判定标准明确、覆盖点清晰有标识
+· 测试报告：结论先行且明确、测试环境与范围交代完整、数据支撑结论、遗留问题与风险如实列出
+· 操作手册：步骤完整可跟随、关键处有示例或截图说明、异常情况与回退处理、面向读者无前置知识断层
+· 会议纪要：决议明确不含糊、每项决议有责任人与时限、遗留议题清楚
+· 数据报告：数据来源与统计口径说明、结论与数据一致、图表可读
+· 其他知识文档：按通用四维从严评估"""
+
+JSON_CONTRACT = ("只返回 JSON："
+                 "{\"genre\":\"文体\",\"score\":0-100,"
+                 "\"dimensions\":{\"要素完整\":0-15,\"准确清晰\":0-15,\"结构可读\":0-15,\"规范性\":0-15,\"文体专属\":0-40},"
+                 "\"findings\":[{\"rule\":\"维度名\",\"deduction\":整数,\"message\":\"不引用原文的具体问题与可执行的整改建议\"}]}。"
+                 "不要复述或引用文档原文。")
+
+
+def build_review_prompt(file_class: str, filename: str) -> str:
+    """Genre-aware two-stage review prompt. The model classifies the genre
+    first, then scores against that genre's rubric — a test case is judged as
+    a test case, not as a missing-abstract essay."""
+    if file_class == "sheet":
+        return ("你是企业知识库评审员。这是一份电子表格（内容为提取出的单元格文本，顺序可能与表格布局不同）。"
+                "文体固定为「电子表格」。评分（总分100）：表头与字段命名清晰完整(0-30)、必要的说明或注释(0-25)、"
+                "术语与格式一致性(0-25)、文件命名规范(0-20)。"
+                "【不要】因缺少摘要、章节结构、版本历史等文档特有要素扣分。"
+                "只返回 JSON：{\"genre\":\"电子表格\",\"score\":0-100,"
+                "\"dimensions\":{\"表头与字段\":0-30,\"说明与注释\":0-25,\"一致性\":0-25,\"命名规范\":0-20},"
+                "\"findings\":[{\"rule\":\"维度名\",\"deduction\":整数,\"message\":\"不引用原文的具体问题与整改建议\"}]}。"
+                "不要复述或引用文档原文。文件名：" + filename)
+    if file_class == "slide":
+        return ("你是企业知识库评审员。这是一份演示文稿（内容为逐页提取的文字）。文体固定为「演示文稿」。"
+                "评分（总分100）：逻辑主线清晰(0-30)、每页要点明确不堆砌(0-25)、标题与层次结构(0-25)、命名与用语规范(0-20)。"
+                "【不要】因缺少摘要、版本历史等文档特有要素扣分。"
+                "只返回 JSON：{\"genre\":\"演示文稿\",\"score\":0-100,"
+                "\"dimensions\":{\"逻辑主线\":0-30,\"每页要点\":0-25,\"层次结构\":0-25,\"规范性\":0-20},"
+                "\"findings\":[{\"rule\":\"维度名\",\"deduction\":整数,\"message\":\"不引用原文的具体问题与整改建议\"}]}。"
+                "不要复述或引用文档原文。文件名：" + filename)
+    return ("你是企业知识库评审员。请先判定文档文体，再按对应标准评分。\n"
+            "第一步·文体判定（从下列选一）：规范制度 / 方案设计 / 测试用例 / 测试报告 / 操作手册 / 会议纪要 / 数据报告 / 其他知识文档\n"
+            "第二步·评分（总分100 = 通用60 + 文体专属40）：\n"
+            "通用四维（各15分）：要素完整（该文体应有的要素是否齐全）、准确清晰（表述明确、术语一致）、"
+            "结构可读（组织合理、便于查阅）、规范性（命名、版本信息、格式统一）。\n"
+            "文体专属要点（40分，按判定的文体取用）：\n" + GENRE_RUBRICS + "\n"
+            + JSON_CONTRACT + "文件名：" + filename)
+
+
+ADVISORY_GENRES = ("测试用例", "测试报告", "会议纪要", "数据报告")
+
+
 async def model_score_content(config: dict[str, Any], content: str, filename: str,
                               file_class: str = "document") -> dict[str, Any] | None:
     """Invoke an OpenAI-compatible model without persisting or logging document text.
@@ -289,15 +338,7 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
     key = resolve_model_key(config)
     if not key or not content:
         return None
-    if file_class == "sheet":
-        rubric = ("这是一份电子表格（内容为提取出的单元格文本，顺序可能与表格布局不同）。"
-                  "评估维度：文件命名规范、表头/字段命名是否清晰完整、是否有必要的说明或注释、术语一致性、数据可读性。"
-                  "【不要】因缺少摘要、章节结构、版本历史等文档特有要素扣分。")
-    else:
-        rubric = "依据评分标准通用-V1.1对文档评分。"
-    prompt = ("你是企业知识库评审器。" + rubric +
-              "只返回 JSON：{\"score\":0-100,\"findings\":[{\"rule\":\"章节号\",\"deduction\":整数,\"message\":\"不引用正文的简短问题\"}]}。"
-              "不要复述或引用文档原文。文件名：" + filename + "\n正文：\n" + content[:60000])
+    prompt = build_review_prompt(file_class, filename) + "\n正文：\n" + content[:60000]
     payload: dict[str, Any] = {"model": config["model_name"], "response_format": {"type": "json_object"},
                                "messages": [{"role": "system", "content": "Return strict JSON only."}, {"role": "user", "content": prompt}]}
     payload["temperature"] = config.get("temperature") if config.get("temperature") is not None else 0
@@ -327,6 +368,15 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
         for item in findings[:20]:
             if isinstance(item, dict):
                 safe_findings.append({"rule": str(item.get("rule", "model"))[:32], "deduction": max(0, min(100, int(item.get("deduction", 0) or 0))), "message": str(item.get("message", "模型发现问题。"))[:240]})
-        return {"score": score, "findings": safe_findings}
+        raw_dims = result.get("dimensions", {})
+        dimensions = {}
+        if isinstance(raw_dims, dict):
+            for key, value in list(raw_dims.items())[:8]:
+                try:
+                    dimensions[str(key)[:16]] = max(0, min(100, round(float(value), 1)))
+                except (TypeError, ValueError):
+                    continue
+        return {"score": score, "genre": str(result.get("genre", "") or "")[:16],
+                "dimensions": dimensions, "findings": safe_findings}
     except (httpx.HTTPError, ValueError, TypeError, KeyError):
         return None

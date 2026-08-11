@@ -197,10 +197,23 @@ async function reviews(state_={verdict:'',query:'',offset:0}){const qs=new URLSe
   if(pv)pv.onclick=()=>reviews({...state_,offset:Math.max(0,state_.offset-50)});
   if(nx)nx.onclick=()=>reviews({...state_,offset:state_.offset+50})}
 
-async function documentDetail(id){const d=await api('/api/v1/documents/'+id);const r=d.latest_review;const dims=r?Object.values(r.dimensions):[];
+async function documentDetail(id){const d=await api('/api/v1/documents/'+id);const r=d.latest_review;
+  const allDims=r?r.dimensions:{};const model=allDims.model;const ruleDims=Object.entries(allDims).filter(([k])=>k!=='model').map(([,v])=>v);
+  const dualBanner=model?`<section class="card section-gap"><div class="card-head"><h2>综合评分构成</h2><span class="chip">文体：${model.genre||'未判定'}</span></div>
+    <div class="detail-meta" style="font-size:15px;flex-wrap:wrap;gap:18px">
+      <span>规则合规分 <b>${model.rule_score}</b> × ${Math.round((model.rule_weight??0.4)*100)}%</span>
+      <span>＋</span>
+      <span>模型内容分 <b>${model.model_score}</b> × ${Math.round((1-(model.rule_weight??0.4))*100)}%</span>
+      <span>＝</span>
+      <span>综合 <b class="score ${scoreClass(r.ai_score)}">${r.ai_score}</b></span>
+    </div>
+    ${model.model_dimensions&&Object.keys(model.model_dimensions).length?`<div class="controls" style="flex-wrap:wrap;gap:8px;margin-top:10px">${Object.entries(model.model_dimensions).map(([k,v])=>`<span class="chip">${k} ${v}</span>`).join('')}</div>`:''}
+    ${model.findings&&model.findings.length?`<ul style="margin-top:10px">${model.findings.map(f=>`<li>${f.message}</li>`).join('')}</ul>`:''}
+  </section>`:'';
   shell('评审详情','AI 分数为建议；最终结论由知识库审核员保存。',`
   <section class="card"><div class="detail-header"><div class="document-icon">▤</div><div><h2 style="margin:0">${d.name}</h2><p class="sub">节点 ${d.node_id} · 知识库 ${state.coverageNames[d.workspace_id]||d.workspace_id}</p><div class="detail-meta"><span>上传人：${fmt(d.uploader_name)}</span><span>入库时间：${fmt(d.source_created_at)}</span><span>归属：${fmt(d.department_name)} / ${fmt(d.biz_group_name)}</span><span>重评次数：${d.rerun_count}</span></div></div><div class="big-score">${r?.ai_score??'—'}<span>/100</span><br><small>${r?verdictText(r.verdict):'未评审'}</small></div></div></section>
-  <section class="grid deductions section-gap">${dims.map(x=>`<article class="card deduction"><div class="field-label">${x.label}</div><div class="number">-${x.deduction}<small> / ${x.cap}</small></div><ul>${x.findings.length?x.findings.map(f=>`<li>${f.message}</li>`).join(''):'<li>未发现扣分项</li>'}</ul></article>`).join('')||'<div class="card muted">暂无评审维度数据</div>'}</section>
+  ${dualBanner}
+  <section class="grid deductions section-gap">${ruleDims.map(x=>`<article class="card deduction${x.advisory?' muted':''}"><div class="field-label">${x.label}${x.advisory?' <span class="chip amber">仅提示不计分</span>':''}</div><div class="number">${x.advisory?'<small>该文体不适用</small>':`-${x.deduction}<small> / ${x.cap}</small>`}</div><ul>${x.findings.length?x.findings.map(f=>`<li>${f.message}</li>`).join(''):'<li>未发现扣分项</li>'}</ul></article>`).join('')||'<div class="card muted">暂无评审维度数据</div>'}</section>
   <section class="card section-gap"><h2>评审记录</h2>${d.reviews.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>实例 ID</th><th class="num">分数</th><th>范围</th><th>触发</th><th>规则版本</th><th>时间</th></tr></thead><tbody>${d.reviews.map(x=>`<tr><td><small>${x.review_instance_id}</small></td><td class="num score ${scoreClass(x.ai_score)}">${x.ai_score}</td><td>${x.review_scope==='full_content'?'完整正文':'元数据合规'}</td><td>${x.trigger}</td><td>${x.rule_version}</td><td>${(x.created_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无记录</p>'}
   <div class="section-gap"><button class="primary" id="rerun">重新评审</button><button class="secondary" id="back" style="margin-left:8px">返回列表</button></div></section>`);
   document.querySelector('#back').onclick=()=>navigate('documents');

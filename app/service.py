@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .db import Document, ModelConfig, ReviewInstance, ReviewJob, SyncRun, Workspace, WorkspaceRole, utcnow
 from .fileclass import classify, review_classes
-from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_score_content
+from .integrations import ADVISORY_GENRES, BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
 from .scoring import PASS_SCORE, RETURN_SCORE, RULE_VERSION, score_document
 
@@ -72,13 +72,33 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
                                                         "timeout_seconds": model.timeout_seconds}, content, doc.name,
                                                        doc.file_class or "document"))
         if model_result:
-            result["ai_score"] = model_result["score"]
+            # Dual-track scoring: the rule-compliance score stays reproducible,
+            # the model judges content quality within its detected genre, and
+            # the stored score is their weighted composite. Genres without a
+            # document shape (test cases, reports, minutes) demote the
+            # document-shaped rule dimensions to advisory — flagged, not fined.
+            genre = model_result.get("genre", "")
+            if genre in ADVISORY_GENRES:
+                for key in ("metadata", "abstract", "structure", "rag"):
+                    dim = result["dimensions"].get(key)
+                    if dim and dim.get("deduction"):
+                        dim["advisory"] = True
+            rule_score = 100 - sum(dim["deduction"] for dim in result["dimensions"].values()
+                                   if not dim.get("advisory"))
+            model_score = model_result["score"]
+            weight = min(max(settings.score_rule_weight, 0.0), 1.0)
+            composite = round(weight * rule_score + (1 - weight) * model_score)
             result["findings"].extend(model_result["findings"])
-            result["dimensions"]["model"] = {"label": "模型补充评审", "deduction": 0, "cap": 0, "findings": model_result["findings"]}
-            # The verdict must follow the FINAL score — the rule-engine verdict
-            # computed before the model override let a 35 slip through as pass.
-            result["verdict"] = ("pass" if result["ai_score"] >= PASS_SCORE
-                                 else "manual_review" if result["ai_score"] >= RETURN_SCORE else "return")
+            result["dimensions"]["model"] = {
+                "label": "模型内容评审", "deduction": 0, "cap": 0,
+                "genre": genre, "model_score": model_score, "rule_score": rule_score,
+                "composite": composite, "rule_weight": weight,
+                "model_dimensions": model_result.get("dimensions", {}),
+                "findings": model_result["findings"],
+            }
+            result["ai_score"] = composite
+            result["verdict"] = ("pass" if composite >= PASS_SCORE
+                                 else "manual_review" if composite >= RETURN_SCORE else "return")
     instance = ReviewInstance(
         review_instance_id=str(uuid.uuid4()), node_id=node_id, ai_score=result["ai_score"], verdict=result["verdict"],
         review_scope=scope, rule_version=RULE_VERSION,
