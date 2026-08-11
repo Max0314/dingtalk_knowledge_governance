@@ -35,6 +35,10 @@ def main() -> None:
                        func.max(SyncRun.created_at))
                 .where(SyncRun.mode.in_(("watch", "watch_seed")))
                 .group_by(SyncRun.mode, SyncRun.status)).all()]
+        out["run_errors"] = {code: count for code, count in db.execute(
+            select(SyncRun.error_code, func.count()).where(SyncRun.mode.in_(("watch", "watch_seed")),
+                                                           SyncRun.status == "failed")
+            .group_by(SyncRun.error_code)).all()}
         out["notifications"] = {
             "by_status": {status: count for status, count in db.execute(
                 select(Notification.status, func.count()).group_by(Notification.status)).all()},
@@ -55,6 +59,10 @@ def main() -> None:
             ws_id = target["workspace_id"]
             docs = db.scalar(select(func.count()).select_from(Document)
                              .where(Document.workspace_id == ws_id, Document.is_deleted.is_(False))) or 0
+            # Folder count ~= DingTalk list calls per walk cycle (cost driver).
+            folders = db.scalar(select(func.count()).select_from(Document)
+                                .where(Document.workspace_id == ws_id, Document.is_folder.is_(True),
+                                       Document.is_deleted.is_(False))) or 0
             deleted = db.scalar(select(func.count()).select_from(Document)
                                 .where(Document.workspace_id == ws_id, Document.is_deleted.is_(True))) or 0
             node_ids = select(Document.node_id).where(Document.workspace_id == ws_id)
@@ -67,7 +75,7 @@ def main() -> None:
             latest = db.scalars(select(ReviewInstance).where(ReviewInstance.node_id.in_(node_ids))
                                 .order_by(ReviewInstance.created_at.desc()).limit(5)).all()
             out["workspaces"].append({
-                "workspace_id": ws_id, "name": target["name"], "documents": docs, "deleted": deleted,
+                "workspace_id": ws_id, "name": target["name"], "documents": docs, "folders": folders, "deleted": deleted,
                 "review_jobs": jobs, "review_instances": reviews, "reviews_by_trigger": reviews_by_trigger,
                 "latest_reviews": [{"node_id": r.node_id, "score": r.ai_score, "verdict": r.verdict,
                                     "scope": r.review_scope, "trigger": r.trigger,
