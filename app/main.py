@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from . import metrics, orgmap
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .service import document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict
 
@@ -109,11 +109,13 @@ def dashboard(db: Session = Depends(db_session)):
         latest.append(document_dict(doc, review, max(0, count - 1)))
     coverage_summary = metrics.coverage(db)["summary"] if workspaces else {"visible_workspaces": 0, "scanned": 0, "empty": 0, "excluded": 0}
     # The snapshot-frozen org note dates from the personal-authorization era
-    # (23.5% coverage); the digital employee now sees the registered set, so
-    # the caveat that still holds is the headline-baseline scope, not access.
+    # (23.5% coverage); rebuild it from whichever snapshot is the primary
+    # baseline right now so a baseline switch never leaves a stale banner.
     org_context = dict(increments["baseline"]["definition"].get("org_context", {}))
-    org_context["note"] = (f"文件总量与月度增量按 2026-08-05 主基线口径（44 库）+ 实时增量计算；"
-                           f"服务身份现已可见并登记 {workspaces} 个知识库，全量口径切换待业务确认。")
+    primary = db.get(HistoricalSnapshot, metrics.primary_snapshot_id(db))
+    baseline_libs = len(((primary.definition or {}).get("workspaces") or {})) if primary else 0
+    org_context["note"] = (f"文件总量与月度增量按全量基线 {primary.snapshot_id if primary else '—'}"
+                           f"（{baseline_libs or '—'} 库）+ 实时增量计算；服务身份已登记 {workspaces} 个知识库。")
     return {
         "metrics": {
             "workspace_count": workspaces,

@@ -64,7 +64,8 @@ def _collect(db: Session) -> dict[str, Any]:
     files: dict[str, tuple[str, str]] = {}  # node_id -> (workspace_id, created_at)
     for workspace_id, node_id, created in db.execute(
             select(HistoricalFileNode.workspace_id, HistoricalFileNode.node_id, HistoricalFileNode.source_created_at)
-            .where(HistoricalFileNode.snapshot_id == baseline)):
+            .where(HistoricalFileNode.snapshot_id == baseline,
+                   HistoricalFileNode.node_type != "folder")):  # the 135-lib scan stores folders too
         files[node_id] = (workspace_id, created or "")
     for workspace_id, node_id, created in db.execute(
             select(Document.workspace_id, Document.node_id, Document.source_created_at)
