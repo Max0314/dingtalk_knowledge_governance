@@ -10,7 +10,7 @@ from .db import Document, ModelConfig, ReviewInstance, ReviewJob, SyncRun, Works
 from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
-from .scoring import RULE_VERSION, score_document
+from .scoring import PASS_SCORE, RETURN_SCORE, RULE_VERSION, score_document
 
 
 def iso(value):
@@ -69,6 +69,10 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
             result["ai_score"] = model_result["score"]
             result["findings"].extend(model_result["findings"])
             result["dimensions"]["model"] = {"label": "模型补充评审", "deduction": 0, "cap": 0, "findings": model_result["findings"]}
+            # The verdict must follow the FINAL score — the rule-engine verdict
+            # computed before the model override let a 35 slip through as pass.
+            result["verdict"] = ("pass" if result["ai_score"] >= PASS_SCORE
+                                 else "manual_review" if result["ai_score"] >= RETURN_SCORE else "return")
     instance = ReviewInstance(
         review_instance_id=str(uuid.uuid4()), node_id=node_id, ai_score=result["ai_score"], verdict=result["verdict"],
         review_scope=scope, rule_version=RULE_VERSION,

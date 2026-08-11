@@ -64,6 +64,38 @@ def test_fetch_degrades_without_numeric_id():
     assert text == "" and source == "no_numeric_id"
 
 
+def test_model_score_recomputes_verdict(monkeypatch):
+    import app.content as content_module
+    from app import service
+    from app.db import ModelConfig
+
+    async def fake_fetch(settings, doc):
+        return ("规范正文，规则分本会很高。", "storage_download")
+
+    async def fake_model(config, content, filename):
+        return {"score": 35, "findings": [{"rule": "model", "deduction": 0, "message": "内容质量差。"}]}
+
+    monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)
+    monkeypatch.setattr(service, "model_score_content", fake_model)
+    init_db()
+    with SessionLocal() as db:
+        if not db.get(Workspace, "content-ws"):
+            db.add(Workspace(workspace_id="content-ws", name="抽取测试库"))
+        if not db.scalar(__import__("sqlalchemy").select(ModelConfig).where(ModelConfig.name == "test-model")):
+            db.add(ModelConfig(name="test-model", base_url="http://x", model_name="m", api_key="k",
+                               enabled=True, version="test-v1"))
+        if not db.get(Document, "content-2"):
+            db.add(Document(node_id="content-2", workspace_id="content-ws", name="判级测试_V1.0.docx",
+                            extension="docx", file_class="document"))
+        db.commit()
+        settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
+        instance = service.run_review(db, settings, "content-2", "test")
+        assert instance.ai_score == 35 and instance.verdict == "return"  # verdict follows the final score
+        assert instance.model_config_version == "test-v1"
+        db.query(ModelConfig).filter(ModelConfig.name == "test-model").delete(synchronize_session=False)
+        db.commit()
+
+
 def test_run_review_uses_extracted_content(monkeypatch):
     import app.content as content_module
 
