@@ -95,6 +95,22 @@ def test_non_wiki_and_ambiguous_events(env):
         db.commit()
 
 
+def test_snapshot_bootstrap_learns_unwalked_workspace(env):
+    settings, walks = env
+    from app.db import HistoricalFileNode, HistoricalSnapshot
+    with SessionLocal() as db:
+        if not db.get(HistoricalSnapshot, "bridge-snap"):
+            db.add(HistoricalSnapshot(snapshot_id="bridge-snap"))
+            db.add(HistoricalFileNode(snapshot_id="bridge-snap", workspace_id="never-walked-ws",
+                                      node_id="snap-node-1", name="仅快照可见.docx", extension="docx"))
+            db.commit()
+    add_event("tb-7", "仅快照可见.docx", "99005")
+    summary = run_bridge(settings)
+    assert summary["learned"] == 1 and summary["walks"] == []  # learned, but watched-scope gates the walk
+    with SessionLocal() as db:
+        assert db.get(SpaceMap, "99005").workspace_id == "never-walked-ws"
+
+
 def test_scope_gates_ungoverned_workspaces(env):
     settings, walks = env
     with SessionLocal() as db:

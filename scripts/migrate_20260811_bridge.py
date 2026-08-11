@@ -33,6 +33,12 @@ def main() -> None:
             "documents.file_class")
         run(connection, "CREATE INDEX ix_documents_file_class ON documents (file_class)",
             "documents.file_class index")
+        if engine.dialect.name == "mysql":
+            run(connection, "CREATE INDEX ix_hfn_name ON historical_file_nodes (name(191))",
+                "historical_file_nodes.name index")
+        else:
+            run(connection, "CREATE INDEX IF NOT EXISTS ix_hfn_name ON historical_file_nodes (name)",
+                "historical_file_nodes.name index")
     backfilled = 0
     with SessionLocal() as db:
         for doc in db.scalars(select(Document).where(Document.file_class == "")).all():

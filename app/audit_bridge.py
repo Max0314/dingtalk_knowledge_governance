@@ -27,7 +27,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .config import Settings
-from .db import Document, FileAuditEvent, SpaceMap, Workspace, utcnow
+from .db import Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, SpaceMap, Workspace, utcnow
 from .service import watch_workspace
 
 logger = logging.getLogger("kg.bridge")
@@ -62,10 +62,24 @@ def _matching_documents(db: Session, event: FileAuditEvent) -> list[Document]:
                       .limit(20)).all()
 
 
+def _snapshot_workspaces(db: Session, names: list[str]) -> set[str]:
+    """First-contact bootstrap: workspaces the mirror has never walked still
+    exist in the latest reconciliation snapshot (141k+ named nodes), so a new
+    space can map itself on its very first event."""
+    snapshot_id = db.scalar(select(HistoricalSnapshot.snapshot_id)
+                            .order_by(HistoricalSnapshot.collected_at.desc()).limit(1))
+    if not snapshot_id or not names:
+        return set()
+    rows = db.execute(select(HistoricalFileNode.workspace_id)
+                      .where(HistoricalFileNode.snapshot_id == snapshot_id,
+                             HistoricalFileNode.name.in_(names)).distinct().limit(5)).all()
+    return {row[0] for row in rows}
+
+
 def _learn_mapping(db: Session, entry: SpaceMap, event: FileAuditEvent) -> None:
     """Unique (resource name -> workspace) join teaches the space mapping."""
-    docs = _matching_documents(db, event)
-    workspaces = {doc.workspace_id for doc in docs}
+    names = _name_candidates(event)
+    workspaces = {doc.workspace_id for doc in _matching_documents(db, event)} | _snapshot_workspaces(db, names)
     if len(workspaces) != 1:
         return
     workspace_id = workspaces.pop()
