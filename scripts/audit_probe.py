@@ -15,8 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import func, select
 
+from app.audit_bridge import bridge_status
 from app.audit_pull import audit_status
-from app.db import FileAuditEvent, SessionLocal, init_db
+from app.db import FileAuditEvent, SessionLocal, SyncRun, init_db
 
 CST = timezone(timedelta(hours=8))
 
@@ -32,7 +33,14 @@ def main() -> None:
     grep = sys.argv[1] if len(sys.argv) > 1 else ""
     init_db()
     with SessionLocal() as db:
-        out: dict = {"status": audit_status(db)}
+        out: dict = {"status": audit_status(db), "bridge": bridge_status(db)}
+        out["recent_bridge_runs"] = [
+            {"run_id": run.run_id, "mode": run.mode, "status": run.status,
+             "documents_seen": run.documents_seen, "documents_new": run.documents_new,
+             "documents_changed": run.documents_changed, "error_code": run.error_code,
+             "created_at": run.created_at.isoformat()}
+            for run in db.scalars(select(SyncRun).where(SyncRun.mode.in_(("bridge", "bridge_seed")))
+                                  .order_by(SyncRun.created_at.desc()).limit(5)).all()]
         day_start_ms = int(datetime.now(CST).replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
         out["writes_today_by_module_action"] = [
             {"module": module, "action_view": action_view, "count": count}
