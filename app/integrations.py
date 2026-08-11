@@ -279,7 +279,8 @@ async def model_connection_check(config: dict[str, Any], settings: Settings) -> 
         return {"status": "failed", "message": "模型服务连接失败。"}
 
 
-async def model_score_content(config: dict[str, Any], content: str, filename: str) -> dict[str, Any] | None:
+async def model_score_content(config: dict[str, Any], content: str, filename: str,
+                              file_class: str = "document") -> dict[str, Any] | None:
     """Invoke an OpenAI-compatible model without persisting or logging document text.
 
     The model receives a bounded temporary body only after the caller has enforced the
@@ -288,7 +289,13 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
     key = resolve_model_key(config)
     if not key or not content:
         return None
-    prompt = ("你是企业知识库评审器。依据评分标准通用-V1.1对文档评分。"
+    if file_class == "sheet":
+        rubric = ("这是一份电子表格（内容为提取出的单元格文本，顺序可能与表格布局不同）。"
+                  "评估维度：文件命名规范、表头/字段命名是否清晰完整、是否有必要的说明或注释、术语一致性、数据可读性。"
+                  "【不要】因缺少摘要、章节结构、版本历史等文档特有要素扣分。")
+    else:
+        rubric = "依据评分标准通用-V1.1对文档评分。"
+    prompt = ("你是企业知识库评审器。" + rubric +
               "只返回 JSON：{\"score\":0-100,\"findings\":[{\"rule\":\"章节号\",\"deduction\":整数,\"message\":\"不引用正文的简短问题\"}]}。"
               "不要复述或引用文档原文。文件名：" + filename + "\n正文：\n" + content[:60000])
     payload: dict[str, Any] = {"model": config["model_name"], "response_format": {"type": "json_object"},

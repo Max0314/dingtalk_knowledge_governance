@@ -17,6 +17,11 @@ def iso(value):
     return value.isoformat() if value else None
 
 
+def robot_keys(settings: Settings) -> set[str]:
+    """Machine accounts in either id form (numeric userId / UnionID)."""
+    return {token.strip() for token in settings.robot_user_ids.split(",") if token.strip()}
+
+
 def review_dict(review: ReviewInstance, rerun_count: int = 0) -> dict:
     return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "review_scope": review.review_scope, "rule_version": review.rule_version, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
 
@@ -58,13 +63,14 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
             except (IntegrationError, RuntimeError):
                 content = ""
         scope = "full_content" if content else "metadata_only"
-    result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n")
+    result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n", doc.file_class or "document")
     model = active_model(db)
     if content and model and settings.model_allow_content_transfer:
         model_result = asyncio.run(model_score_content({"base_url": model.base_url, "model_name": model.model_name,
                                                         "api_key": model.api_key, "api_key_env_name": model.api_key_env_name,
                                                         "temperature": model.temperature, "thinking_mode": model.thinking_mode,
-                                                        "timeout_seconds": model.timeout_seconds}, content, doc.name))
+                                                        "timeout_seconds": model.timeout_seconds}, content, doc.name,
+                                                       doc.file_class or "document"))
         if model_result:
             result["ai_score"] = model_result["score"]
             result["findings"].extend(model_result["findings"])
@@ -152,7 +158,10 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    if enqueue and (is_new or changed) and not doc.is_folder and doc.file_class in review_classes(settings.review_classes):
+    robots = robot_keys(settings)
+    uploaded_by_robot = doc.uploader_key in robots or (item.get("creator_id", "") in robots)
+    if (enqueue and (is_new or changed) and not doc.is_folder and not uploaded_by_robot
+            and doc.file_class in review_classes(settings.review_classes)):
         db.flush()
         pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
         if not pending:

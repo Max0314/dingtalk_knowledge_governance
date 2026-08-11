@@ -115,3 +115,45 @@ def test_connectivity_never_claims_unconfigured_integrations_are_healthy():
         payload = client.get("/api/v1/diagnostics/connectivity").json()
         statuses = {item["name"]: item["status"] for item in payload["items"]}
         assert statuses["钉钉知识库"] == "not_configured"
+
+
+def test_admin_guard_gates_model_configs():
+    from app import auth as auth_module
+    from app.config import get_settings
+
+    os.environ["KG_AUTH_ENABLED"] = "true"
+    os.environ["KG_ADMIN_UNION_IDS"] = "admin-union"
+    get_settings.cache_clear()
+    try:
+        with TestClient(app) as client:
+            client.cookies.set(auth_module.COOKIE_NAME, auth_module.issue_session({"union_id": "ordinary", "name": "普通员工"}))
+            assert client.get("/api/v1/model-configs").status_code == 403
+            assert client.get("/api/v1/diagnostics/connectivity").status_code == 403
+            assert client.get("/api/v1/documents").status_code == 200  # data views stay open to logged-in users
+            client.cookies.set(auth_module.COOKIE_NAME, auth_module.issue_session({"union_id": "admin-union", "name": "管理员"}))
+            assert client.get("/api/v1/model-configs").status_code == 200
+    finally:
+        os.environ["KG_AUTH_ENABLED"] = "false"
+        os.environ.pop("KG_ADMIN_UNION_IDS", None)
+        get_settings.cache_clear()
+
+
+def test_workspace_registry_classification_and_filters():
+    from app.db import SessionLocal, Workspace, WorkspaceRole
+
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            if not db.get(Workspace, "ws-C1"):
+                db.add_all([Workspace(workspace_id="ws-C1", name="C-公司制度库"),
+                            Workspace(workspace_id="ws-D1", name="D-研发部资料"),
+                            Workspace(workspace_id="ws-I1", name="I-张三")])
+                db.add(WorkspaceRole(workspace_id="ws-D1", employee_key="a1", role="administrator", display_name="李管理"))
+                db.commit()
+        by_level = client.get("/api/v1/workspaces", params={"level": "D"}).json()
+        assert by_level["total"] >= 1 and all(item["level"] == "D" for item in by_level["items"])
+        by_admin = client.get("/api/v1/workspaces", params={"admin": "李管理"}).json()
+        assert [item["workspace_id"] for item in by_admin["items"]] == ["ws-D1"]
+        paged = client.get("/api/v1/workspaces", params={"limit": 1}).json()
+        assert len(paged["items"]) == 1 and paged["total"] >= 4 and paged["levels"]
+        search = client.get("/api/v1/workspaces", params={"query": "研发部"}).json()
+        assert search["total"] == 1

@@ -1,16 +1,17 @@
 from __future__ import annotations
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from . import metrics, orgmap
 from .config import get_settings
-from .db import Document, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .service import document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict
 
@@ -41,6 +42,18 @@ def db_session():
 
 def actor() -> str:
     return get_settings().default_actor
+
+
+def require_admin(request: Request):
+    """Model configs and diagnostics are operator-only. With auth off (local
+    dev) everything stays open; with auth on, an empty admin list fails closed."""
+    settings = get_settings()
+    if not settings.auth_enabled:
+        return
+    admins = {token.strip() for token in settings.admin_union_ids.split(",") if token.strip()}
+    user = getattr(request.state, "user", None) or {}
+    if user.get("union_id") not in admins:
+        raise HTTPException(403, "仅管理员可执行此操作。")
 
 
 class GovernancePatch(BaseModel):
@@ -215,7 +228,7 @@ class NotifyTestRequest(BaseModel):
     text: str = "### 知识库治理推送测试\n如果你看到这条消息，机器人发送链路已打通。"
 
 
-@app.post("/api/v1/notifications/test")
+@app.post("/api/v1/notifications/test", dependencies=[Depends(require_admin)])
 async def notification_test(payload: NotifyTestRequest):
     try:
         result = await DingtalkClient(get_settings()).send_robot_markdown([payload.user_id], payload.title, payload.text)
@@ -244,7 +257,7 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
                       for r, d in rows]}
 
 
-@app.get("/api/v1/audit/status")
+@app.get("/api/v1/audit/status", dependencies=[Depends(require_admin)])
 def audit_status_api(db: Session = Depends(db_session)):
     from .audit_bridge import bridge_status
     from .audit_pull import audit_status
@@ -255,7 +268,7 @@ def audit_status_api(db: Session = Depends(db_session)):
                        "debounce_seconds": settings.bridge_debounce_seconds, **bridge_status(db)}}
 
 
-@app.get("/api/v1/stream-events")
+@app.get("/api/v1/stream-events", dependencies=[Depends(require_admin)])
 def stream_events(limit: int = Query(default=20, ge=1, le=100), event_type: str = "", db: Session = Depends(db_session)):
     from .db import StreamEvent
     stmt = select(StreamEvent).order_by(StreamEvent.received_at.desc()).limit(limit)
@@ -267,7 +280,7 @@ def stream_events(limit: int = Query(default=20, ge=1, le=100), event_type: str 
                        "payload": e.payload[:2000]} for e in db.scalars(stmt).all()]}
 
 
-@app.get("/api/v1/notifications")
+@app.get("/api/v1/notifications", dependencies=[Depends(require_admin)])
 def notifications(status: str = "", limit: int = Query(default=20, ge=1, le=100), db: Session = Depends(db_session)):
     stmt = select(Notification).order_by(Notification.created_at.desc()).limit(limit)
     if status:
@@ -281,9 +294,68 @@ def notifications(status: str = "", limit: int = Query(default=20, ge=1, le=100)
                        "sent_at": n.sent_at.isoformat() if n.sent_at else None} for n in db.scalars(stmt).all()]}
 
 
+WORKSPACE_LEVEL_PATTERN = re.compile(r"^([CDPIcdpi])[\-_—－]")
+WORKSPACE_LEVEL_LABELS = {"C": "C-公司级", "D": "D-部门级", "P": "P-项目级", "I": "I-个人级"}
+
+
+def workspace_level(name: str) -> str:
+    match = WORKSPACE_LEVEL_PATTERN.match((name or "").strip())
+    return match.group(1).upper() if match else "其他"
+
+
 @app.get("/api/v1/workspaces")
-def workspaces(db: Session = Depends(db_session)):
-    return {"items": [workspace_dict(ws, db) for ws in db.scalars(select(Workspace).order_by(Workspace.name)).all()]}
+def workspaces(query: str = "", level: str = "", department: str = "", creator: str = "", admin: str = "",
+               offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=200),
+               db: Session = Depends(db_session)):
+    """Registry listing with level classification (C/D/P/I by name prefix),
+    search, filters and pagination. Counts and role rows are prefetched in
+    bulk so the page costs a handful of queries, not one per workspace."""
+    rows = db.scalars(select(Workspace).order_by(Workspace.name)).all()
+    doc_counts = {ws_id: count for ws_id, count in db.execute(
+        select(Document.workspace_id, func.count()).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
+        .group_by(Document.workspace_id)).all()}
+    roles: dict[str, dict[str, list[str]]] = {}
+    for role_row in db.scalars(select(WorkspaceRole)).all():
+        bucket = roles.setdefault(role_row.workspace_id, {"administrator": [], "reviewer": []})
+        bucket.setdefault(role_row.role, []).append(role_row.display_name or role_row.employee_key)
+    creator_names = {row.user_id: row.name for row in db.scalars(select(EmployeeMap)).all()}
+
+    items = []
+    for ws in rows:
+        level_code = workspace_level(ws.name)
+        admins = roles.get(ws.workspace_id, {}).get("administrator", [])
+        creator_name = creator_names.get(ws.creator_key, "") or ws.creator_key
+        entry = {"workspace_id": ws.workspace_id, "name": ws.name, "url": ws.url,
+                 "level": level_code, "level_label": WORKSPACE_LEVEL_LABELS.get(level_code, "其他"),
+                 "department_name": ws.owner_department_name, "biz_group_name": ws.owner_biz_group_name,
+                 "creator": creator_name, "administrators": admins,
+                 "reviewers": roles.get(ws.workspace_id, {}).get("reviewer", []),
+                 "document_count": doc_counts.get(ws.workspace_id, 0),
+                 "source_created_at": ws.source_created_at,
+                 "synced_at": ws.synced_at.isoformat() if ws.synced_at else None}
+        items.append(entry)
+
+    def keep(entry: dict) -> bool:
+        if query and query.lower() not in entry["name"].lower():
+            return False
+        if level and entry["level"] != level.upper():
+            return False
+        if department and department not in (entry["department_name"] or ""):
+            return False
+        if creator and creator not in (entry["creator"] or ""):
+            return False
+        if admin and not any(admin in (name or "") for name in entry["administrators"]):
+            return False
+        return True
+
+    filtered = [entry for entry in items if keep(entry)]
+    level_facets: dict[str, int] = {}
+    for entry in filtered:
+        level_facets[entry["level"]] = level_facets.get(entry["level"], 0) + 1
+    return {"total": len(filtered), "offset": offset, "limit": limit,
+            "levels": [{"level": key, "label": WORKSPACE_LEVEL_LABELS.get(key, "其他"), "count": value}
+                       for key, value in sorted(level_facets.items())],
+            "items": filtered[offset:offset + limit]}
 
 
 @app.get("/api/v1/workspaces/{workspace_id}")
@@ -377,7 +449,7 @@ def _record_history(db: Session, item: ModelConfig, action: str) -> None:
     db.add(ModelConfigHistory(config_id=item.id, action=action, snapshot=_model_snapshot(item), saved_by=actor()))
 
 
-@app.get("/api/v1/model-configs")
+@app.get("/api/v1/model-configs", dependencies=[Depends(require_admin)])
 def model_configs(db: Session = Depends(db_session)):
     return {"items": [_model_dict(x) for x in db.scalars(select(ModelConfig).order_by(ModelConfig.updated_at.desc())).all()],
             "rule_version": "V1.1",
@@ -392,7 +464,7 @@ def _apply_model_body(item: ModelConfig, body: "ModelRequest") -> None:
         setattr(item, key, value)
 
 
-@app.post("/api/v1/model-configs")
+@app.post("/api/v1/model-configs", dependencies=[Depends(require_admin)])
 def create_model(body: ModelRequest, db: Session = Depends(db_session)):
     if db.scalar(select(ModelConfig).where(ModelConfig.name == body.name)):
         raise HTTPException(409, "模型配置名称已存在")
@@ -406,7 +478,7 @@ def create_model(body: ModelRequest, db: Session = Depends(db_session)):
     return {"id": item.id, "name": item.name, "version": item.version}
 
 
-@app.put("/api/v1/model-configs/{config_id}")
+@app.put("/api/v1/model-configs/{config_id}", dependencies=[Depends(require_admin)])
 def update_model(config_id: int, body: ModelRequest, db: Session = Depends(db_session)):
     item = db.get(ModelConfig, config_id)
     if not item: raise HTTPException(404, "模型配置不存在")
@@ -417,7 +489,7 @@ def update_model(config_id: int, body: ModelRequest, db: Session = Depends(db_se
     db.commit(); return {"id": item.id, "name": item.name, "version": item.version}
 
 
-@app.get("/api/v1/model-configs/{config_id}/history")
+@app.get("/api/v1/model-configs/{config_id}/history", dependencies=[Depends(require_admin)])
 def model_history(config_id: int, db: Session = Depends(db_session)):
     from .db import ModelConfigHistory
     rows = db.scalars(select(ModelConfigHistory).where(ModelConfigHistory.config_id == config_id)
@@ -432,7 +504,7 @@ def model_history(config_id: int, db: Session = Depends(db_session)):
                        "api_key_masked": _mask_key((h.snapshot or {}).get("api_key", ""))} for h in rows]}
 
 
-@app.post("/api/v1/model-configs/{config_id}/rollback/{history_id}")
+@app.post("/api/v1/model-configs/{config_id}/rollback/{history_id}", dependencies=[Depends(require_admin)])
 def model_rollback(config_id: int, history_id: int, db: Session = Depends(db_session)):
     from .db import ModelConfigHistory
     item = db.get(ModelConfig, config_id)
@@ -451,7 +523,7 @@ def model_rollback(config_id: int, history_id: int, db: Session = Depends(db_ses
     return {"id": item.id, "rolled_back_to": history_id}
 
 
-@app.post("/api/v1/model-configs/{config_id}/connection-check")
+@app.post("/api/v1/model-configs/{config_id}/connection-check", dependencies=[Depends(require_admin)])
 async def model_check(config_id: int, db: Session = Depends(db_session)):
     item = db.get(ModelConfig, config_id)
     if not item: raise HTTPException(404, "模型配置不存在")
@@ -460,7 +532,7 @@ async def model_check(config_id: int, db: Session = Depends(db_session)):
                                          "timeout_seconds": item.timeout_seconds}, get_settings())
 
 
-@app.get("/api/v1/diagnostics/connectivity")
+@app.get("/api/v1/diagnostics/connectivity", dependencies=[Depends(require_admin)])
 async def connectivity(db: Session = Depends(db_session)):
     settings = get_settings(); ding = DingtalkClient(settings)
     if ding.configured() and settings.dingtalk_sync_operator_id:
@@ -482,18 +554,18 @@ async def connectivity(db: Session = Depends(db_session)):
     return {"items": [{"name": "钉钉知识库", **ding_result}, {"name": "bi_center 组织架构", **(await BiCenterClient(settings).check())}, {"name": "AI 评审模型", **model_result}, {"name": "定向监控 watcher", **watch_result}], "body_storage": "正文仅在 worker 内存/tmpfs 临时处理，数据库不保存正文。"}
 
 
-@app.get("/api/v1/diagnostics/sync-runs")
+@app.get("/api/v1/diagnostics/sync-runs", dependencies=[Depends(require_admin)])
 def sync_runs(db: Session = Depends(db_session)):
     return {"items": [{"run_id": x.run_id, "status": x.status, "mode": x.mode, "workspaces_seen": x.workspaces_seen, "documents_seen": x.documents_seen, "documents_new": x.documents_new, "documents_changed": x.documents_changed, "error_code": x.error_code, "created_at": x.created_at.isoformat(), "finished_at": x.finished_at.isoformat() if x.finished_at else None} for x in db.scalars(select(SyncRun).order_by(SyncRun.created_at.desc()).limit(30)).all()]}
 
 
-@app.post("/api/v1/sync-runs", status_code=202)
+@app.post("/api/v1/sync-runs", status_code=202, dependencies=[Depends(require_admin)])
 async def start_sync(mode: str = "incremental", db: Session = Depends(db_session)):
     run = await sync_from_dingtalk(db, get_settings(), mode)
     return {"run_id": run.run_id, "status": run.status, "error_code": run.error_code, "documents_new": run.documents_new, "documents_changed": run.documents_changed}
 
 
-@app.post("/api/v1/watch/run")
+@app.post("/api/v1/watch/run", dependencies=[Depends(require_admin)])
 async def run_watch_now(db: Session = Depends(db_session)):
     """On-demand watch cycle (same code path as the worker tick), for testing
     and for ops after adding a workspace to KG_WATCH_WORKSPACES."""

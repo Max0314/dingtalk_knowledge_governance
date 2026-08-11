@@ -50,6 +50,17 @@ def test_plain_text_and_fallbacks():
     assert extract_text("docx", b"not a zip at all") == ""  # malformed archive degrades
 
 
+def test_sheet_class_uses_reduced_rule_subset():
+    from app.scoring import score_document
+
+    cells = "序号\n物料编码\n数量\n交期"
+    sheet = score_document("GPON再生产订单推进表任务模板 2.xlsx", cells, "sheet")
+    assert set(sheet["dimensions"]) <= {"format", "quality"}  # no abstract/structure/RAG penalties
+    document = score_document("GPON再生产订单推进表任务模板 2.xlsx", cells, "document")
+    assert "structure" in document["dimensions"]
+    assert sheet["ai_score"] >= document["ai_score"]
+
+
 def test_fetch_degrades_without_numeric_id():
     import asyncio
 
@@ -72,7 +83,7 @@ def test_model_score_recomputes_verdict(monkeypatch):
     async def fake_fetch(settings, doc):
         return ("规范正文，规则分本会很高。", "storage_download")
 
-    async def fake_model(config, content, filename):
+    async def fake_model(config, content, filename, file_class="document"):
         return {"score": 35, "findings": [{"rule": "model", "deduction": 0, "message": "内容质量差。"}]}
 
     monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)

@@ -206,19 +206,45 @@ async function documentDetail(id){const d=await api('/api/v1/documents/'+id);con
   document.querySelector('#back').onclick=()=>navigate('documents');
   document.querySelector('#rerun').onclick=async()=>{const j=await api('/api/v1/documents/'+id+'/reviews',{method:'POST',body:JSON.stringify({trigger:'manual_rerun'})});toast('已提交评审任务 '+j.job_id.slice(0,8))}}
 
-async function workspaces(){const d=await api('/api/v1/metrics/coverage');d.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name);
-  const s=d.summary,org=d.org_context||{};
-  shell('知识库管理','覆盖状态、基线规模与实时同步情况；点击行查看月度分布与治理配置。',`
+async function workspaces(){
+  state.wsReg=state.wsReg||{query:'',level:'',department:'',creator:'',admin:'',offset:0};const p=state.wsReg;
+  const qs=new URLSearchParams({query:p.query,level:p.level==='其他'?'':p.level,department:p.department,creator:p.creator,admin:p.admin,offset:p.offset,limit:50});
+  if(p.level==='其他')qs.set('level','其他');
+  const [reg,cov]=await Promise.all([api('/api/v1/workspaces?'+qs),api('/api/v1/metrics/coverage').catch(()=>null)]);
+  if(cov)cov.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name);
+  const s=cov?cov.summary:{visible_workspaces:reg.total,scanned:'—',empty:'—',excluded:'—'},org=(cov&&cov.org_context)||{};
+  const facet=Object.fromEntries((reg.levels||[]).map(l=>[l.level,l.count]));
+  const tabs=[['','全部'],['C','C-公司级'],['D','D-部门级'],['P','P-项目级'],['I','I-个人级'],['其他','其他']];
+  shell('知识库管理','公司知识库注册表：等级分类、搜索、筛选与分页；点击行查看月度分布与治理配置。',`
   <div class="grid metrics">
-    ${statCard('可见知识库',s.visible_workspaces,`全公司约 ${org.org_total_knowledge_bases||'—'} 库`)}
+    ${statCard('注册知识库',reg.total_all??reg.total,`全公司约 ${org.org_total_knowledge_bases||'—'} 库`)}
     ${statCard('已扫描',s.scanned,'基线或实时同步有数据')}
     ${statCard('空库',s.empty,'探测确认无文件')}
-    ${statCard('已排除',s.excluded,'不计入指标，原因见行内标注')}
+    ${statCard('已排除',s.excluded,'不计入指标')}
   </div>
-  <section class="card section-gap"><div class="card-head"><h2>知识库清单</h2><span class="hint">${org.note||''}</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>状态</th><th class="num">基线文件数</th><th class="num">实时文档数</th><th>归属部门 / 业务组</th></tr></thead><tbody>
-    ${d.items.map(i=>`<tr class="rowlink" data-ws="${i.workspace_id}"><td><b>${i.name}</b><br><small>${i.workspace_id}</small></td><td>${statusChip(i)}${i.excluded_reason?`<br><small>${i.excluded_reason}</small>`:''}</td><td class="num">${nf(i.baseline_files)}</td><td class="num">${i.live_documents?nf(i.live_documents):'—'}</td><td>${i.owner_department_name}<br><small>${i.owner_biz_group_name}</small></td></tr>`).join('')}
-  </tbody></table></div></section>
-  ${d.unreachable&&d.unreachable.length?`<section class="card section-gap"><div class="card-head"><h2>当前授权不可达（按宜搭 2026-04-27 快照，Top ${d.unreachable.length}）</h2><span class="chip amber">待授权</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th class="num">文件数</th></tr></thead><tbody>${d.unreachable.map(u=>`<tr><td>${u.name}</td><td class="num">${nf(u.files)}</td></tr>`).join('')}</tbody></table></div><p class="hint">这些知识库需要把服务身份加为成员后才能纳入统计与评审。</p></section>`:''}`);
+  <section class="card section-gap"><div class="card-head"><h2>知识库清单（${nf(reg.total)}）</h2><span class="hint">${org.note||''}</span></div>
+  <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
+    ${tabs.map(([v,l])=>`<button class="${p.level===v?'primary':'secondary'}" data-level="${v}">${l}${v&&facet[v]!==undefined?` (${facet[v]})`:''}</button>`).join('')}
+  </div>
+  <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
+    <input class="input" id="wsq" placeholder="按名称搜索" value="${p.query}" style="flex:2;min-width:150px">
+    <input class="input" id="wsdept" placeholder="部门" value="${p.department}" style="flex:1;min-width:100px">
+    <input class="input" id="wscreator" placeholder="创建人" value="${p.creator}" style="flex:1;min-width:100px">
+    <input class="input" id="wsadmin" placeholder="管理员" value="${p.admin}" style="flex:1;min-width:100px">
+    <button class="primary" id="wsgo">查询</button><button class="secondary" id="wsreset">重置</button>
+  </div>
+  <div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>等级</th><th class="num">文档数</th><th>创建人</th><th>管理员</th><th>归属部门</th></tr></thead><tbody>
+    ${reg.items.map(i=>`<tr class="rowlink" data-ws="${i.workspace_id}"><td><b>${i.name}</b><br><small>${i.workspace_id}</small></td><td><span class="chip">${i.level_label}</span></td><td class="num">${i.document_count?nf(i.document_count):'—'}</td><td>${i.creator||'—'}</td><td>${(i.administrators||[]).slice(0,3).join('、')||'—'}${(i.administrators||[]).length>3?` 等${i.administrators.length}人`:''}</td><td>${i.department_name||'—'}</td></tr>`).join('')||'<tr><td colspan="6"><div class="empty">无匹配结果</div></td></tr>'}
+  </tbody></table></div>
+  <div class="controls" style="justify-content:space-between;margin-top:8px"><span class="hint">第 ${reg.total?p.offset+1:0}-${Math.min(p.offset+50,reg.total)} 条 / 共 ${reg.total} 条</span><span><button class="secondary" id="wsprev" ${p.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="wsnext" ${p.offset+50>=reg.total?'disabled':''} style="margin-left:8px">下一页</button></span></div>
+  </section>
+  ${cov&&cov.unreachable&&cov.unreachable.length?`<section class="card section-gap"><div class="card-head"><h2>当前授权不可达（按宜搭 2026-04-27 快照，Top ${cov.unreachable.length}）</h2><span class="chip amber">待授权</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th class="num">文件数</th></tr></thead><tbody>${cov.unreachable.map(u=>`<tr><td>${u.name}</td><td class="num">${nf(u.files)}</td></tr>`).join('')}</tbody></table></div><p class="hint">这些知识库需要把服务身份加为成员后才能纳入统计与评审。</p></section>`:''}`);
+  document.querySelectorAll('[data-level]').forEach(x=>x.onclick=()=>{p.level=x.dataset.level;p.offset=0;workspaces()});
+  document.querySelector('#wsgo').onclick=()=>{p.query=document.querySelector('#wsq').value.trim();p.department=document.querySelector('#wsdept').value.trim();p.creator=document.querySelector('#wscreator').value.trim();p.admin=document.querySelector('#wsadmin').value.trim();p.offset=0;workspaces()};
+  document.querySelector('#wsq').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#wsgo').click()};
+  document.querySelector('#wsreset').onclick=()=>{state.wsReg={query:'',level:'',department:'',creator:'',admin:'',offset:0};workspaces()};
+  document.querySelector('#wsprev').onclick=()=>{p.offset=Math.max(0,p.offset-50);workspaces()};
+  document.querySelector('#wsnext').onclick=()=>{p.offset=p.offset+50;workspaces()};
   document.querySelectorAll('[data-ws]').forEach(x=>x.onclick=()=>workspaceDetail(x.dataset.ws))}
 
 async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),api('/api/v1/workspaces/'+id).catch(()=>null),api('/api/v1/baseline/workspaces/'+id+'/folders?limit=100').catch(()=>({items:[],total_folders:0,note:''}))]);

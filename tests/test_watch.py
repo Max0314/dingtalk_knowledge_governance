@@ -140,6 +140,16 @@ def test_walk_falls_back_to_listing_when_detail_fails(settings, monkeypatch):
         assert run.status == "succeeded" and run.documents_seen == 1
 
 
+def test_robot_uploads_never_enter_review_queue(settings):
+    robot_settings = settings.model_copy(update={"robot_user_ids": "tester"})  # FakeClient creator is "tester"
+    FakeClient.nodes = {"R": node("watch-robot-doc")}
+    cycle(robot_settings)  # seed
+    FakeClient.nodes["R2"] = node("watch-robot-doc2")
+    cycle(robot_settings)
+    with SessionLocal() as db:
+        assert jobs_for(db, "watch-robot-doc2") == []  # robot upload: mirrored but never reviewed
+
+
 def test_watch_skips_unreviewable_file_classes(settings):
     FakeClient.nodes = {"D1": node("watch-doc1")}
     cycle(settings)  # seed with one document

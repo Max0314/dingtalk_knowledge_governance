@@ -65,10 +65,14 @@ class Settings(BaseSettings):
     # Bridge locator: resolve wiki write events to workspaces via node search
     # before falling back to the governed-set sweep.
     bridge_locator_enabled: bool = True
-    # Machine accounts (comma-separated userIds) excluded from person rankings.
-    # bi_center currently classifies the digital employee as an official
-    # employee, so the service marks its own operator account explicitly.
+    # Machine accounts (comma-separated userIds AND unionIds) excluded from
+    # person rankings and from automatic reviews. bi_center currently
+    # classifies the digital employee as an official employee, so the service
+    # marks its own operator account explicitly (both id forms).
     robot_user_ids: str = ""
+    # Union ids allowed to operate model configs and diagnostics when auth is
+    # on. Empty denies everyone (fail closed); local dev with auth off is open.
+    admin_union_ids: str = ""
     # DingTalk login guard for /api/*. Off by default so local dev and tests
     # run open; the server .env turns it on with a real secret.
     auth_enabled: bool = False
