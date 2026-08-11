@@ -136,7 +136,7 @@ class DingtalkClient:
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
-                f"https://api.dingtalk.com/v2.0/storage/spaces/{space_id}/files/{dentry_uuid}/downloadInfos/query",
+                f"https://api.dingtalk.com/v1.0/storage/spaces/{space_id}/dentries/{dentry_uuid}/downloadInfos/query",
                 params={"unionId": operator},
                 headers={"x-acs-dingtalk-access-token": token},
                 json={"option": {"preferIntranet": False}},
