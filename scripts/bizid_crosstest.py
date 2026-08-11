@@ -31,8 +31,7 @@ async def run() -> dict:
     init_db()
     with SessionLocal() as db:
         events = db.scalars(select(FileAuditEvent)
-                            .where(FileAuditEvent.action_view == "知识库上传文件",
-                                   FileAuditEvent.size > 0)
+                            .where(FileAuditEvent.action_view.contains("知识库上传"))
                             .order_by(FileAuditEvent.gmt_create.desc()).limit(3)).all()
         samples = [{"biz_id": event.biz_id, "resource": event.resource[:40],
                     "expected_size": event.size, "space": event.target_space_id} for event in events]
