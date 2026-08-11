@@ -244,6 +244,14 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
                       for r, d in rows]}
 
 
+@app.get("/api/v1/audit/status")
+def audit_status_api(db: Session = Depends(db_session)):
+    from .audit_pull import audit_status
+    settings = get_settings()
+    return {"enabled": settings.audit_pull_enabled, "interval_seconds": settings.audit_pull_interval_seconds,
+            **audit_status(db)}
+
+
 @app.get("/api/v1/stream-events")
 def stream_events(limit: int = Query(default=20, ge=1, le=100), event_type: str = "", db: Session = Depends(db_session)):
     from .db import StreamEvent

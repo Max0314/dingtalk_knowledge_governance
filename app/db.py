@@ -1,7 +1,7 @@
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from .config import get_settings
@@ -255,6 +255,49 @@ class StreamEvent(Base):
     payload: Mapped[str] = mapped_column(Text, default="")
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class FileAuditEvent(Base):
+    """Write-type operations from the exclusive audit trail (pillar B CDC)."""
+    __tablename__ = "file_audit_events"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    biz_id: Mapped[str] = mapped_column(String(64), unique=True)
+    gmt_create: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), index=True)
+    operator_user_id: Mapped[str] = mapped_column(id_string(), index=True, default="")
+    operator_name: Mapped[str] = mapped_column(String(128), default="")
+    action: Mapped[str] = mapped_column(String(32), default="")
+    action_view: Mapped[str] = mapped_column(String(64), default="", index=True)
+    module_view: Mapped[str] = mapped_column(String(64), default="")
+    resource: Mapped[str] = mapped_column(String(512), default="")
+    extension: Mapped[str] = mapped_column(String(32), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    target_space_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    ip_address: Mapped[str] = mapped_column(String(64), default="")
+    platform: Mapped[str] = mapped_column(String(32), default="")
+    matched_node_id: Mapped[str] = mapped_column(id_string(), default="")  # filled by the future matcher
+    processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AuditDailyAgg(Base):
+    """Read-op volumes (previews/downloads) aggregated per day and action."""
+    __tablename__ = "audit_daily_aggs"
+    __table_args__ = (UniqueConstraint("day", "module_view", "action_view", name="uq_audit_agg"),)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)
+    module_view: Mapped[str] = mapped_column(String(64), default="")
+    action_view: Mapped[str] = mapped_column(String(64), default="")
+    count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AuditState(Base):
+    """Singleton cursor row for the audit CDC puller."""
+    __tablename__ = "audit_state"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    last_gmt_create: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), default=0)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_rows: Mapped[int] = mapped_column(Integer, default=0)
+    silence_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Notification(Base):

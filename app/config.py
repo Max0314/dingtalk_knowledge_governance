@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # A document is soft-deleted after this many consecutive complete walks
     # without seeing it (recycle-bin restores clear the flag again).
     watch_delete_misses: int = 2
+    # Pillar B: log-based CDC over the exclusive file-audit trail.
+    audit_pull_enabled: bool = False
+    audit_pull_interval_seconds: int = 600
+    # Recipient of the audit-silence alarm (workday hours, 30min of no events).
+    audit_alert_user_id: str = ""
     # Machine accounts (comma-separated userIds) excluded from person rankings.
     # bi_center currently classifies the digital employee as an official
     # employee, so the service marks its own operator account explicitly.

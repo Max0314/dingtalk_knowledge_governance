@@ -1,5 +1,6 @@
 import logging
 import time
+from .audit_pull import run_audit_pull
 from .config import get_settings
 from .db import SessionLocal, init_db
 from .notify import process_pending_notifications
@@ -18,6 +19,7 @@ def main() -> None:
     # First watch tick shortly after boot so a fresh deploy proves itself
     # without waiting a full interval; later ticks follow the configured pace.
     next_watch_at = time.time() + 5 if settings.watch_workspaces else None
+    next_audit_at = time.time() + 10 if settings.audit_pull_enabled else None
     while True:
         with SessionLocal() as db:
             processed = process_next_job(db, settings)
@@ -31,6 +33,14 @@ def main() -> None:
             except Exception:
                 logger.exception("watch cycle failed")
             next_watch_at = time.time() + max(60, settings.watch_interval_seconds)
+        if next_audit_at is not None and time.time() >= next_audit_at:
+            try:
+                with SessionLocal() as db:
+                    audit = run_audit_pull(db, settings)
+                logger.info("audit pull: %s", audit)
+            except Exception:
+                logger.exception("audit pull failed")
+            next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
         time.sleep(0.5 if processed or notified else 3)
 
 
