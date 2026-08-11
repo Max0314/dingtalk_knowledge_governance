@@ -114,38 +114,48 @@ def test_snapshot_join_backfills_match(env):
         assert event.matched_node_id == "snap-node-1"
 
 
+def locator_settings(settings):
+    return settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op",
+                                       "wiki_storage_space_id": "2932890480"})
+
+
 def test_locator_routes_precisely(env, monkeypatch):
     settings, walks, _ = env
-    located = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op"})
 
     class FakeSearchClient:
         def __init__(self, _settings):
             pass
 
-        async def search_wiki_nodes(self, keyword, operator_id, max_results=20):
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "bridge-A", "name": "桥接测试文档.docx", "path": "/桥接测试库/桥接测试文档.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            assert node_ids == ["bridge-A"]
             return [{"name": "桥接测试文档.docx", "workspace_id": WS, "node_id": "bridge-A"}]
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", FakeSearchClient)
     add_event("tb-9", "桥接测试文档.docx", "99009")
-    summary = run_bridge(located)
+    summary = run_bridge(locator_settings(settings))
     assert summary["unlocated"] == 0
     assert [walk["workspace_id"] for walk in summary["walks"]] == [WS]  # only the located workspace
 
 
 def test_locator_miss_falls_back_to_sweep(env, monkeypatch):
     settings, walks, _ = env
-    located = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op"})
 
     class EmptySearchClient:
         def __init__(self, _settings):
             pass
 
-        async def search_wiki_nodes(self, keyword, operator_id, max_results=20):
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
             return []  # brand-new file not indexed yet
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return []
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", EmptySearchClient)
     add_event("tb-10", "全新未索引文件.docx", "99010")
-    summary = run_bridge(located)
+    summary = run_bridge(locator_settings(settings))
     assert summary["unlocated"] == 1
     assert WS in {walk["workspace_id"] for walk in summary["walks"]}  # governed sweep fired
 

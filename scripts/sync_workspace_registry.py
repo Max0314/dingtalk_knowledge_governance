@@ -58,17 +58,16 @@ async def collect(settings, with_members: bool) -> dict:
             summary["upserted"] += 1
             if not with_members:
                 continue
+            root_node_id = space.get("root_node_id", "")
+            if not root_node_id:
+                summary["member_errors"] += 1
+                continue
             try:
-                members: list[dict] = []
-                token = ""
-                while True:
-                    page = await client.list_workspace_members(workspace_id, operator, token)
-                    members.extend(page["items"])
-                    token = page.get("next_token", "")
-                    if not token:
-                        break
+                # The KB root dentry's storage-layer permission roster is the
+                # workspace member list (roles like OWNER/MANAGER).
+                members = await client.list_dentry_permissions(root_node_id, operator)
                 admins = [member for member in members
-                          if member["role"] in ADMIN_ROLES and member["type"] == "USER" and member["user_id"]]
+                          if member["role"].upper() in ADMIN_ROLES and member["type"] == "USER" and member["user_id"]]
                 db.execute(delete(WorkspaceRole).where(WorkspaceRole.workspace_id == workspace_id,
                                                        WorkspaceRole.role == "administrator"))
                 for admin in admins:

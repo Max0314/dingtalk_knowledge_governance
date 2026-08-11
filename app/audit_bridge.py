@@ -122,15 +122,19 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     ring: set[str] = set()
     located_ungoverned: set[str] = set()
     unlocated = 0
-    if settings.bridge_locator_enabled:
+    if settings.bridge_locator_enabled and settings.wiki_storage_space_id:
         client = DingtalkClient(settings)
+        operator = settings.dingtalk_sync_operator_id
         for event in wiki_events:
             names = _name_candidates(event)
             try:
-                nodes = asyncio.run(client.search_wiki_nodes(names[0], settings.dingtalk_sync_operator_id))
+                # Storage search returns dentryUuids (== wiki nodeIds); the wiki
+                # batch query then names the workspace each hit lives in.
+                dentries = asyncio.run(client.search_dentries(names[0], operator,
+                                                              [settings.wiki_storage_space_id]))
+                exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
+                nodes = asyncio.run(client.batch_query_wiki_nodes(exact_ids, operator)) if exact_ids else []
             except (IntegrationError, RuntimeError):
-                nodes = None
-            if nodes is None:
                 unlocated += 1
                 continue
             hits = [node for node in nodes if node.get("name") in names]

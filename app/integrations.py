@@ -111,42 +111,70 @@ class DingtalkClient:
             raise IntegrationError("dingtalk_robot_send_failed", f"机器人消息发送失败（HTTP {response.status_code}）。", response.status_code)
         return response.json()
 
-    async def list_workspace_members(self, workspace_id: str, operator_id: str, next_token: str = "",
-                                     max_results: int = 100) -> dict:
-        """Workspace member roster (OWNER/MANAGER/... roles) for the registry."""
+    async def list_dentry_permissions(self, dentry_uuid: str, operator_union_id: str, max_results: int = 100) -> list[dict]:
+        """Storage-layer permission roster for one dentry (a KB root node gives
+        the workspace's member list with roles). Endpoint per official SDK:
+        POST /v2.0/storage/spaces/dentries/{uuid}/permissions/query."""
         token = await self._token_value()
-        params = {"operatorId": operator_id, "maxResults": max(1, min(max_results, 100))}
-        if next_token:
-            params["nextToken"] = next_token
         async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                f"https://api.dingtalk.com/v2.0/wiki/workspaces/{workspace_id}/members",
-                params=params, headers={"x-acs-dingtalk-access-token": token})
+            response = await client.post(
+                f"https://api.dingtalk.com/v2.0/storage/spaces/dentries/{dentry_uuid}/permissions/query",
+                params={"unionId": operator_union_id},
+                headers={"x-acs-dingtalk-access-token": token},
+                json={"option": {"maxResults": max(1, min(max_results, 100))}},
+            )
         if response.is_error:
-            raise IntegrationError("dingtalk_members_failed", f"知识库成员查询失败（HTTP {response.status_code}）。", response.status_code)
+            raise IntegrationError("dingtalk_permissions_failed", f"权限名册查询失败（HTTP {response.status_code}）。", response.status_code)
         payload = response.json()
-        members = payload.get("members", payload.get("data", payload.get("items", []))) or []
-        return {"items": [{"user_id": str(item.get("id", "")), "name": str(item.get("name", "")),
-                           "role": str(item.get("role", "")), "type": str(item.get("type", ""))}
-                          for item in members if isinstance(item, dict)],
-                "next_token": payload.get("nextToken", "")}
+        rows = payload.get("permissions", payload.get("items", [])) or []
+        result = []
+        for row in rows:
+            member = row.get("member") or {}
+            role = row.get("role") or {}
+            result.append({"user_id": str(member.get("id", "")), "name": str(member.get("name", "")),
+                           "type": str(member.get("type", "")),
+                           "role": str(role.get("id", "") or role.get("name", ""))})
+        return result
 
-    async def search_wiki_nodes(self, keyword: str, operator_id: str, max_results: int = 20) -> list[dict]:
-        """Keyword search across the operator's visible wiki spaces. Used by the
-        bridge locator to turn a file name into candidate workspaces."""
+    async def search_dentries(self, keyword: str, operator_id: str, space_ids: list[str] | None = None,
+                              max_results: int = 20) -> list[dict]:
+        """Storage-layer name search (POST /v2.0/storage/dentries/search). Hits
+        carry dentryUuid — which equals the wiki nodeId — plus name and path."""
         if not keyword or not operator_id:
+            return []
+        token = await self._token_value()
+        option: dict[str, Any] = {"maxResults": max(1, min(max_results, 50))}
+        if space_ids:
+            option["spaceIds"] = space_ids
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.dingtalk.com/v2.0/storage/dentries/search",
+                params={"operatorId": operator_id},
+                headers={"x-acs-dingtalk-access-token": token},
+                json={"keyword": keyword[:100], "option": option},
+            )
+        if response.is_error:
+            raise IntegrationError("dingtalk_dentry_search_failed", f"存储搜索失败（HTTP {response.status_code}）。", response.status_code)
+        items = response.json().get("items", []) or []
+        return [{"dentry_uuid": str(item.get("dentryUuid", "")), "name": str(item.get("name", "")),
+                 "path": str(item.get("path", ""))} for item in items if isinstance(item, dict)]
+
+    async def batch_query_wiki_nodes(self, node_ids: list[str], operator_id: str) -> list[dict]:
+        """POST /v2.0/wiki/nodes/batchQuery — nodeIds -> full nodes incl. workspaceId."""
+        if not node_ids:
             return []
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
-                "https://api.dingtalk.com/v2.0/wiki/nodes/search",
+                "https://api.dingtalk.com/v2.0/wiki/nodes/batchQuery",
+                params={"operatorId": operator_id},
                 headers={"x-acs-dingtalk-access-token": token},
-                json={"keyword": keyword[:100], "operatorId": operator_id, "maxResults": max(1, min(max_results, 50))},
+                json={"nodeIds": node_ids[:30]},
             )
         if response.is_error:
-            raise IntegrationError("dingtalk_wiki_search_failed", f"知识库搜索失败（HTTP {response.status_code}）。", response.status_code)
+            raise IntegrationError("dingtalk_nodes_batch_failed", f"节点批量查询失败（HTTP {response.status_code}）。", response.status_code)
         payload = response.json()
-        items = payload.get("nodes", payload.get("data", payload.get("items", []))) or []
+        items = payload.get("nodes", payload.get("data", [])) or []
         return [normalize_node(item) for item in items if isinstance(item, dict)]
 
     async def download_file_bytes(self, space_id: str, dentry_uuid: str, max_bytes: int = 50_000_000) -> bytes:
