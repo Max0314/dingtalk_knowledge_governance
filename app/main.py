@@ -99,6 +99,8 @@ def dashboard(db: Session = Depends(db_session)):
     average = round(sum(x.ai_score for x in reviews) / len(reviews), 1) if reviews else None
     increments = metrics.monthly_increments(db)
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    month_reviews = [x for x in reviews if x.created_at and x.created_at.strftime("%Y-%m") == current_month]
+    month_average = round(sum(x.ai_score for x in month_reviews) / len(month_reviews), 1) if month_reviews else None
     month_row = next((row for row in increments["rows"] if row["month"] == current_month), None)
     latest = []
     for doc in db.scalars(select(Document).where(Document.is_folder.is_(False)).order_by(Document.discovered_at.desc()).limit(8)).all():
@@ -106,15 +108,22 @@ def dashboard(db: Session = Depends(db_session)):
         count = db.scalar(select(func.count()).select_from(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)) or 0
         latest.append(document_dict(doc, review, max(0, count - 1)))
     coverage_summary = metrics.coverage(db)["summary"] if workspaces else {"visible_workspaces": 0, "scanned": 0, "empty": 0, "excluded": 0}
+    # The snapshot-frozen org note dates from the personal-authorization era
+    # (23.5% coverage); the digital employee now sees the registered set, so
+    # the caveat that still holds is the headline-baseline scope, not access.
+    org_context = dict(increments["baseline"]["definition"].get("org_context", {}))
+    org_context["note"] = (f"文件总量与月度增量按 2026-08-05 主基线口径（44 库）+ 实时增量计算；"
+                           f"服务身份现已可见并登记 {workspaces} 个知识库，全量口径切换待业务确认。")
     return {
         "metrics": {
             "workspace_count": workspaces,
             "total_files": increments["total_files"],
             "month_increment": month_row["total"] if month_row else 0,
             "average_ai_score": average,
+            "month_average_score": month_average,
         },
         "coverage_summary": coverage_summary,
-        "org_context": increments["baseline"]["definition"].get("org_context", {}),
+        "org_context": org_context,
         "monthly": increments["rows"][-14:],
         "yearly": increments["yearly"],
         "latest_documents": latest,

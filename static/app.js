@@ -41,23 +41,23 @@ function bindDocRows(){document.querySelectorAll('[data-doc]').forEach(x=>x.oncl
 /* ---- views ---- */
 async function overview(){const d=await api('/api/v1/dashboard/overview');
   const cs=d.coverage_summary,org=d.org_context||{};
-  document.querySelector('#scopePill').textContent=`覆盖 ${cs.scanned}/${cs.visible_workspaces}/${org.org_total_knowledge_bases||'—'} 库`;
+  document.querySelector('#scopePill').textContent=`已登记 ${d.metrics.workspace_count} 库`;
   const years=Object.keys(d.yearly||{}).sort();
   const yearChips=years.map(y=>`<span class="chip blue">${y} 全量 ${nf(d.yearly[y].total)} · 日常 ${nf(d.yearly[y].routine)}</span>`).join('');
-  shell('治理概览','基线快照与增量同步合并去重；月份按钉钉 createTime（Asia/Shanghai）归属。',`
-  ${org.note?`<div class="banner">⚠ ${org.note}</div>`:''}
+  shell('知识库总览','公司知识库全景：规模、增量与文档质量。月份按钉钉 createTime（Asia/Shanghai）归属。',`
+  ${org.note?`<div class="banner">${org.note}</div>`:''}
   <div class="grid metrics">
-    ${statCard('文件总量（去重）',nf(d.metrics.total_files),'基线 + 增量同步合并')}
-    ${statCard('本月新增',nf(d.metrics.month_increment),'按 createTime 归属当月')}
-    ${statCard('可见知识库',d.metrics.workspace_count,`已扫描 ${cs.scanned} · 空库 ${cs.empty} · 排除 ${cs.excluded}`)}
-    ${statCard('平均 AI 评审分',d.metrics.average_ai_score??'—',d.metrics.average_ai_score==null?'评审尚未开始':'全部评审实例均值')}
+    ${statCard('知识库数量',d.metrics.workspace_count,'服务身份已加入并登记')}
+    ${statCard('文件总量（去重）',nf(d.metrics.total_files),'主基线 + 实时增量')}
+    ${statCard('本月文件增量',nf(d.metrics.month_increment),'按 createTime 归属当月')}
+    ${statCard('本月文档平均分',d.metrics.month_average_score??'—',d.metrics.month_average_score==null?'本月暂无评审':`历史均值 ${d.metrics.average_ai_score??'—'}`)}
   </div>
   <section class="card section-gap"><div class="card-head"><h2>月度新增趋势（近 14 个月）</h2><div class="controls">${yearChips}</div></div><div id="trendChart" class="chart"></div><div class="legend-note"><span><span class="dot" style="background:${COLOR.routine}"></span>日常新增</span><span><span class="dot" style="background:${COLOR.bulk}"></span>批量导入（系统迁移/同步，同样计入总量）</span><button class="secondary" id="go-increments" style="margin-left:auto">查看完整报表</button></div></section>
   <div class="grid two-cols section-gap">
     <section class="card"><div class="card-head"><h2>最近发现文档</h2><button class="secondary" id="go-docs">全部文档</button></div>${docTable(d.latest_documents)}</section>
     <section class="card"><h2>口径与数据边界</h2>
       <p class="hint">• 下限口径：扫描前已删除的文件不可观测。</p>
-      <p class="hint">• 覆盖范围：仅当前授权可见的知识库，不能表述为全公司。</p>
+      <p class="hint">• 覆盖范围：服务身份已加入的知识库；未加入的库不可见，加成员即纳入。</p>
       <p class="hint">• createTime 为知识库入库时间，非原文件创建时间。</p>
       <p class="hint">• 批量导入不扣减：仅拆分构成，供分析口径使用。</p>
       <button class="secondary" id="go-diagnostics">查看连接诊断</button></section>
@@ -251,7 +251,7 @@ async function workspaces(){
   </tbody></table></div>
   <div class="controls" style="justify-content:space-between;margin-top:8px"><span class="hint">第 ${reg.total?p.offset+1:0}-${Math.min(p.offset+50,reg.total)} 条 / 共 ${reg.total} 条</span><span><button class="secondary" id="wsprev" ${p.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="wsnext" ${p.offset+50>=reg.total?'disabled':''} style="margin-left:8px">下一页</button></span></div>
   </section>
-  ${cov&&cov.unreachable&&cov.unreachable.length?`<section class="card section-gap"><div class="card-head"><h2>当前授权不可达（按宜搭 2026-04-27 快照，Top ${cov.unreachable.length}）</h2><span class="chip amber">待授权</span></div><div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th class="num">文件数</th></tr></thead><tbody>${cov.unreachable.map(u=>`<tr><td>${u.name}</td><td class="num">${nf(u.files)}</td></tr>`).join('')}</tbody></table></div><p class="hint">这些知识库需要把服务身份加为成员后才能纳入统计与评审。</p></section>`:''}`);
+  `);
   document.querySelectorAll('[data-level]').forEach(x=>x.onclick=()=>{p.level=x.dataset.level;p.offset=0;workspaces()});
   document.querySelector('#wsgo').onclick=()=>{p.query=document.querySelector('#wsq').value.trim();p.department=document.querySelector('#wsdept').value.trim();p.creator=document.querySelector('#wscreator').value.trim();p.admin=document.querySelector('#wsadmin').value.trim();p.offset=0;workspaces()};
   document.querySelector('#wsq').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#wsgo').click()};
