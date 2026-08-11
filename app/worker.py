@@ -1,5 +1,6 @@
 import logging
 import time
+from .audit_bridge import process_audit_events
 from .audit_pull import run_audit_pull
 from .config import get_settings
 from .db import SessionLocal, init_db
@@ -40,6 +41,14 @@ def main() -> None:
                 logger.info("audit pull: %s", audit)
             except Exception:
                 logger.exception("audit pull failed")
+            if settings.bridge_enabled:
+                try:
+                    with SessionLocal() as db:
+                        bridge = process_audit_events(db, settings)
+                    if bridge["wiki_events"] or bridge["walks"]:
+                        logger.info("audit bridge: %s", bridge)
+                except Exception:
+                    logger.exception("audit bridge failed")
             next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
         time.sleep(0.5 if processed or notified else 3)
 

@@ -246,10 +246,13 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
 
 @app.get("/api/v1/audit/status")
 def audit_status_api(db: Session = Depends(db_session)):
+    from .audit_bridge import bridge_status
     from .audit_pull import audit_status
     settings = get_settings()
     return {"enabled": settings.audit_pull_enabled, "interval_seconds": settings.audit_pull_interval_seconds,
-            **audit_status(db)}
+            **audit_status(db),
+            "bridge": {"enabled": settings.bridge_enabled, "scope": settings.bridge_scope,
+                       "debounce_seconds": settings.bridge_debounce_seconds, **bridge_status(db)}}
 
 
 @app.get("/api/v1/stream-events")
@@ -469,7 +472,7 @@ async def connectivity(db: Session = Depends(db_session)):
     if not settings.watch_workspaces:
         watch_result = {"status": "not_configured", "message": "未配置 KG_WATCH_WORKSPACES，定向监控关闭。"}
     else:
-        last_watch = db.scalar(select(SyncRun).where(SyncRun.mode.in_(("watch", "watch_seed"))).order_by(SyncRun.created_at.desc()).limit(1))
+        last_watch = db.scalar(select(SyncRun).where(SyncRun.mode.in_(("watch", "watch_seed", "bridge", "bridge_seed"))).order_by(SyncRun.created_at.desc()).limit(1))
         if not last_watch:
             watch_result = {"status": "pending", "message": f"已配置目标「{settings.watch_workspaces}」，等待 worker 首轮扫描。"}
         elif last_watch.status == "succeeded":

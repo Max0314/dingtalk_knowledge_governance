@@ -75,6 +75,9 @@ class Document(Base):
     # Consecutive complete watcher walks that failed to see this node; the
     # watcher soft-deletes at the configured threshold and resets on sight.
     watch_misses: Mapped[int] = mapped_column(Integer, default=0)
+    # Asset class from app.fileclass (document/sheet/image/engineering/...).
+    # Only configured classes enter the review queue automatically.
+    file_class: Mapped[str] = mapped_column(String(32), default="", index=True)
     workspace: Mapped[Workspace] = relationship(back_populates="documents")
     reviews: Mapped[list["ReviewInstance"]] = relationship(back_populates="document")
 
@@ -288,6 +291,24 @@ class AuditDailyAgg(Base):
     module_view: Mapped[str] = mapped_column(String(64), default="")
     action_view: Mapped[str] = mapped_column(String(64), default="")
     count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SpaceMap(Base):
+    """Learned mapping from audit-trail numeric space ids to wiki workspaces.
+
+    Audit events carry only a numeric storage-space id; the review pipeline
+    needs a workspaceId. Rows start unmapped (workspace_id="") and are filled
+    by the bridge's resource-name learner, a manual seed, or reconciliation —
+    the per-space event tally shows which unmapped spaces matter most.
+    """
+    __tablename__ = "space_map"
+    space_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(id_string(), default="", index=True)
+    workspace_name: Mapped[str] = mapped_column(String(255), default="")
+    source: Mapped[str] = mapped_column(String(32), default="")  # learned | manual | seed
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_event_gmt: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class AuditState(Base):

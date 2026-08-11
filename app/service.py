@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import Settings
 from .db import Document, ModelConfig, ReviewInstance, ReviewJob, SyncRun, Workspace, WorkspaceRole, utcnow
+from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
 from .scoring import RULE_VERSION, score_document
@@ -120,6 +121,7 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     doc.source_created_at = item.get("created_at") or ""
     doc.source_updated_at = item.get("updated_at") or ""
     doc.is_folder = item["has_children"]
+    doc.file_class = classify(doc.extension, doc.is_folder)
     if doc.is_deleted:  # seen again — a recycle-bin restore, not a new document
         doc.is_deleted = False
     doc.watch_misses = 0
@@ -139,7 +141,7 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    if enqueue and (is_new or changed) and not doc.is_folder:
+    if enqueue and (is_new or changed) and not doc.is_folder and doc.file_class in review_classes(settings.review_classes):
         db.flush()
         pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
         if not pending:
@@ -242,7 +244,8 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
     return {"resolved": resolved, "unresolved": unresolved}
 
 
-async def watch_workspace(db: Session, settings: Settings, workspace_id: str, space: dict | None = None) -> SyncRun:
+async def watch_workspace(db: Session, settings: Settings, workspace_id: str, space: dict | None = None,
+                          mode: str = "watch") -> SyncRun:
     """One complete walk of one workspace. The first walk (empty mirror) seeds
     without queueing reviews — 482 pre-existing files must not flood the queue
     on day one; every later walk queues reviews for new/changed files and
@@ -251,7 +254,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     ``space`` is the normalized workspace listing item; when given, the walk
     trusts its rootNodeId instead of calling the detail endpoint, which fails
     for some personal spaces."""
-    run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode="watch")
+    run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode)
     db.add(run); db.commit()
     client = DingtalkClient(settings)
     operator = settings.dingtalk_sync_operator_id
@@ -271,7 +274,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         run.workspaces_seen = 1
         seeding = (db.scalar(select(func.count()).select_from(Document).where(Document.workspace_id == workspace_id)) or 0) == 0
         if seeding:
-            run.mode = "watch_seed"
+            run.mode = f"{mode}_seed"
         seen: set[str] = set()
 
         async def walk(parent_node_id: str) -> None:

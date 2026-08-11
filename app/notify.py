@@ -42,6 +42,14 @@ def enqueue_review_notification(db: Session, settings: Settings, doc: Document, 
     """Queue a push for a non-pass review. Caller commits."""
     if not settings.notify_enabled or instance.verdict == "pass":
         return None
+    allowed = {token.strip() for token in settings.notify_workspaces.split(",") if token.strip()}
+    if allowed and doc.workspace_id not in allowed:
+        # Org-rollout guardrail: reviews outside the allowlist stay silent but
+        # auditable — nobody gets robot-spammed by a workspace we never onboarded.
+        notification = Notification(node_id=doc.node_id, review_instance_id=instance.review_instance_id,
+                                    status="skipped", error_code="workspace_not_allowlisted")
+        db.add(notification)
+        return notification
     if not doc.uploader_key:
         notification = Notification(node_id=doc.node_id, review_instance_id=instance.review_instance_id,
                                     status="skipped", error_code="uploader_unknown")

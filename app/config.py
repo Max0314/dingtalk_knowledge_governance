@@ -39,6 +39,19 @@ class Settings(BaseSettings):
     audit_pull_interval_seconds: int = 600
     # Recipient of the audit-silence alarm (workday hours, 30min of no events).
     audit_alert_user_id: str = ""
+    # Audit-event -> workspace bridge: wiki write events ring the doorbell and
+    # a debounced targeted walk of the touched workspace does node-exact diffs.
+    bridge_enabled: bool = False
+    bridge_debounce_seconds: int = 900
+    # "watched" walks only workspaces the mirror already governs (pilot-safe);
+    # "mapped" walks any workspace with a learned space mapping (org rollout).
+    bridge_scope: str = "watched"
+    # Comma list of file classes (app.fileclass) that auto-enter the review
+    # queue. Empty falls back to the module default.
+    review_classes: str = ""
+    # Comma list of workspace ids allowed to receive review push messages.
+    # Empty = no restriction (pilot behavior). Set before org-wide rollout.
+    notify_workspaces: str = ""
     # Machine accounts (comma-separated userIds) excluded from person rankings.
     # bi_center currently classifies the digital employee as an official
     # employee, so the service marks its own operator account explicitly.

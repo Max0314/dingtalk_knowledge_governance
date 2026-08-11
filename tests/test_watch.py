@@ -123,3 +123,18 @@ def test_watch_full_lifecycle(settings):
 def test_watch_unresolved_target_reported(settings):
     result = cycle(settings.model_copy(update={"watch_workspaces": "不存在的库"}))
     assert result["resolved"] == [] and result["unresolved"] == ["不存在的库"] and result["runs"] == []
+
+
+def test_watch_skips_unreviewable_file_classes(settings):
+    FakeClient.nodes = {"D1": node("watch-doc1")}
+    cycle(settings)  # seed with one document
+
+    FakeClient.nodes["P"] = node("watch-pic", name="截图.png", extension="png")
+    FakeClient.nodes["L"] = node("watch-log", name="dump.log", extension="log")
+    FakeClient.nodes["D2"] = node("watch-doc2")
+    cycle(settings)
+    with SessionLocal() as db:
+        assert db.get(Document, "watch-pic").file_class == "image"
+        assert db.get(Document, "watch-log").file_class == "engineering"
+        assert jobs_for(db, "watch-pic") == [] and jobs_for(db, "watch-log") == []
+        assert [job.trigger for job in jobs_for(db, "watch-doc2")] == ["watch"]
