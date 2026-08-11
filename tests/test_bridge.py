@@ -14,17 +14,18 @@ from app.db import Document, FileAuditEvent, SessionLocal, SpaceMap, Workspace, 
 from app.fileclass import classify, review_classes
 
 WS = "bridge-ws"
-WS_EMPTY = "bridge-empty-ws"
 
 
 @pytest.fixture()
 def env(monkeypatch):
     init_db()
     walks: list[dict] = []
+    fail_next: list[bool] = []
 
     async def fake_walk(db, settings, workspace_id, space=None, mode="watch"):
         walks.append({"workspace_id": workspace_id, "mode": mode})
-        return SimpleNamespace(run_id="fake-run", mode=mode, status="succeeded",
+        status = "failed" if (fail_next and fail_next.pop(0)) else "succeeded"
+        return SimpleNamespace(run_id="fake-run", mode=mode, status=status,
                                documents_new=0, documents_changed=0, error_code="")
 
     monkeypatch.setattr(audit_bridge, "watch_workspace", fake_walk)
@@ -32,20 +33,18 @@ def env(monkeypatch):
     with SessionLocal() as db:
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("tb-%")).delete(synchronize_session=False)
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
-        for ws_id, name in ((WS, "桥接测试库"), (WS_EMPTY, "空白库")):
-            if not db.get(Workspace, ws_id):
-                db.add(Workspace(workspace_id=ws_id, name=name))
+        if not db.get(Workspace, WS):
+            db.add(Workspace(workspace_id=WS, name="桥接测试库"))
         if not db.get(Document, "bridge-A"):
             db.add(Document(node_id="bridge-A", workspace_id=WS, name="桥接测试文档.docx",
                             extension="docx", file_class="document"))
         db.commit()
-    settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_scope": "watched",
-                                                 "bridge_debounce_seconds": 900})
-    return settings, walks
+    settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_debounce_seconds": 900})
+    return settings, walks, fail_next
 
 
-def add_event(biz_id, resource, space_id, action_view="知识库上传文件", module_view="团队空间",
-              extension="docx", gmt=1786400000000):
+def add_event(biz_id, resource, space_id="2932890480", action_view="知识库上传文件",
+              module_view="团队空间", extension="docx", gmt=1786400000000):
     with SessionLocal() as db:
         db.add(FileAuditEvent(biz_id=biz_id, gmt_create=gmt, action_view=action_view,
                               module_view=module_view, resource=resource, extension=extension,
@@ -58,45 +57,48 @@ def run_bridge(settings):
         return audit_bridge.process_audit_events(db, settings)
 
 
-def test_learn_map_walk_and_backfill(env):
-    settings, walks = env
+def test_wiki_event_sweeps_governed_set_with_debounce(env):
+    settings, walks, _ = env
     add_event("tb-1", "桥接测试文档", "99001")
     summary = run_bridge(settings)
-    assert summary["wiki_events"] == 1 and summary["learned"] == 1 and len(summary["walks"]) == 1
-    assert walks == [{"workspace_id": WS, "mode": "bridge"}]
+    assert summary["wiki_events"] == 1 and summary["matched"] == 1
+    walked = {walk["workspace_id"] for walk in walks}
+    assert WS in walked and all(walk["mode"] == "bridge" for walk in walks)
     with SessionLocal() as db:
-        entry = db.get(SpaceMap, "99001")
-        assert entry.workspace_id == WS and entry.source == "learned" and entry.event_count == 1
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-1"))
         assert event.processed is True and event.matched_node_id == "bridge-A"
+        assert db.get(SpaceMap, "99001").event_count == 1  # tally survives as observability
 
-    # Same space again inside the debounce window: mapped, but no second walk.
+    # Second ring inside the debounce window: consumed, but no new walks.
+    count_before = len(walks)
     add_event("tb-2", "桥接测试文档.docx", "99001")
-    summary2 = run_bridge(settings)
-    assert summary2["mapped"] == 1 and summary2["walks"] == []
-    assert len(walks) == 1
+    assert run_bridge(settings)["wiki_events"] == 1
+    assert len(walks) == count_before
 
 
-def test_non_wiki_and_ambiguous_events(env):
-    settings, walks = env
+def test_non_wiki_event_never_walks(env):
+    settings, walks, _ = env
     add_event("tb-3", "随便.docx", "99002", action_view="上传文件", module_view="单聊")
-    with SessionLocal() as db:  # same name in a second workspace -> ambiguous join
-        if not db.get(Document, "bridge-B"):
-            db.add(Document(node_id="bridge-B", workspace_id=WS_EMPTY, name="桥接测试文档.docx",
-                            extension="docx", file_class="document"))
-            db.commit()
-    add_event("tb-4", "桥接测试文档.docx", "99003")
     summary = run_bridge(settings)
-    assert summary["wiki_events"] == 1 and summary["learned"] == 0 and summary["walks"] == []
-    with SessionLocal() as db:
-        assert db.get(SpaceMap, "99003").workspace_id == ""
-        assert db.scalar(select(FileAuditEvent.processed).where(FileAuditEvent.biz_id == "tb-3")) is True
-        db.query(Document).filter(Document.node_id == "bridge-B").delete(synchronize_session=False)
-        db.commit()
+    assert summary["wiki_events"] == 0 and summary["walks"] == [] and walks == []
 
 
-def test_snapshot_bootstrap_learns_unwalked_workspace(env):
-    settings, walks = env
+def test_failed_walk_evicts_debounce_for_retry(env):
+    settings, walks, fail_next = env
+    fail_next.extend([True] * 10)  # every governed workspace fails this round
+    add_event("tb-4", "任意文件.docx")
+    first = run_bridge(settings)
+    assert first["walks"] and all(walk["status"] == "failed" for walk in first["walks"])
+    count_after_failure = len(walks)
+    fail_next.clear()
+    add_event("tb-5", "任意文件2.docx")
+    second = run_bridge(settings)  # debounce evicted -> walks again immediately
+    assert len(walks) > count_after_failure
+    assert any(walk["status"] == "succeeded" for walk in second["walks"])
+
+
+def test_snapshot_join_backfills_match(env):
+    settings, walks, _ = env
     from app.db import HistoricalFileNode, HistoricalSnapshot
     with SessionLocal() as db:
         if not db.get(HistoricalSnapshot, "bridge-snap"):
@@ -104,24 +106,11 @@ def test_snapshot_bootstrap_learns_unwalked_workspace(env):
             db.add(HistoricalFileNode(snapshot_id="bridge-snap", workspace_id="never-walked-ws",
                                       node_id="snap-node-1", name="仅快照可见.docx", extension="docx"))
             db.commit()
-    add_event("tb-7", "仅快照可见.docx", "99005")
-    summary = run_bridge(settings)
-    assert summary["learned"] == 1 and summary["walks"] == []  # learned, but watched-scope gates the walk
+    add_event("tb-6", "仅快照可见.docx", "99005")
+    assert run_bridge(settings)["matched"] == 1
     with SessionLocal() as db:
-        assert db.get(SpaceMap, "99005").workspace_id == "never-walked-ws"
-
-
-def test_scope_gates_ungoverned_workspaces(env):
-    settings, walks = env
-    with SessionLocal() as db:
-        db.add(SpaceMap(space_id="99004", workspace_id=WS_EMPTY, workspace_name="空白库", source="manual"))
-        db.commit()
-    add_event("tb-5", "无镜像文档.docx", "99004")
-    assert run_bridge(settings)["walks"] == []  # watched scope: no mirror rows -> no walk
-    audit_bridge._last_walk.clear()
-    add_event("tb-6", "无镜像文档.docx", "99004")
-    open_scope = run_bridge(settings.model_copy(update={"bridge_scope": "mapped"}))
-    assert [walk["workspace_id"] for walk in open_scope["walks"]] == [WS_EMPTY]
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-6"))
+        assert event.matched_node_id == "snap-node-1"
 
 
 def test_fileclass_and_notify_guardrails():

@@ -259,7 +259,24 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     client = DingtalkClient(settings)
     operator = settings.dingtalk_sync_operator_id
     try:
-        raw = space if space and space.get("root_node_id") else await client.workspace_detail(workspace_id, operator)
+        raw = space if space and space.get("root_node_id") else None
+        if raw is None:
+            # The detail endpoint 400/404s on personal/team spaces; fall back
+            # to scanning the operator's listing, which always carries the root.
+            try:
+                raw = await client.workspace_detail(workspace_id, operator)
+            except IntegrationError:
+                raw = None
+            if not raw or not raw.get("root_node_id"):
+                next_token = ""
+                while True:
+                    page = await client.list_workspaces(operator, next_token)
+                    raw = next((item for item in page["items"] if item["workspace_id"] == workspace_id), None)
+                    next_token = page.get("next_token", "")
+                    if raw or not next_token:
+                        break
+            if not raw:
+                raise IntegrationError("workspace_not_visible", "工作区不在操作者可见列表中。", 404)
         ws = db.get(Workspace, workspace_id)
         if not ws:
             ws = Workspace(workspace_id=workspace_id, name=raw.get("name", "") or workspace_id)

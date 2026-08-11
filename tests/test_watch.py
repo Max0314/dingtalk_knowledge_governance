@@ -125,6 +125,21 @@ def test_watch_unresolved_target_reported(settings):
     assert result["resolved"] == [] and result["unresolved"] == ["不存在的库"] and result["runs"] == []
 
 
+def test_walk_falls_back_to_listing_when_detail_fails(settings, monkeypatch):
+    import asyncio
+    from app.integrations import IntegrationError
+
+    class DetailFailClient(FakeClient):
+        async def workspace_detail(self, workspace_id, operator_id):
+            raise IntegrationError("dingtalk_request_failed", "detail 400s on this space", 400)
+
+    monkeypatch.setattr(service, "DingtalkClient", DetailFailClient)
+    FakeClient.nodes = {"A": node("watch-A")}
+    with SessionLocal() as db:
+        run = asyncio.run(service.watch_workspace(db, settings, WS, mode="bridge"))  # no space passed
+        assert run.status == "succeeded" and run.documents_seen == 1
+
+
 def test_watch_skips_unreviewable_file_classes(settings):
     FakeClient.nodes = {"D1": node("watch-doc1")}
     cycle(settings)  # seed with one document
