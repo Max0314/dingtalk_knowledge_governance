@@ -117,6 +117,30 @@ def test_connectivity_never_claims_unconfigured_integrations_are_healthy():
         assert statuses["钉钉知识库"] == "not_configured"
 
 
+def test_soft_deleted_document_leaves_the_headline_total():
+    from app import metrics
+    from app.db import Document, SessionLocal
+
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            baseline_total = metrics.monthly_increments(db)["total_files"]
+            # hist-A exists in the primary baseline snapshot; a mirrored soft
+            # delete must remove it from the merged headline count.
+            doc = db.get(Document, "hist-A")
+            if not doc:
+                doc = Document(node_id="hist-A", workspace_id="demo-workspace", name="历史文档甲.docx",
+                               extension="docx", file_class="document")
+                db.add(doc)
+            doc.is_deleted = True
+            db.commit()
+            metrics._cache.update(stamp=None, at=0)  # bust the metrics cache
+            after = metrics.monthly_increments(db)["total_files"]
+            assert after == baseline_total - 1
+            doc.is_deleted = False
+            db.commit()
+            metrics._cache.update(stamp=None, at=0)
+
+
 def test_admin_guard_gates_model_configs():
     from app import auth as auth_module
     from app.config import get_settings

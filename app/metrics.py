@@ -71,6 +71,10 @@ def _collect(db: Session) -> dict[str, Any]:
             select(Document.workspace_id, Document.node_id, Document.source_created_at)
             .where(Document.is_folder.is_(False), Document.is_deleted.is_(False))):
         files.setdefault(node_id, (workspace_id, created or ""))
+    # A confirmed deletion (watcher/reconciliation soft-delete) overrides the
+    # frozen baseline row — totals go down the moment the mirror knows.
+    for (node_id,) in db.execute(select(Document.node_id).where(Document.is_deleted.is_(True))):
+        files.pop(node_id, None)
 
     monthly = collections.Counter()
     month_days: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
