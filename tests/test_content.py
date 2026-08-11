@@ -1,0 +1,71 @@
+import io
+import os
+import zipfile
+
+os.environ["KG_DATABASE_URL"] = "sqlite:///./runtime/test_knowledge_governance.db"
+os.environ["KG_DEMO_MODE"] = "true"
+
+from app.config import get_settings
+from app.content import extract_text
+from app.db import Document, SessionLocal, Workspace, init_db
+from app.service import run_review
+
+
+def zip_bytes(entries: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+    return buffer.getvalue()
+
+
+def test_docx_extraction():
+    data = zip_bytes({"word/document.xml":
+                      "<w:document xmlns:w='ns'><w:body><w:p><w:r><w:t>第一段标题</w:t></w:r></w:p>"
+                      "<w:p><w:r><w:t>第二段正文内容</w:t></w:r></w:p></w:body></w:document>"})
+    text = extract_text("docx", data)
+    assert "第一段标题" in text and "第二段正文内容" in text
+    assert text.index("第一段标题") < text.index("第二段正文内容")
+
+
+def test_xlsx_extraction():
+    data = zip_bytes({
+        "xl/sharedStrings.xml": "<sst xmlns='http://x'><si><t>表头甲</t></si><si><t>数值乙</t></si></sst>",
+        "xl/worksheets/sheet1.xml": "<worksheet xmlns='http://x'><sheetData><row><c><is><t>行内丙</t></is></c></row></sheetData></worksheet>",
+    })
+    text = extract_text("xlsx", data)
+    assert "表头甲" in text and "数值乙" in text and "行内丙" in text
+
+
+def test_pptx_extraction():
+    data = zip_bytes({"ppt/slides/slide1.xml":
+                      "<p:sld xmlns:a='http://a' xmlns:p='http://p'><a:t>幻灯片标题</a:t></p:sld>"})
+    assert "幻灯片标题" in extract_text("pptx", data)
+
+
+def test_plain_text_and_fallbacks():
+    assert extract_text("txt", "中文文本".encode("utf-8")) == "中文文本"
+    assert extract_text("md", "中文gbk".encode("gb18030")) == "中文gbk"
+    assert extract_text("doc", b"legacy binary") == ""      # unsupported legacy format
+    assert extract_text("docx", b"not a zip at all") == ""  # malformed archive degrades
+
+
+def test_run_review_uses_extracted_content(monkeypatch):
+    import app.content as content_module
+
+    async def fake_fetch(settings, doc):
+        return ("文档信息\n版本号：V1.0\n适用范围：测试\n标签：a, b, c\n\n摘要\n本文验证抽取。\n\n"
+                "1. 背景\n抽取测试正文段落。\n2. 结论\n抽取生效。", "storage_download")
+
+    monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)
+    init_db()
+    with SessionLocal() as db:
+        if not db.get(Workspace, "content-ws"):
+            db.add(Workspace(workspace_id="content-ws", name="抽取测试库"))
+        if not db.get(Document, "content-1"):
+            db.add(Document(node_id="content-1", workspace_id="content-ws", name="抽取测试_V1.0.docx",
+                            extension="docx", file_class="document"))
+        db.commit()
+        instance = run_review(db, get_settings(), "content-1", "test")
+        assert instance.review_scope == "full_content"
+        assert instance.content_fingerprint  # sha256 of the ephemeral body

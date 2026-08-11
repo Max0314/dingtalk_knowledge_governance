@@ -39,7 +39,8 @@ def env(monkeypatch):
             db.add(Document(node_id="bridge-A", workspace_id=WS, name="桥接测试文档.docx",
                             extension="docx", file_class="document"))
         db.commit()
-    settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_debounce_seconds": 900})
+    settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_debounce_seconds": 900,
+                                                 "bridge_locator_enabled": False})
     return settings, walks, fail_next
 
 
@@ -111,6 +112,70 @@ def test_snapshot_join_backfills_match(env):
     with SessionLocal() as db:
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-6"))
         assert event.matched_node_id == "snap-node-1"
+
+
+def test_locator_routes_precisely(env, monkeypatch):
+    settings, walks, _ = env
+    located = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op"})
+
+    class FakeSearchClient:
+        def __init__(self, _settings):
+            pass
+
+        async def search_wiki_nodes(self, keyword, operator_id, max_results=20):
+            return [{"name": "桥接测试文档.docx", "workspace_id": WS, "node_id": "bridge-A"}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", FakeSearchClient)
+    add_event("tb-9", "桥接测试文档.docx", "99009")
+    summary = run_bridge(located)
+    assert summary["unlocated"] == 0
+    assert [walk["workspace_id"] for walk in summary["walks"]] == [WS]  # only the located workspace
+
+
+def test_locator_miss_falls_back_to_sweep(env, monkeypatch):
+    settings, walks, _ = env
+    located = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op"})
+
+    class EmptySearchClient:
+        def __init__(self, _settings):
+            pass
+
+        async def search_wiki_nodes(self, keyword, operator_id, max_results=20):
+            return []  # brand-new file not indexed yet
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", EmptySearchClient)
+    add_event("tb-10", "全新未索引文件.docx", "99010")
+    summary = run_bridge(located)
+    assert summary["unlocated"] == 1
+    assert WS in {walk["workspace_id"] for walk in summary["walks"]}  # governed sweep fired
+
+
+def test_notify_override_redirects_to_operator(monkeypatch):
+    from app.db import Notification
+    from app import notify as notify_module
+
+    sent = []
+
+    class FakeNotifyClient:
+        def __init__(self, _settings):
+            pass
+
+        async def resolve_user_id(self, union_id):
+            return "resolved-" + union_id
+
+        async def send_robot_markdown(self, user_ids, title, text):
+            sent.append((user_ids, title, text))
+
+    monkeypatch.setattr(notify_module, "DingtalkClient", FakeNotifyClient)
+    init_db()
+    with SessionLocal() as db:
+        db.add(Notification(node_id="n-ovr", target_union_id="u-999", title="评审退回", body="正文", status="pending"))
+        db.commit()
+        settings = get_settings().model_copy(update={"notify_enabled": True,
+                                                     "notify_override_user_id": "01115324500438248944"})
+        notify_module.process_pending_notifications(db, settings)
+    ours = [item for item in sent if "u-999" in item[2]]
+    assert ours and ours[0][0] == ["01115324500438248944"]
 
 
 def test_fileclass_and_notify_guardrails():

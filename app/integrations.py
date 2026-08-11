@@ -111,6 +111,51 @@ class DingtalkClient:
             raise IntegrationError("dingtalk_robot_send_failed", f"机器人消息发送失败（HTTP {response.status_code}）。", response.status_code)
         return response.json()
 
+    async def search_wiki_nodes(self, keyword: str, operator_id: str, max_results: int = 20) -> list[dict]:
+        """Keyword search across the operator's visible wiki spaces. Used by the
+        bridge locator to turn a file name into candidate workspaces."""
+        if not keyword or not operator_id:
+            return []
+        token = await self._token_value()
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                "https://api.dingtalk.com/v2.0/wiki/nodes/search",
+                headers={"x-acs-dingtalk-access-token": token},
+                json={"keyword": keyword[:100], "operatorId": operator_id, "maxResults": max(1, min(max_results, 50))},
+            )
+        if response.is_error:
+            raise IntegrationError("dingtalk_wiki_search_failed", f"知识库搜索失败（HTTP {response.status_code}）。", response.status_code)
+        payload = response.json()
+        items = payload.get("nodes", payload.get("data", payload.get("items", []))) or []
+        return [normalize_node(item) for item in items if isinstance(item, dict)]
+
+    async def download_file_bytes(self, space_id: str, dentry_uuid: str, max_bytes: int = 50_000_000) -> bytes:
+        """Two-step unified-storage download. The returned bytes live only in
+        the caller's memory for the duration of one review."""
+        operator = self.settings.dingtalk_sync_operator_id
+        token = await self._token_value()
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"https://api.dingtalk.com/v2.0/storage/spaces/{space_id}/files/{dentry_uuid}/downloadInfos/query",
+                params={"unionId": operator},
+                headers={"x-acs-dingtalk-access-token": token},
+                json={"option": {"preferIntranet": False}},
+            )
+        if response.is_error:
+            raise IntegrationError("dingtalk_download_info_failed", f"下载信息获取失败（HTTP {response.status_code}）。", response.status_code)
+        info = response.json().get("headerSignatureInfo") or {}
+        urls = info.get("resourceUrls") or []
+        headers = info.get("headers") or {}
+        if not urls:
+            raise IntegrationError("dingtalk_download_url_missing", "下载信息响应缺少资源地址。")
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            response = await client.get(urls[0], headers=headers)
+        if response.is_error:
+            raise IntegrationError("dingtalk_download_failed", f"文件下载失败（HTTP {response.status_code}）。", response.status_code)
+        if len(response.content) > max_bytes:
+            raise IntegrationError("dingtalk_download_too_large", "文件超出下载上限。")
+        return response.content
+
     async def fetch_ephemeral_content(self, node_id: str) -> str:
         """Fetches text only when an explicitly verified content gateway is configured.
 

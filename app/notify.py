@@ -74,15 +74,22 @@ def process_pending_notifications(db: Session, settings: Settings, batch: int = 
             row.status, row.error_code = "skipped", "notify_disabled"
             continue
         try:
-            # New-namespace uploader keys are already numeric userIds; only
-            # UnionIDs need the conversion round-trip.
-            user_id = row.target_user_id or (row.target_union_id if row.target_union_id.isdigit()
-                                             else asyncio.run(client.resolve_user_id(row.target_union_id)))
+            if settings.notify_override_user_id:
+                # Pilot observation mode: everything goes to the operator, with
+                # the intended recipient named so routing can be judged later.
+                user_id = settings.notify_override_user_id
+                send_body = f"> 试点观察模式：本应推送给上传人 `{row.target_union_id}`\n\n{row.body}"
+            else:
+                # New-namespace uploader keys are already numeric userIds; only
+                # UnionIDs need the conversion round-trip.
+                user_id = row.target_user_id or (row.target_union_id if row.target_union_id.isdigit()
+                                                 else asyncio.run(client.resolve_user_id(row.target_union_id)))
+                send_body = row.body
             if not user_id:
                 row.status, row.error_code = "failed", "user_id_not_resolved"
                 continue
             row.target_user_id = user_id
-            asyncio.run(client.send_robot_markdown([user_id], row.title, row.body))
+            asyncio.run(client.send_robot_markdown([user_id], row.title, send_body))
             row.status, row.sent_at, row.error_code = "sent", utcnow(), ""
         except IntegrationError as exc:
             row.status, row.error_code = "failed", exc.code

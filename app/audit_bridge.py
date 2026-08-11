@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings
 from .db import Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, SpaceMap
+from .integrations import DingtalkClient, IntegrationError
 from .service import watch_workspace
 
 logger = logging.getLogger("kg.bridge")
@@ -115,8 +116,46 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     if not wiki_events:
         return summary
 
+    # Locator: a wiki-search by file name gives the doorbell an address. Only
+    # events the search cannot place fall back to sweeping the governed set.
+    governed = set(_governed_workspaces(db))
+    ring: set[str] = set()
+    located_ungoverned: set[str] = set()
+    unlocated = 0
+    if settings.bridge_locator_enabled:
+        client = DingtalkClient(settings)
+        for event in wiki_events:
+            names = _name_candidates(event)
+            try:
+                nodes = asyncio.run(client.search_wiki_nodes(names[0], settings.dingtalk_sync_operator_id))
+            except (IntegrationError, RuntimeError):
+                nodes = None
+            if nodes is None:
+                unlocated += 1
+                continue
+            hits = [node for node in nodes if node.get("name") in names]
+            workspaces = {node.get("workspace_id") for node in hits if node.get("workspace_id")}
+            if not workspaces:
+                unlocated += 1  # brand-new files may not be indexed yet -> sweep
+                continue
+            for workspace_id in workspaces:
+                if workspace_id in governed or settings.bridge_scope == "mapped":
+                    ring.add(workspace_id)
+                else:
+                    located_ungoverned.add(workspace_id)
+            node_ids = {node["node_id"] for node in hits if node.get("node_id")}
+            if not event.matched_node_id and len(node_ids) == 1:
+                event.matched_node_id = node_ids.pop()
+                summary["matched"] += 1
+    else:
+        unlocated = len(wiki_events)
+    if unlocated:
+        ring |= governed
+    summary["unlocated"] = unlocated
+    summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
+
     debounce = max(60, settings.bridge_debounce_seconds)
-    for workspace_id in _governed_workspaces(db):
+    for workspace_id in sorted(ring):
         if time.time() - _last_walk.get(workspace_id, 0) < debounce:
             continue
         _last_walk[workspace_id] = time.time()

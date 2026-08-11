@@ -52,6 +52,19 @@ class Settings(BaseSettings):
     # Comma list of workspace ids allowed to receive review push messages.
     # Empty = no restriction (pilot behavior). Set before org-wide rollout.
     notify_workspaces: str = ""
+    # Pilot observation mode: when set, every review push is redirected to
+    # this userId (with the original recipient named in the body) instead of
+    # messaging uploaders directly.
+    notify_override_user_id: str = ""
+    # Ephemeral body extraction for reviews. The wiki storage space id is the
+    # org-wide pool behind knowledge bases (learned from an upload response);
+    # empty disables downloads and reviews stay metadata_only.
+    content_extract_enabled: bool = True
+    wiki_storage_space_id: str = ""
+    content_max_bytes: int = 20_000_000
+    # Bridge locator: resolve wiki write events to workspaces via node search
+    # before falling back to the governed-set sweep.
+    bridge_locator_enabled: bool = True
     # Machine accounts (comma-separated userIds) excluded from person rankings.
     # bi_center currently classifies the digital employee as an official
     # employee, so the service marks its own operator account explicitly.

@@ -39,18 +39,25 @@ def active_model(db: Session) -> ModelConfig | None:
 
 
 def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual") -> ReviewInstance:
+    from .content import fetch_document_content
+
     doc = db.get(Document, node_id)
     if not doc:
         raise KeyError("document_not_found")
     # The only body holder is this local variable. It is never assigned to an ORM field or logged.
     content = ""
     scope = "metadata_only"
-    if settings.dingtalk_doc_content_url_template and not doc.is_folder:
+    if not doc.is_folder:
         try:
-            content = asyncio.run(DingtalkClient(settings).fetch_ephemeral_content(node_id))
-            scope = "full_content" if content else "metadata_only"
+            content, _source = asyncio.run(fetch_document_content(settings, doc))
         except (IntegrationError, RuntimeError):
             content = ""
+        if not content and settings.dingtalk_doc_content_url_template:
+            try:
+                content = asyncio.run(DingtalkClient(settings).fetch_ephemeral_content(node_id))
+            except (IntegrationError, RuntimeError):
+                content = ""
+        scope = "full_content" if content else "metadata_only"
     result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n")
     model = active_model(db)
     if content and model and settings.model_allow_content_transfer:
