@@ -187,11 +187,91 @@ def test_notify_override_redirects_to_operator(monkeypatch):
     with SessionLocal() as db:
         db.add(Notification(node_id="n-ovr", target_union_id="u-999", title="评审退回", body="正文", status="pending"))
         db.commit()
-        settings = get_settings().model_copy(update={"notify_enabled": True,
+        settings = get_settings().model_copy(update={"notify_enabled": True, "notify_digest_window_seconds": 0,
                                                      "notify_override_user_id": "01115324500438248944"})
         notify_module.process_pending_notifications(db, settings)
     ours = [item for item in sent if "u-999" in item[2]]
     assert ours and ours[0][0] == ["01115324500438248944"]
+
+
+def test_notification_digest_batches_bursts(monkeypatch):
+    from datetime import timedelta
+
+    from app.db import Notification, utcnow
+    from app import notify as notify_module
+
+    sent = []
+
+    class FakeNotifyClient:
+        def __init__(self, _settings):
+            pass
+
+        async def resolve_user_id(self, union_id):
+            return union_id
+
+        async def send_robot_markdown(self, user_ids, title, text):
+            sent.append((user_ids, title, text))
+
+    monkeypatch.setattr(notify_module, "DingtalkClient", FakeNotifyClient)
+    init_db()
+    settings = get_settings().model_copy(update={"notify_enabled": True, "notify_override_user_id": "",
+                                                 "notify_digest_window_seconds": 300,
+                                                 "notify_digest_max_delay_seconds": 1800})
+    with SessionLocal() as db:
+        db.query(Notification).filter(Notification.target_union_id == "70000001").delete(synchronize_session=False)
+        # Fresh burst rows -> the pump must hold them.
+        for index in range(3):
+            db.add(Notification(node_id=f"burst-{index}", target_union_id="70000001",
+                                title=f"文档评审退回：批量文档{index}.docx", body="正文", status="pending"))
+        db.commit()
+        assert notify_module.process_pending_notifications(db, settings) == 0
+        assert sent == []
+        # Quiet window elapsed -> ONE digest message, all rows marked sent.
+        for row in db.query(Notification).filter(Notification.target_union_id == "70000001").all():
+            row.created_at = utcnow() - timedelta(seconds=400)
+        db.commit()
+        assert notify_module.process_pending_notifications(db, settings) == 3
+        digest = [item for item in sent if "批量文档" in item[2]]
+        assert len(digest) == 1 and "3 份待处理" in digest[0][1]
+        statuses = {row.status for row in db.query(Notification)
+                    .filter(Notification.target_union_id == "70000001").all()}
+        assert statuses == {"sent"}
+
+
+def test_notification_digest_max_delay_forces_flush(monkeypatch):
+    from datetime import timedelta
+
+    from app.db import Notification, utcnow
+    from app import notify as notify_module
+
+    sent = []
+
+    class FakeNotifyClient:
+        def __init__(self, _settings):
+            pass
+
+        async def resolve_user_id(self, union_id):
+            return union_id
+
+        async def send_robot_markdown(self, user_ids, title, text):
+            sent.append((user_ids, title, text))
+
+    monkeypatch.setattr(notify_module, "DingtalkClient", FakeNotifyClient)
+    init_db()
+    settings = get_settings().model_copy(update={"notify_enabled": True, "notify_override_user_id": "",
+                                                 "notify_digest_window_seconds": 300,
+                                                 "notify_digest_max_delay_seconds": 1800})
+    with SessionLocal() as db:
+        db.query(Notification).filter(Notification.target_union_id == "70000002").delete(synchronize_session=False)
+        old = Notification(node_id="force-0", target_union_id="70000002",
+                           title="文档评审退回：最早的文档.docx", body="正文", status="pending")
+        db.add(old); db.commit()
+        old.created_at = utcnow() - timedelta(seconds=1900)  # past max delay
+        fresh = Notification(node_id="force-1", target_union_id="70000002",
+                             title="文档评审退回：刚上传的文档.docx", body="正文", status="pending")
+        db.add(fresh); db.commit()  # burst still ongoing, but max delay wins
+        assert notify_module.process_pending_notifications(db, settings) == 2
+        assert any("2 份待处理" in item[1] for item in sent)
 
 
 def test_fileclass_and_notify_guardrails():

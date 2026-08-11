@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     # this userId (with the original recipient named in the body) instead of
     # messaging uploaders directly.
     notify_override_user_id: str = ""
+    # Burst-friendly digests: hold pushes until the recipient has been quiet
+    # for this many seconds (sliding window; 0 = send immediately), but never
+    # hold longer than the max delay even during continuous uploading.
+    notify_digest_window_seconds: int = 300
+    notify_digest_max_delay_seconds: int = 1800
     # Ephemeral body extraction for reviews. The wiki storage space id is the
     # org-wide pool behind knowledge bases (learned from an upload response);
     # empty disables downloads and reviews stay metadata_only.

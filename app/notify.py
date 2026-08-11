@@ -62,38 +62,84 @@ def enqueue_review_notification(db: Session, settings: Settings, doc: Document, 
     return notification
 
 
-def process_pending_notifications(db: Session, settings: Settings, batch: int = 5) -> int:
-    """Send up to `batch` pending rows. Returns how many were attempted."""
+def _age_seconds(now, moment) -> float:
+    return (now.replace(tzinfo=None) - moment.replace(tzinfo=None)).total_seconds()
+
+
+def _digest_message(db: Session, rows: list[Notification]) -> tuple[str, str]:
+    """One message for a burst: counts plus a one-line summary per document."""
+    from .db import ReviewInstance
+
+    lines = [f"### 知识库文档评审汇总：{len(rows)} 份待处理", ""]
+    for row in rows[:10]:
+        instance = db.get(ReviewInstance, row.review_instance_id) if row.review_instance_id else None
+        name = row.title.split("：", 1)[-1]
+        if instance:
+            lines.append(f"- **{name}** — {instance.ai_score:.0f} 分 · {VERDICT_LABEL.get(instance.verdict, instance.verdict)}")
+        else:
+            lines.append(f"- **{name}**")
+    if len(rows) > 10:
+        lines.append(f"- ……其余 {len(rows) - 10} 份见治理看板")
+    lines += ["", "请在钉钉知识库中修改原文档；修改会被自动发现并重新评审，历史评分保留。"]
+    return f"文档评审汇总：{len(rows)} 份待处理", "\n".join(lines)
+
+
+def process_pending_notifications(db: Session, settings: Settings, batch: int = 100) -> int:
+    """Digest-aware pump: pushes wait out a quiet window per recipient so a
+    burst of uploads becomes one summary message instead of a message storm.
+    Returns how many rows were attempted (sent or failed)."""
     rows = db.scalars(select(Notification).where(Notification.status == "pending")
                       .order_by(Notification.created_at).limit(batch)).all()
     if not rows:
         return 0
     client = DingtalkClient(settings)
+    now = utcnow()
+    window = max(0, settings.notify_digest_window_seconds)
+    max_delay = max(window, settings.notify_digest_max_delay_seconds)
+    groups: dict[str, list[Notification]] = {}
     for row in rows:
+        key = settings.notify_override_user_id or row.target_union_id or "?"
+        groups.setdefault(key, []).append(row)
+    attempted = 0
+    for key, group in groups.items():
         if not settings.notify_enabled:
-            row.status, row.error_code = "skipped", "notify_disabled"
+            for row in group:
+                row.status, row.error_code = "skipped", "notify_disabled"
+            attempted += len(group)
             continue
+        newest_age = min(_age_seconds(now, row.created_at) for row in group)
+        oldest_age = max(_age_seconds(now, row.created_at) for row in group)
+        if window and newest_age < window and oldest_age < max_delay:
+            continue  # recipient still in a burst — keep accumulating
         try:
             if settings.notify_override_user_id:
-                # Pilot observation mode: everything goes to the operator, with
-                # the intended recipient named so routing can be judged later.
                 user_id = settings.notify_override_user_id
-                send_body = f"> 试点观察模式：本应推送给上传人 `{row.target_union_id}`\n\n{row.body}"
+                origin = "、".join(sorted({row.target_union_id for row in group if row.target_union_id})) or "未知"
+                prefix = f"> 试点观察模式：本应推送给上传人 `{origin}`\n\n"
             else:
-                # New-namespace uploader keys are already numeric userIds; only
-                # UnionIDs need the conversion round-trip.
-                user_id = row.target_user_id or (row.target_union_id if row.target_union_id.isdigit()
-                                                 else asyncio.run(client.resolve_user_id(row.target_union_id)))
-                send_body = row.body
+                sample = group[0]
+                user_id = sample.target_user_id or (sample.target_union_id if sample.target_union_id.isdigit()
+                                                    else asyncio.run(client.resolve_user_id(sample.target_union_id)))
+                prefix = ""
             if not user_id:
-                row.status, row.error_code = "failed", "user_id_not_resolved"
+                for row in group:
+                    row.status, row.error_code = "failed", "user_id_not_resolved"
+                attempted += len(group)
                 continue
-            row.target_user_id = user_id
-            asyncio.run(client.send_robot_markdown([user_id], row.title, send_body))
-            row.status, row.sent_at, row.error_code = "sent", utcnow(), ""
+            if len(group) == 1:
+                title, body = group[0].title, group[0].body
+            else:
+                title, body = _digest_message(db, group)
+            asyncio.run(client.send_robot_markdown([user_id], title, prefix + body))
+            for row in group:
+                row.target_user_id = user_id
+                row.status, row.sent_at, row.error_code = "sent", utcnow(), ""
         except IntegrationError as exc:
-            row.status, row.error_code = "failed", exc.code
+            for row in group:
+                row.status, row.error_code = "failed", exc.code
         except Exception:
-            row.status, row.error_code = "failed", "notify_execution_failed"
+            for row in group:
+                row.status, row.error_code = "failed", "notify_execution_failed"
+        attempted += len(group)
     db.commit()
-    return len(rows)
+    return attempted
