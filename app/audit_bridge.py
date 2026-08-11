@@ -27,12 +27,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid as uuid_module
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from .config import Settings
-from .db import Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, SpaceMap
+from .db import Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewJob, SpaceMap
+from .fileclass import review_classes
 from .integrations import DingtalkClient, IntegrationError
 from .service import watch_workspace
 
@@ -94,15 +96,24 @@ def _governed_workspaces(db: Session) -> list[str]:
     return [row[0] for row in db.execute(select(Document.workspace_id).distinct()).all() if row[0]]
 
 
-def _attach_numeric_id(db: Session, event: FileAuditEvent) -> None:
+def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -> None:
     """The event's bizId IS the file's numeric storage dentry id (verified by
     cross-download); hand it to the mirrored document so reviews can fetch
-    the body through the numeric-only download API."""
+    the body through the numeric-only download API. A document whose review
+    ran before its key arrived gets an automatic content-scope re-review."""
     if not event.matched_node_id or not (event.biz_id or "").isdigit():
         return
     doc = db.get(Document, event.matched_node_id)
-    if doc and not doc.storage_dentry_id:
-        doc.storage_dentry_id = event.biz_id
+    if not doc or doc.storage_dentry_id:
+        return
+    doc.storage_dentry_id = event.biz_id
+    if doc.is_folder or doc.file_class not in review_classes(settings.review_classes):
+        return
+    pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
+                                                ReviewJob.status.in_(("pending", "running"))))
+    if not pending:
+        db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
+                         trigger="content_key", requested_by="system"))
 
 
 def process_audit_events(db: Session, settings: Settings) -> dict:
@@ -162,7 +173,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if not event.matched_node_id and len(node_ids) == 1:
                 event.matched_node_id = node_ids.pop()
                 summary["matched"] += 1
-            _attach_numeric_id(db, event)
+            _attach_numeric_id(db, event, settings)
     else:
         unlocated = len(wiki_events)
     if unlocated:
@@ -188,7 +199,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if node_id:
                 event.matched_node_id = node_id
                 summary["matched"] += 1
-        _attach_numeric_id(db, event)
+        _attach_numeric_id(db, event, settings)
     db.commit()
     return summary
 
