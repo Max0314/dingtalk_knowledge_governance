@@ -111,6 +111,26 @@ class DingtalkClient:
             raise IntegrationError("dingtalk_robot_send_failed", f"机器人消息发送失败（HTTP {response.status_code}）。", response.status_code)
         return response.json()
 
+    async def list_workspace_members(self, workspace_id: str, operator_id: str, next_token: str = "",
+                                     max_results: int = 100) -> dict:
+        """Workspace member roster (OWNER/MANAGER/... roles) for the registry."""
+        token = await self._token_value()
+        params = {"operatorId": operator_id, "maxResults": max(1, min(max_results, 100))}
+        if next_token:
+            params["nextToken"] = next_token
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"https://api.dingtalk.com/v2.0/wiki/workspaces/{workspace_id}/members",
+                params=params, headers={"x-acs-dingtalk-access-token": token})
+        if response.is_error:
+            raise IntegrationError("dingtalk_members_failed", f"知识库成员查询失败（HTTP {response.status_code}）。", response.status_code)
+        payload = response.json()
+        members = payload.get("members", payload.get("data", payload.get("items", []))) or []
+        return {"items": [{"user_id": str(item.get("id", "")), "name": str(item.get("name", "")),
+                           "role": str(item.get("role", "")), "type": str(item.get("type", ""))}
+                          for item in members if isinstance(item, dict)],
+                "next_token": payload.get("nextToken", "")}
+
     async def search_wiki_nodes(self, keyword: str, operator_id: str, max_results: int = 20) -> list[dict]:
         """Keyword search across the operator's visible wiki spaces. Used by the
         bridge locator to turn a file name into candidate workspaces."""
