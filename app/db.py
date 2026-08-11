@@ -78,6 +78,10 @@ class Document(Base):
     # Asset class from app.fileclass (document/sheet/image/engineering/...).
     # Only configured classes enter the review queue automatically.
     file_class: Mapped[str] = mapped_column(String(32), default="", index=True)
+    # Numeric storage dentry id (== the audit trail's bizId for the upload
+    # event — verified by cross-download 2026-08-12). The download API only
+    # accepts this numeric form; empty means no event seen yet.
+    storage_dentry_id: Mapped[str] = mapped_column(String(64), default="")
     workspace: Mapped[Workspace] = relationship(back_populates="documents")
     reviews: Mapped[list["ReviewInstance"]] = relationship(back_populates="document")
 

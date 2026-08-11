@@ -121,13 +121,14 @@ async def fetch_document_content(settings: Settings, doc: Document) -> tuple[str
         return "", "unsupported"
     if not settings.content_extract_enabled or not settings.wiki_storage_space_id:
         return "", "disabled"
+    if not doc.storage_dentry_id:
+        # The numeric key arrives with the file's audit event; stock files
+        # that predate the trail stay at metadata scope until touched.
+        return "", "no_numeric_id"
     if doc.size and doc.size > settings.content_max_bytes:
         return "", "too_large"
     client = DingtalkClient(settings)
-    try:
-        data = await client.download_file_bytes(settings.wiki_storage_space_id, doc.node_id)
-    except IntegrationError:
-        raise
+    data = await client.download_file_bytes(settings.wiki_storage_space_id, doc.storage_dentry_id)
     if not data:
         return "", "empty_download"
     text = extract_text(doc.extension, data)

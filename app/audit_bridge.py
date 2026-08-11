@@ -94,6 +94,17 @@ def _governed_workspaces(db: Session) -> list[str]:
     return [row[0] for row in db.execute(select(Document.workspace_id).distinct()).all() if row[0]]
 
 
+def _attach_numeric_id(db: Session, event: FileAuditEvent) -> None:
+    """The event's bizId IS the file's numeric storage dentry id (verified by
+    cross-download); hand it to the mirrored document so reviews can fetch
+    the body through the numeric-only download API."""
+    if not event.matched_node_id or not (event.biz_id or "").isdigit():
+        return
+    doc = db.get(Document, event.matched_node_id)
+    if doc and not doc.storage_dentry_id:
+        doc.storage_dentry_id = event.biz_id
+
+
 def process_audit_events(db: Session, settings: Settings) -> dict:
     """One bridge cycle. Returns a summary for the worker log."""
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
@@ -151,6 +162,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if not event.matched_node_id and len(node_ids) == 1:
                 event.matched_node_id = node_ids.pop()
                 summary["matched"] += 1
+            _attach_numeric_id(db, event)
     else:
         unlocated = len(wiki_events)
     if unlocated:
@@ -176,6 +188,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if node_id:
                 event.matched_node_id = node_id
                 summary["matched"] += 1
+        _attach_numeric_id(db, event)
     db.commit()
     return summary
 

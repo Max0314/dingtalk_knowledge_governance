@@ -32,6 +32,7 @@ def env(monkeypatch):
     audit_bridge._last_walk.clear()
     with SessionLocal() as db:
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("tb-%")).delete(synchronize_session=False)
+        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("999%")).delete(synchronize_session=False)
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
         if not db.get(Workspace, WS):
             db.add(Workspace(workspace_id=WS, name="桥接测试库"))
@@ -134,10 +135,15 @@ def test_locator_routes_precisely(env, monkeypatch):
             return [{"name": "桥接测试文档.docx", "workspace_id": WS, "node_id": "bridge-A"}]
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", FakeSearchClient)
-    add_event("tb-9", "桥接测试文档.docx", "99009")
+    add_event("99900000001", "桥接测试文档.docx", "99009")  # digit bizId == numeric dentry id
     summary = run_bridge(locator_settings(settings))
     assert summary["unlocated"] == 0
     assert [walk["workspace_id"] for walk in summary["walks"]] == [WS]  # only the located workspace
+    with SessionLocal() as db:
+        doc = db.get(Document, "bridge-A")
+        assert doc.storage_dentry_id == "99900000001"  # numeric download key attached from the event
+        doc.storage_dentry_id = ""
+        db.commit()
 
 
 def test_locator_miss_falls_back_to_sweep(env, monkeypatch):

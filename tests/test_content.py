@@ -50,6 +50,20 @@ def test_plain_text_and_fallbacks():
     assert extract_text("docx", b"not a zip at all") == ""  # malformed archive degrades
 
 
+def test_fetch_degrades_without_numeric_id():
+    import asyncio
+
+    from app.content import fetch_document_content
+
+    init_db()
+    settings = get_settings().model_copy(update={"content_extract_enabled": True,
+                                                 "wiki_storage_space_id": "2932890480"})
+    doc = Document(node_id="content-nonum", workspace_id="content-ws", name="老文件.docx",
+                   extension="docx", file_class="document", storage_dentry_id="")
+    text, source = asyncio.run(fetch_document_content(settings, doc))
+    assert text == "" and source == "no_numeric_id"
+
+
 def test_run_review_uses_extracted_content(monkeypatch):
     import app.content as content_module
 
