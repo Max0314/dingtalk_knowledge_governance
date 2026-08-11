@@ -178,21 +178,21 @@ class DingtalkClient:
         return [normalize_node(item) for item in items if isinstance(item, dict)]
 
     async def download_file_bytes(self, space_id: str, dentry_uuid: str, max_bytes: int = 50_000_000) -> bytes:
-        """Two-step unified-storage download. The returned bytes live only in
-        the caller's memory for the duration of one review."""
+        """Two-step drive download (the uuid-native route; needs the
+        Drive.DownloadInfo.Read scope). The returned bytes live only in the
+        caller's memory for the duration of one review."""
         operator = self.settings.dingtalk_sync_operator_id
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"https://api.dingtalk.com/v1.0/storage/spaces/{space_id}/dentries/{dentry_uuid}/downloadInfos/query",
+            response = await client.get(
+                f"https://api.dingtalk.com/v1.0/drive/spaces/{space_id}/files/{dentry_uuid}/downloadInfos",
                 params={"unionId": operator},
                 headers={"x-acs-dingtalk-access-token": token},
-                json={"option": {"preferIntranet": False}},
             )
         if response.is_error:
             raise IntegrationError("dingtalk_download_info_failed", f"下载信息获取失败（HTTP {response.status_code}）。", response.status_code)
-        info = response.json().get("headerSignatureInfo") or {}
-        urls = info.get("resourceUrls") or []
+        info = response.json().get("downloadInfo") or {}
+        urls = [url for url in (info.get("resourceUrl"), info.get("internalResourceUrl")) if url]
         headers = info.get("headers") or {}
         if not urls:
             raise IntegrationError("dingtalk_download_url_missing", "下载信息响应缺少资源地址。")
