@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select, union_all
 from sqlalchemy.orm import Session
 from . import metrics, orgmap
 from .config import get_settings
@@ -246,6 +246,66 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
                        "name": r.name, "extension": r.extension, "url": r.url, "size": r.size,
                        "creator_user_id": r.creator_user_id,
                        "created_at": r.source_created_at, "updated_at": r.source_updated_at} for r in rows]}
+
+
+@app.get("/api/v1/files")
+def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
+                  offset: int = Query(default=0, ge=0),
+                  limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
+    """The single merged document list: primary-baseline snapshot rows plus the
+    live increment mirror, deduplicated by node_id (the live row wins — it has
+    fresher attribution and review state), soft-deleted nodes hidden. Newest
+    first, so page one is "最新入库"."""
+    snapshot = metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    base = select(
+        HistoricalFileNode.node_id, HistoricalFileNode.workspace_id, HistoricalFileNode.name,
+        HistoricalFileNode.extension, HistoricalFileNode.url,
+        HistoricalFileNode.source_created_at.label("created_at"),
+        HistoricalFileNode.creator_user_id.label("creator"),
+    ).where(HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type != "folder")
+    live = select(
+        Document.node_id, Document.workspace_id, Document.name,
+        Document.extension, Document.url,
+        Document.source_created_at.label("created_at"),
+        Document.uploader_key.label("creator"),
+    ).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
+    if workspace_id:
+        base = base.where(HistoricalFileNode.workspace_id == workspace_id)
+        live = live.where(Document.workspace_id == workspace_id)
+    if query:
+        base = base.where(HistoricalFileNode.name.contains(query))
+        live = live.where(Document.name.contains(query))
+    if folder:  # folder browsing is a snapshot feature; the live mirror stores no parent
+        stmt = base.where(HistoricalFileNode.parent_node_id == ("" if folder == "(根目录)" else folder))
+    else:
+        stmt = union_all(base.where(HistoricalFileNode.node_id.not_in(select(Document.node_id))), live)
+    sub = stmt.subquery()
+    total = db.scalar(select(func.count()).select_from(sub)) or 0
+    rows = db.execute(select(sub).order_by(sub.c.created_at.desc(), sub.c.node_id.desc())
+                      .offset(offset).limit(limit)).all()
+    ids = [r.node_id for r in rows]
+    docs = {d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {}
+    latest_review: dict[str, ReviewInstance] = {}
+    if ids:
+        for rv in db.scalars(select(ReviewInstance).where(ReviewInstance.node_id.in_(ids))
+                             .order_by(ReviewInstance.created_at.desc())):
+            latest_review.setdefault(rv.node_id, rv)
+    creators = {r.creator for r in rows if r.creator and r.node_id not in docs}
+    emp = {e.user_id: e for e in db.scalars(select(EmployeeMap).where(EmployeeMap.user_id.in_(creators)))} if creators else {}
+    items = []
+    for r in rows:
+        doc, rv, person = docs.get(r.node_id), latest_review.get(r.node_id), emp.get(r.creator)
+        items.append({
+            "node_id": r.node_id, "workspace_id": r.workspace_id, "name": r.name,
+            "extension": r.extension, "url": (doc.url if doc and doc.url else r.url),
+            "created_at": r.created_at, "source": "live" if doc else "baseline",
+            "uploader_name": (doc.uploader_name if doc and doc.uploader_name else (person.name if person else "")),
+            "department_name": (doc.department_name if doc and doc.department_name else (person.department_name if person else "")),
+            "ai_score": round(rv.ai_score, 1) if rv else None,
+            "verdict": rv.verdict if rv else "",
+            "has_detail": doc is not None,
+        })
+    return {"total": total, "offset": offset, "limit": limit, "snapshot_id": snapshot, "items": items}
 
 
 class NotifyTestRequest(BaseModel):

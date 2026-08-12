@@ -9,4 +9,5 @@ os.environ.setdefault("KG_DATABASE_URL", "sqlite:///./runtime/local_ui.db")
 import uvicorn
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="127.0.0.1", port=39021)
+    port = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 39021
+    uvicorn.run("app.main:app", host="127.0.0.1", port=port)

@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "kg-preview",
-      "runtimeExecutable": "C:\\Users\\陈鹏列\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\python.exe",
-      "runtimeArgs": ["scripts/dev_server.py"],
-      "port": 39021
+      "name": "kg-dev",
+      "runtimeExecutable": "C:\\Users\\陈鹏列\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
+      "runtimeArgs": ["scripts/dev_server.py", "--port", "39027"],
+      "port": 39027
     }
   ]
 }
