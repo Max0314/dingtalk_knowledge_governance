@@ -1,0 +1,1450 @@
+{
+ "meta": {
+  "source": "yida knowledge_base_info (FORM-62FC...TY5W) via bi_center read-only",
+  "captured_at": "2026-08-03",
+  "records": 144,
+  "with_department": 136
+ },
+ "items": [
+  {
+   "workspace_id": "dy0mV4dAkxvlwz89",
+   "space_uuid": "bJvOOSJNmROZqkvK",
+   "name": "I-石佩杰(20193171)",
+   "code": "I-20193171",
+   "level": "I",
+   "department": "产品工程部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVB5JoWk6km89",
+   "space_uuid": "QXvd5SD52XZyny0Z",
+   "name": "P-06-低轨卫星专题",
+   "code": "P-06",
+   "level": "P",
+   "department": "中国区经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBWqq9qM6m89",
+   "space_uuid": "ZpvYeSO7WW9WGNvm",
+   "name": "P-06-东欧无人车",
+   "code": "P-06",
+   "level": "P",
+   "department": "海外经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBa8aLPvjm89",
+   "space_uuid": "gjvAqSMNQNLqVpvX",
+   "name": "P-05-AI超级产品经理",
+   "code": "P-05",
+   "level": "P",
+   "department": "产品线经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBNbbnelWm89",
+   "space_uuid": "lovW2Srjqq2V6Eab",
+   "name": "P-04-设备资产管理系统",
+   "code": "P-04",
+   "level": "P",
+   "department": "生产厂",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVB0Kw7D4dm89",
+   "space_uuid": "lovW2SrLR7e3Yyab",
+   "name": "P-05-北京+杭州办知识库",
+   "code": "P-05",
+   "level": "P",
+   "department": "中国区经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBxlq2QJwm89",
+   "space_uuid": "7z8XMSROze97JMaq",
+   "name": "P-05-产品经理知识库",
+   "code": "P-05",
+   "level": "P",
+   "department": "中国区经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBedVAjAjm89",
+   "space_uuid": "Kw8lASLQoD1A1AaE",
+   "name": "P-06-印度A客户IPTV STB项目招投标",
+   "code": "P-06",
+   "level": "P",
+   "department": "海外经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVD29xj41Wz89",
+   "space_uuid": "bJvOOSBeMOrJyYvK",
+   "name": "全员公告",
+   "code": "",
+   "level": "O",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-07-31T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVjLrwoNAYm89",
+   "space_uuid": "KEvB1SqPWEkr6Ma5",
+   "name": "Department Meeting",
+   "code": "",
+   "level": "O",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-07-30T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlP83wDOYz89",
+   "space_uuid": "DPayjSodx3geKJv5",
+   "name": "C-06-产品需求规范",
+   "code": "C-06",
+   "level": "C",
+   "department": "产品线经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVjq0pgL0Rm89",
+   "space_uuid": "QXvd5SR1YqjWYE0Z",
+   "name": "I-雍岚(20015026)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "数字化转型部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlr7LBZgMz89",
+   "space_uuid": "KEvB1SDWKPA57pa5",
+   "name": "P-06-媒体_ATV产品",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlre7bBeWz89",
+   "space_uuid": "5zaVASPqAB6JAl8y",
+   "name": "P-06-媒体_IPTV产品",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1AoREM6z89",
+   "space_uuid": "NrvQeSD9Ggj16Ov1",
+   "name": "C-05-出口业务政策与风险管理",
+   "code": "C-05",
+   "level": "C",
+   "department": "海外经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlPqPWYj8z89",
+   "space_uuid": "qMan2SOdkdy1Mza1",
+   "name": "D-媒体终端软件研发部",
+   "code": "D-10",
+   "level": "D",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVldB36VY8z89",
+   "space_uuid": "qMan2SOj7V5G1za1",
+   "name": "P-04-数据治理",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlDeog5BMz89",
+   "space_uuid": "9Bv51S1MbL74Onv3",
+   "name": "C-03-工会",
+   "code": "C-03",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "03 党群团：Party, Trade Unions, and Youth League",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV0V8g4aKwz89",
+   "space_uuid": "4Eve9Spbg43YKmvb",
+   "name": "P-15-基础设施_服务器",
+   "code": "P-15",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV0YZ843j8z89",
+   "space_uuid": "p48ggSzp1BOqVB87",
+   "name": "I-李诚(11006885)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "行政人事部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV0lxLr71Wz89",
+   "space_uuid": "QXvd5SYkxWV7pZ0Z",
+   "name": "P-06-东欧CO2温湿度传感器HCD-006",
+   "code": "P-06",
+   "level": "P",
+   "department": "物联网事业部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV0xv31kR6z89",
+   "space_uuid": "No0K4SJorNmDp68P",
+   "name": "P-07-信息系统_ISRM",
+   "code": "P-07",
+   "level": "P",
+   "department": "物资采购部",
+   "biz_domain": "07 供应链：Supply Chain",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlP7DLyeWz89",
+   "space_uuid": "xwaNdSk9lzQ1bE0O",
+   "name": "C-06-产品合作方资料",
+   "code": "C-06",
+   "level": "C",
+   "department": "产品线经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl12DBO4dz89",
+   "space_uuid": "gjvAqS3o5zM6lxvX",
+   "name": "C-15-行政管理",
+   "code": "C-15",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl12YA0k6z89",
+   "space_uuid": "Ao01nSYzoVL1JX8J",
+   "name": "C-15-工程建设",
+   "code": "C-15",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxpab3ngMz89",
+   "space_uuid": "kyaR3SdnzmqB7kvP",
+   "name": "P-11-信息系统_QMS",
+   "code": "P-11",
+   "level": "P",
+   "department": "质量部",
+   "biz_domain": "11 质量管理：Quality Management",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlvQBOQQaz89",
+   "space_uuid": "eLvJDSM3PrEPPL87",
+   "name": "C-05-展会管理",
+   "code": "C-05",
+   "level": "C",
+   "department": "产品线经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxxxvp4bRz89",
+   "space_uuid": "4Eve9SJJJBk39lvb",
+   "name": "P-04-数据资产入表项目",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl1aP49xjz89",
+   "space_uuid": "Kw8lASdKlpwb9AaE",
+   "name": "C-15-宣传与公共关系管理",
+   "code": "C-15",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxje1exM6z89",
+   "space_uuid": "xyak9SQm1R1QgG0G",
+   "name": "C-01-成都长虹网络公司管理文件",
+   "code": "C-01",
+   "level": "C",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "01 法人治理：Corporate governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl1aA88vjz89",
+   "space_uuid": "5zaVASPn9x77gz8y",
+   "name": "C-09-产品维修知识库",
+   "code": "C-undefined",
+   "level": "C",
+   "department": "生产厂",
+   "biz_domain": "09 售后服务：After-Sales Service",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV6QNbwv9dm89",
+   "space_uuid": "Kw8lASVRNz7JboaE",
+   "name": "I-刘锐锋",
+   "code": "",
+   "level": "I",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlMEOAdyWz89",
+   "space_uuid": "qMan2SOWoP4jpya1",
+   "name": "C-01-社会责任(ESG)",
+   "code": "C-01",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "01 法人治理：Corporate governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxNgYgn7jz89",
+   "space_uuid": "OQ0xySZd151J4g8B",
+   "name": "P-06-信息系统_PLM",
+   "code": "P-06",
+   "level": "P",
+   "department": "硬件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVjonDvj5Wm89",
+   "space_uuid": "xPar2Sn2O9JnVkaV",
+   "name": "人工智能",
+   "code": "",
+   "level": "O",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-07-30T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlN1jp9owz89",
+   "space_uuid": "1g0wySA3GDRYLBap",
+   "name": "CD_P-06-通信_光猫",
+   "code": "P-06",
+   "level": "O",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVxqV94dY8z89",
+   "space_uuid": "OQ0xySZrbMQG5x8B",
+   "name": "P-06-信息系统_LIMS",
+   "code": "P-06",
+   "level": "P",
+   "department": "检测技术部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV6pRkNVZRm89",
+   "space_uuid": "QXvd5SnqEyNbPE0Z",
+   "name": "P-04-VibeCoding开发大赛信息",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlD3Kod5Wz89",
+   "space_uuid": "qMan2SObVrqjnya1",
+   "name": "C-08-工装设备知识库",
+   "code": "C-08",
+   "level": "C",
+   "department": "产品工程部",
+   "biz_domain": "08 生产制造：Manufacturing",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV6ydx5Mpam89",
+   "space_uuid": "Kw8lASVMo94XglaE",
+   "name": "I-陈鹏列(undefined)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "AI应用研发部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV6k4600ZMm89",
+   "space_uuid": "NK8M2SB6zBOOlQad",
+   "name": "CD-P-04-禅道同步数据",
+   "code": "P-04",
+   "level": "O",
+   "department": "AI应用研发部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5OawAKa8X89",
+   "space_uuid": "rbv2eSpwl5eVlAaK",
+   "name": "P-12-信息系统_S6",
+   "code": "P-12",
+   "level": "P",
+   "department": "财务部",
+   "biz_domain": "12 财务：Finance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5Np5Zo68X89",
+   "space_uuid": "DPayjSX7AXw2bxv5",
+   "name": "I-蒋晓东CESHI",
+   "code": "",
+   "level": "I",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5k7NQ8paX89",
+   "space_uuid": "MY87ESzGQ26pVYvP",
+   "name": "I-JXD测试100",
+   "code": "",
+   "level": "I",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlQ2ob9Ndz89",
+   "space_uuid": "Jpaq7SB9jLEpK10x",
+   "name": "C-02-员工持股平台(合伙企业)",
+   "code": "C-02",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "02 战略与投资：Strategic & Investment",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVx86nLoqMz89",
+   "space_uuid": "QXvd5Sx4n9WX1A0Z",
+   "name": "C-04-知识库文档规则与自动化模板库",
+   "code": "C-04",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5rwQndk6X89",
+   "space_uuid": "p48ggSGkMQXE6Y87",
+   "name": "P-04-OpenYida",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV6yy4ky4dm89",
+   "space_uuid": "xPar2SL773w73ZaV",
+   "name": "D-ChanghongIndia",
+   "code": "D-20",
+   "level": "D",
+   "department": "Changhong India",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5jkx33NYX89",
+   "space_uuid": "kyaR3SZgldqqOpvP",
+   "name": "P-04-ERP系统迭代",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlM1PP2a8z89",
+   "space_uuid": "xyak9SDgRyyAMP0G",
+   "name": "C-15-安全管理",
+   "code": "C-15",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl9JvPlDMz89",
+   "space_uuid": "gjvAqS3PjVq3zZvX",
+   "name": "P-06-IOT_网关",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5n8RopnwX89",
+   "space_uuid": "lovW2Sd2DPpB27ab",
+   "name": "P-15-财政资金项目知识库",
+   "code": "P-15",
+   "level": "P",
+   "department": "行政人事部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxNB7Vrkkz89",
+   "space_uuid": "zk0EASojzVyDpp0Q",
+   "name": "P-04-员工数字素养",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5AVrZR4dX89",
+   "space_uuid": "kyaR3SZeGNP6LEvP",
+   "name": "C-04-管理思维知识集",
+   "code": "C-04",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlvO655ZRz89",
+   "space_uuid": "oG8LRSRgDP66MOv5",
+   "name": "C-07-供应链管理",
+   "code": "C-07",
+   "level": "C",
+   "department": "物资采购部",
+   "biz_domain": "07 供应链：Supply Chain",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlMMZy8qaz89",
+   "space_uuid": "oG8LRSRGGM7QbEv5",
+   "name": "C-04-公司基础档案",
+   "code": "C-04",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV09Wr91LMz89",
+   "space_uuid": "Jpaq7Swp46pd2b0x",
+   "name": "I-袁小珺(20233849)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "数字化转型部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlMEDjg5wz89",
+   "space_uuid": "kyaR3SAkQ9g7Z4vP",
+   "name": "C-05-中国区投标项目协同",
+   "code": "C-05",
+   "level": "C",
+   "department": "中国区经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBMBwjLPYm89",
+   "space_uuid": "xwaNdS6B65YQ940O",
+   "name": "P-06-通讯_网关（海外）",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBdKBynVjm89",
+   "space_uuid": "Ao01nSrw3rkyZ78J",
+   "name": "P-06-通讯-网关",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBd3xx80Mm89",
+   "space_uuid": "NrvQeS3yzMMr76v1",
+   "name": "P-06-测试-工具开发",
+   "code": "P-06",
+   "level": "P",
+   "department": "检测技术部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBM5reLR6m89",
+   "space_uuid": "eLvJDSr1RmbA9487",
+   "name": "P-06-测试-测试",
+   "code": "P-06",
+   "level": "P",
+   "department": "检测技术部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVByoBkJY8m89",
+   "space_uuid": "618oRSe7MeQlG40L",
+   "name": "P-06-通讯_融合网关",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVByoBkxMkm89",
+   "space_uuid": "lZ8zlSGZmG1we1vD",
+   "name": "P-06-测试-产测开发",
+   "code": "P-06",
+   "level": "P",
+   "department": "检测技术部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBdqDL9pRm89",
+   "space_uuid": "oG8LRSV5b2AwkOv5",
+   "name": "P-06-通讯_路由器（海外）",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBR93K7a6m89",
+   "space_uuid": "OQ0xyS3YMDV4wz8B",
+   "name": "P-06-测试-现场测试",
+   "code": "P-06",
+   "level": "P",
+   "department": "检测技术部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVByVZ1RAdm89",
+   "space_uuid": "NrvQeS352J9jGyv1",
+   "name": "P-06-通讯_融合网关（海外）",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBwMlgoLam89",
+   "space_uuid": "NK8M2S45QXWg1Pad",
+   "name": "P-06-物联网_追踪定位产品",
+   "code": "P-06",
+   "level": "P",
+   "department": "物联网事业部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBwL2xjJwm89",
+   "space_uuid": "4Eve9SEmLRJ5Zmvb",
+   "name": "P-06-测试-自动化测试",
+   "code": "P-06",
+   "level": "P",
+   "department": "检测技术部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVByOZ9KNYm89",
+   "space_uuid": "xyak9S7kqo3BNY0G",
+   "name": "P-06-硬件-通用",
+   "code": "P-06",
+   "level": "P",
+   "department": "硬件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBwopxDEam89",
+   "space_uuid": "7z8XMSRMrAOqoLaq",
+   "name": "P-06-物联网_智慧家居",
+   "code": "P-06",
+   "level": "P",
+   "department": "物联网事业部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBdZpD73Ym89",
+   "space_uuid": "Kw8lASLorgmB5xaE",
+   "name": "P-06-通讯-FTTR",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBd733lOYm89",
+   "space_uuid": "DPayjSMLW33oKJv5",
+   "name": "P-06-物联网_IoT产品",
+   "code": "P-06",
+   "level": "P",
+   "department": "物联网事业部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBMvRxyd6m89",
+   "space_uuid": "1g0wySgwm1JEKoap",
+   "name": "P-06-通讯_FTTR（海外）",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVByEN6ZpMm89",
+   "space_uuid": "NK8M2S43RnBldQad",
+   "name": "P-06-媒体-云电脑",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBwMaQ2Ojm89",
+   "space_uuid": "xwaNdS65BLo3gY0O",
+   "name": "P-06-智能音箱",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlD3vbarwz89",
+   "space_uuid": "bJvOOSqBDZzpQkvK",
+   "name": "C-15-外部资源申报",
+   "code": "C-15",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlD85bq86z89",
+   "space_uuid": "Jpaq7SBlWGEJWN0x",
+   "name": "C-07-招标资料",
+   "code": "C-07",
+   "level": "C",
+   "department": "物资采购部",
+   "biz_domain": "07 供应链：Supply Chain",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl1079d2Wz89",
+   "space_uuid": "kyaR3SAWxJXEM2vP",
+   "name": "C-02-运营管理",
+   "code": "C-02",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "02 战略与投资：Strategic & Investment",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlMOnoJY8z89",
+   "space_uuid": "nV06pSn6o3P2LraB",
+   "name": "D-生产厂",
+   "code": "D-17",
+   "level": "D",
+   "department": "生产厂",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVldyN6rk6z89",
+   "space_uuid": "QXvd5SkzGNnVyn0Z",
+   "name": "P-06-通信_路由器",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mV0N2J3N9dz89",
+   "space_uuid": "No0K4SJwMYNw4E8P",
+   "name": "P-08-信息系统_APS",
+   "code": "P-08",
+   "level": "P",
+   "department": "制造交付中心",
+   "biz_domain": "08 生产制造：Manufacturing",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVl1D74xDRz89",
+   "space_uuid": "p48ggSLnrdOorD87",
+   "name": "C-04-体系管理",
+   "code": "C-04",
+   "level": "C",
+   "department": "质量部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV06peDEM8z89",
+   "space_uuid": "OQ0xySBz6WqLnx8B",
+   "name": "P-06-信息系统_禅道",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVx3kk7QR8z89",
+   "space_uuid": "OQ0xySZDXX4pYx8B",
+   "name": "I-何文勇(20261481)",
+   "code": "I-何文勇",
+   "level": "I",
+   "department": "质量部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV64Q5RdqRm89",
+   "space_uuid": "NK8M2SBzej2K72ad",
+   "name": "I-数字员工4",
+   "code": "",
+   "level": "I",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlDYbJM9Yz89",
+   "space_uuid": "5zaVASPYw63d5w8y",
+   "name": "C-14-合规风控管理",
+   "code": "C-14",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "14 合规与风控：Compliance & Risk Management",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlL68Lr7dz89",
+   "space_uuid": "ZpvYeSwLN6LJe3vm",
+   "name": "C-04-数字化转型知识",
+   "code": "C-04",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV0QD69gk6z89",
+   "space_uuid": "ZpvYeSpqAN9VdNvm",
+   "name": "I-陈云(11020272)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "数字化转型部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxy0dAlxYz89",
+   "space_uuid": "X1v4RS5PnE3r5j8P",
+   "name": "P-06-德国DG路由器",
+   "code": "P-06",
+   "level": "P",
+   "department": "产品线经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlrpq8P1wz89",
+   "space_uuid": "7z8XMSzGAeNDbMaq",
+   "name": "P-06-媒体_DVB产品",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl9N0YYDaz89",
+   "space_uuid": "lXvGySJ1KrAAWV8n",
+   "name": "P-06-媒体_泛智能产品",
+   "code": "P-06",
+   "level": "P",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVRWWxvoVjm89",
+   "space_uuid": "618oRSyjj6JMOq0L",
+   "name": "P-06-ATV知识库",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV08ewEagaz89",
+   "space_uuid": "NK8M2SOrb5RPWPad",
+   "name": "P-04-AI生产力平台专项",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV5rRKnP88X89",
+   "space_uuid": "zk0EAS5DmOJkgg0Q",
+   "name": "C-08-智能制造",
+   "code": "C-08",
+   "level": "C",
+   "department": "产品工程部",
+   "biz_domain": "08 生产制造：Manufacturing",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVR4Rkk7lWm89",
+   "space_uuid": "lXvGyS3z3eeYJn8n",
+   "name": "P-06-IPC研发知识库",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV0YZNv14Yz89",
+   "space_uuid": "p48ggSzp14JnOp87",
+   "name": "I-蒋晓东(11007359)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "数字化转型部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV6o8JNV68m89",
+   "space_uuid": "xb8bkSOPEGobOEaL",
+   "name": "I-李红建(11009488)",
+   "code": "I-李红建",
+   "level": "I",
+   "department": "数字化转型部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBdWVQKW6m89",
+   "space_uuid": "9r09jSV2MQOPM58A",
+   "name": "P-02-印度子公司股权转让",
+   "code": "P-02",
+   "level": "P",
+   "department": "Changhong India",
+   "biz_domain": "02 战略与投资：Strategic & Investment",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBkADon9dm89",
+   "space_uuid": "Kw8lASLY1m2EboaE",
+   "name": "P-06-法国Canal+机顶盒项目",
+   "code": "P-06",
+   "level": "P",
+   "department": "海外经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlvMbbp0Mz89",
+   "space_uuid": "DPayjSozZppA1Zv5",
+   "name": "D-行政人事部",
+   "code": "D-02",
+   "level": "D",
+   "department": "行政人事部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlDnrMxAjz89",
+   "space_uuid": "618oRSrdgn96Nq0L",
+   "name": "C-01-公司治理",
+   "code": "C-01",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "01 法人治理：Corporate governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mV08VEJVPdz89",
+   "space_uuid": "xyak9SpPnrjnyz0G",
+   "name": "P-10-信息系统_WMS",
+   "code": "P-10",
+   "level": "P",
+   "department": "制造交付中心",
+   "biz_domain": "10 仓储物流：Warehousing & Logistics",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlOd3Ebjkz89",
+   "space_uuid": "yq8ZkSYel1Jx9RaX",
+   "name": "D-通讯服务经营中心",
+   "code": "D-16",
+   "level": "D",
+   "department": "通讯服务经营中心",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1ld08xYz89",
+   "space_uuid": "KEvB1SD1DnzV3Ma5",
+   "name": "C-11-质量管理",
+   "code": "C-11",
+   "level": "C",
+   "department": "质量部",
+   "biz_domain": "11 质量管理：Quality Management",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVB6lYAZJWm89",
+   "space_uuid": "xPar2SpLex4RjkaV",
+   "name": "P-05-中国区产品线例会知识库",
+   "code": "P-05",
+   "level": "P",
+   "department": "中国区经营中心",
+   "biz_domain": "05 市场营销：Marketing & Sales",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVx3rKMja6z89",
+   "space_uuid": "lZ8zlSwpgreM6yvD",
+   "name": "P-04-企业指标体系策划",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mV00q5AZk8z89",
+   "space_uuid": "No0K4SJJBqydDl8P",
+   "name": "I-岳姗(20461998)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "数字化转型部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlK2DJkd6z89",
+   "space_uuid": "lXvGySJdNWpeDQ8n",
+   "name": "P-04-信息系统_CRM",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlQqAAewkz89",
+   "space_uuid": "7z8XMSz7e22yMdaq",
+   "name": "D-产品线经营中心",
+   "code": "D-01",
+   "level": "D",
+   "department": "产品线经营中心",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxLYyaBqMz89",
+   "space_uuid": "lZ8zlSwn3Z6GlevD",
+   "name": "I-宋志明(11020907)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "质量部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVxvBMkYOYz89",
+   "space_uuid": "MY87ES4N5oGBlBvP",
+   "name": "I-邓洪燕(20363342)",
+   "code": "I-undefined",
+   "level": "I",
+   "department": "物联网事业部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlvOO4PZMz89",
+   "space_uuid": "NK8M2SXyEEzGlQad",
+   "name": "C-13-人力资源",
+   "code": "C-13",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "13 人力资源：Human Resources",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlOM6rNERz89",
+   "space_uuid": "By8jQSE2M9z6170M",
+   "name": "D-财务部",
+   "code": "D-06",
+   "level": "D",
+   "department": "财务部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlP7D0jywz89",
+   "space_uuid": "NK8M2SXGMoON35ad",
+   "name": "D-硬件研发部",
+   "code": "D-08",
+   "level": "D",
+   "department": "硬件研发部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlOoebObRz89",
+   "space_uuid": "7z8XMSz5ryw5w1aq",
+   "name": "D-物资采购部",
+   "code": "D-07",
+   "level": "D",
+   "department": "物资采购部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mV0kvPA9Eaz89",
+   "space_uuid": "Ao01nS1JNALq2R8J",
+   "name": "P-08-信息系统_PPCO",
+   "code": "P-08",
+   "level": "P",
+   "department": "制造交付中心",
+   "biz_domain": "08 生产制造：Manufacturing",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlvPPVn1wz89",
+   "space_uuid": "lZ8zlSzREEDQ54vD",
+   "name": "C-06-产品规划",
+   "code": "C-06",
+   "level": "C",
+   "department": "产品线经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1D7apBRz89",
+   "space_uuid": "rbv2eS369mlQqLaK",
+   "name": "C-03-党建",
+   "code": "C-03",
+   "level": "C",
+   "department": "行政人事部",
+   "biz_domain": "03 党群团：Party, Trade Unions, and Youth League",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVBpJ89nxdm89",
+   "space_uuid": "5zaVASJG375DyL8y",
+   "name": "P-04-智能工厂申报",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVjy9gpZoWm89",
+   "space_uuid": "NrvQeSw5XBZJgNv1",
+   "name": "P-06_媒体_项目管理",
+   "code": "",
+   "level": "P",
+   "department": "",
+   "biz_domain": "",
+   "modified": "2026-07-30T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mV08lJZVwkz89",
+   "space_uuid": "MJ0pDS6NGmjbW70E",
+   "name": "P-08-信息系统_MES",
+   "code": "P-08",
+   "level": "P",
+   "department": "生产厂",
+   "biz_domain": "08 生产制造：Manufacturing",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1jJb99jz89",
+   "space_uuid": "xwaNdSkxYPj22Y0O",
+   "name": "C-12-财务管理",
+   "code": "C-12",
+   "level": "C",
+   "department": "财务部",
+   "biz_domain": "12 财务：Finance",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVRWjrpe7dm89",
+   "space_uuid": "7z8XMS1gnGAyVYaq",
+   "name": "P-06-IPTV研发知识库",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-07-30T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVxJWv4vR6z89",
+   "space_uuid": "By8jQSyPAeZe790M",
+   "name": "C-04-播客芝士站",
+   "code": "C-04",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1NgEnBRz89",
+   "space_uuid": "7z8XMSzbPZoQR1aq",
+   "name": "C-06-研发基础管理",
+   "code": "C-06",
+   "level": "C",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVj3PQk1R8m89",
+   "space_uuid": "lZ8zlSMpEJ15OqvD",
+   "name": "D-数字化转型部",
+   "code": "D-05",
+   "level": "D",
+   "department": "数字化转型部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlDKWBwpaz89",
+   "space_uuid": "bJvOOSqBWYok9pvK",
+   "name": "D-中国区经营中心",
+   "code": "D-15",
+   "level": "D",
+   "department": "中国区经营中心",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlDnoBdwkz89",
+   "space_uuid": "lovW2S632pry7Kab",
+   "name": "C-11-认证管理",
+   "code": "C-11",
+   "level": "C",
+   "department": "质量部",
+   "biz_domain": "11 质量管理：Quality Management",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVBwpDV14Ym89",
+   "space_uuid": "xyak9S724dnRVY0G",
+   "name": "I-杨玉梅",
+   "code": "I-杨玉梅",
+   "level": "I",
+   "department": "AI应用研发部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVDpJeaaeWz89",
+   "space_uuid": "lZ8zlS27PB66B9vD",
+   "name": "P-06-STB",
+   "code": "P-06",
+   "level": "P",
+   "department": "媒体终端软件研发部",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlvM8WqbRz89",
+   "space_uuid": "eLvJDSM31kKlg987",
+   "name": "D-检测技术部",
+   "code": "D-12",
+   "level": "D",
+   "department": "检测技术部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1JlMj66z89",
+   "space_uuid": "xb8bkSDYGDnjOOaL",
+   "name": "D-通讯终端软件研发部",
+   "code": "D-11",
+   "level": "D",
+   "department": "通讯终端软件研发部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlObdADxdz89",
+   "space_uuid": "Gma31SjYeBRWwB0n",
+   "name": "D-海外经营中心",
+   "code": "D-14",
+   "level": "D",
+   "department": "海外经营中心",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mV6d50kARkm89",
+   "space_uuid": "rbv2eS1JpZjeLjaK",
+   "name": "D-AI应用研发部",
+   "code": "D-19",
+   "level": "D",
+   "department": "AI应用研发部",
+   "biz_domain": "15 能力建设与综合保障：Capacity Building",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlvoqNAQRz89",
+   "space_uuid": "MY87ESANJZ2L63vP",
+   "name": "C-06-知识产权",
+   "code": "C-06",
+   "level": "C",
+   "department": "产品线经营中心",
+   "biz_domain": "06 产品研发：Product Development",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlQpA49AYz89",
+   "space_uuid": "yq8ZkSYOmnzbnwaX",
+   "name": "C-04-数字基础设施指南",
+   "code": "C-04",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlQ3nM8Vjz89",
+   "space_uuid": "5zaVASPpoDd7Zz8y",
+   "name": "D-制造交付中心",
+   "code": "D-04",
+   "level": "D",
+   "department": "制造交付中心",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mV5828WNBRX89",
+   "space_uuid": "p48ggSGBmBP4wD87",
+   "name": "C-04-旧版管理文件存档",
+   "code": "C-04",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:59Z"
+  },
+  {
+   "workspace_id": "dy0mVlOEdQ7j6z89",
+   "space_uuid": "No0K4S39ZEAeG68P",
+   "name": "C-01-规章制度",
+   "code": "C-01",
+   "level": "C",
+   "department": "数字化转型部",
+   "biz_domain": "01 法人治理：Corporate governance",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVl1j47BJWz89",
+   "space_uuid": "9r09jS1oXAWV9M8A",
+   "name": "D-产品工程部",
+   "code": "D-09",
+   "level": "D",
+   "department": "产品工程部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlRxd3Rbaz89",
+   "space_uuid": "No0K4S3poENpxK8P",
+   "name": "P-04-数字流程体系建设",
+   "code": "P-04",
+   "level": "P",
+   "department": "数字化转型部",
+   "biz_domain": "04 管理体系与数字化治理： Management System & Digital Governance",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlO1Mb4Ndz89",
+   "space_uuid": "4Eve9Se2Xn93yxvb",
+   "name": "D-质量部",
+   "code": "D-03",
+   "level": "D",
+   "department": "质量部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  },
+  {
+   "workspace_id": "dy0mVlMEdkdAjz89",
+   "space_uuid": "1g0wySAwxKPK4Dap",
+   "name": "D-物联网事业部",
+   "code": "D-13",
+   "level": "D",
+   "department": "物联网事业部",
+   "biz_domain": "",
+   "modified": "2026-08-03T03:58Z"
+  }
+ ]
+}

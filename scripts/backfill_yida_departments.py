@@ -1,10 +1,10 @@
 """Backfill workspaces.owner_department_name from the Yida knowledge-base
 registry (知识库基本信息表, read via bi_center).
 
-Default input is the slim mapping shipped in scripts/data/ (2026-08-03 capture,
-144 libs, 136 with department). A fresh raw dump from the Yida probe can be
-passed with --input; both the slim format ({"items": [...]}) and the raw
-capture format ({"knowledge_base_info": {"data": [...]}}) are accepted.
+Default input is the slim mapping shipped alongside this script (2026-08-03
+capture, 144 libs, 136 with department). A fresh raw dump from the Yida probe
+can be passed with --input; both the slim format ({"items": [...]}) and the
+raw capture format ({"knowledge_base_info": {"data": [...]}}) are accepted.
 
 Dry-run by default — prints what would change. Apply with --apply.
 Manually-set departments are kept unless --force is given.
@@ -26,7 +26,7 @@ from sqlalchemy import select
 
 from app.db import SessionLocal, Workspace, init_db
 
-DEFAULT_INPUT = Path(__file__).resolve().parent / "data" / "yida_workspace_departments.json"
+DEFAULT_INPUT = Path(__file__).resolve().parent / "yida_workspace_departments.json"
 PLACEHOLDERS = {"", "-", "—", "未映射", "未知"}  # 视同空值，可被宜搭数据覆盖
 
 
