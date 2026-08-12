@@ -44,6 +44,7 @@ def parse_raw(payload: dict) -> list[dict]:
             dept = (text.get("zh_CN") or text.get("en_US") or "") if isinstance(text, dict) else (text or "")
         biz = fields.get("selectField_mdgsbqwc", {}).get("value") or ""
         rows.append({"workspace_id": match.group(1) if match else "",
+                     "space_uuid": fields.get("textField_mr8nshhu", {}).get("value") or "",
                      "name": fields.get("textField_mr8nshi3", {}).get("value") or "",
                      "department": dept,
                      "biz_domain": biz if isinstance(biz, str) else ""})
@@ -61,13 +62,42 @@ def main() -> None:
 
     init_db()
     updated, kept, missing_dept, unmatched = [], [], [], []
+    match_by = {"workspace_id": 0, "space_uuid": 0, "url_slug": 0, "name": 0}
     with SessionLocal() as db:
-        registry = {ws.workspace_id: ws for ws in db.scalars(select(Workspace)).all()}
+        rows = db.scalars(select(Workspace)).all()
+        registry = {ws.workspace_id: ws for ws in rows}
+        # 注册表主键的命名空间随采集通道而异（官方 API id / alidocs URL slug），
+        # 因此按 主键 → spaceUuid → 注册表 url 里的 slug → 唯一名称 依次匹配。
+        by_url_slug = {}
+        for ws in rows:
+            slug = re.search(r"/spaces/([A-Za-z0-9]+)", ws.url or "")
+            if slug:
+                by_url_slug[slug.group(1)] = ws
+        name_counts: dict[str, int] = {}
+        for ws in rows:
+            name_counts[ws.name] = name_counts.get(ws.name, 0) + 1
+        by_name = {ws.name: ws for ws in rows if name_counts[ws.name] == 1}
+
+        def resolve(item: dict):
+            slug = item.get("workspace_id") or ""
+            uuid_ = item.get("space_uuid") or ""
+            if slug and slug in registry:
+                return registry[slug], "workspace_id"
+            if uuid_ and uuid_ in registry:
+                return registry[uuid_], "space_uuid"
+            if slug and slug in by_url_slug:
+                return by_url_slug[slug], "url_slug"
+            name = (item.get("name") or "").strip()
+            if name and name in by_name:
+                return by_name[name], "name"
+            return None, ""
+
         for item in items:
-            ws = registry.get(item.get("workspace_id") or "")
+            ws, how = resolve(item)
             if ws is None:
                 unmatched.append(f'{item.get("name")}({item.get("workspace_id")})')
                 continue
+            match_by[how] += 1
             dept = (item.get("department") or "").strip()
             if not dept:
                 missing_dept.append(ws.name)
@@ -89,7 +119,13 @@ def main() -> None:
         "kept_manual_value": len(kept),
         "yida_missing_department": len(missing_dept),
         "not_in_registry": len(unmatched),
+        "match_by": match_by,
     }, ensure_ascii=False, indent=1))
+    if unmatched and len(unmatched) >= len(items) // 2:
+        # 全线不匹配 ⇒ 十有八九是 id 命名空间对不上，给出注册表样本便于诊断
+        with SessionLocal() as db:
+            for ws in db.scalars(select(Workspace).limit(3)).all():
+                print(f"[registry 样本] id={ws.workspace_id} name={ws.name} url={ws.url[:70]}")
     for label, bucket in (("更新", updated), ("保留人工值", kept), ("宜搭缺部门", missing_dept), ("registry 无此库", unmatched)):
         for line in bucket[:200]:
             print(f"[{label}] {line}")
