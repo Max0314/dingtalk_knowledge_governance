@@ -47,7 +47,7 @@ async function overview(){const d=await api('/api/v1/dashboard/overview');
   shell('知识库总览','公司知识库全景：规模、增量与文档质量。月份按钉钉 createTime（Asia/Shanghai）归属。',`
   ${org.note?`<div class="banner">${org.note}</div>`:''}
   <div class="grid metrics">
-    ${statCard('知识库数量',d.metrics.workspace_count,'服务身份已加入并登记')}
+    <div id="go-ws-card" style="cursor:pointer" title="点击进入知识库管理">${statCard('知识库数量',d.metrics.workspace_count,'服务身份已加入并登记 · 点击查看清单')}</div>
     ${statCard('文件总量（去重）',nf(d.metrics.total_files),'主基线 + 实时增量')}
     ${statCard('本月文件增量',nf(d.metrics.month_increment),'按 createTime 归属当月')}
     ${statCard('本月文档平均分',d.metrics.month_average_score??'—',d.metrics.month_average_score==null?'本月暂无评审':`历史均值 ${d.metrics.average_ai_score??'—'}`)}
@@ -64,6 +64,7 @@ async function overview(){const d=await api('/api/v1/dashboard/overview');
   </div>`);
   renderChart('trendChart',stackedOption(d.monthly));
   bindDocRows();
+  document.querySelector('#go-ws-card').onclick=()=>navigate('workspaces');
   document.querySelector('#go-docs').onclick=()=>navigate('documents');
   document.querySelector('#go-increments').onclick=()=>navigate('increments');
   document.querySelector('#go-diagnostics').onclick=()=>navigate('diagnostics')}
@@ -242,7 +243,6 @@ async function workspaces(){
   <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
     <input class="input" id="wsq" placeholder="按名称搜索" value="${p.query}" style="flex:2;min-width:150px">
     <input class="input" id="wsdept" placeholder="部门" value="${p.department}" style="flex:1;min-width:100px">
-    <input class="input" id="wscreator" placeholder="创建人" value="${p.creator}" style="flex:1;min-width:100px">
     <input class="input" id="wsadmin" placeholder="管理员" value="${p.admin}" style="flex:1;min-width:100px">
     <button class="primary" id="wsgo">查询</button><button class="secondary" id="wsreset">重置</button>
   </div>
@@ -253,7 +253,7 @@ async function workspaces(){
   </section>
   `);
   document.querySelectorAll('[data-level]').forEach(x=>x.onclick=()=>{p.level=x.dataset.level;p.offset=0;workspaces()});
-  document.querySelector('#wsgo').onclick=()=>{p.query=document.querySelector('#wsq').value.trim();p.department=document.querySelector('#wsdept').value.trim();p.creator=document.querySelector('#wscreator').value.trim();p.admin=document.querySelector('#wsadmin').value.trim();p.offset=0;workspaces()};
+  document.querySelector('#wsgo').onclick=()=>{p.query=document.querySelector('#wsq').value.trim();p.department=document.querySelector('#wsdept').value.trim();p.creator='';p.admin=document.querySelector('#wsadmin').value.trim();p.offset=0;workspaces()};
   document.querySelector('#wsq').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#wsgo').click()};
   document.querySelector('#wsreset').onclick=()=>{state.wsReg={query:'',level:'',department:'',creator:'',admin:'',offset:0};workspaces()};
   document.querySelector('#wsprev').onclick=()=>{p.offset=Math.max(0,p.offset-50);workspaces()};

@@ -114,6 +114,9 @@ def dashboard(db: Session = Depends(db_session)):
     org_context = dict(increments["baseline"]["definition"].get("org_context", {}))
     primary = db.get(HistoricalSnapshot, metrics.primary_snapshot_id(db))
     baseline_libs = len(((primary.definition or {}).get("workspaces") or {})) if primary else 0
+    if primary and not baseline_libs:  # older snapshots store no workspace map
+        baseline_libs = db.scalar(select(func.count(func.distinct(HistoricalFileNode.workspace_id)))
+                                  .where(HistoricalFileNode.snapshot_id == primary.snapshot_id)) or 0
     org_context["note"] = (f"文件总量与月度增量按全量基线 {primary.snapshot_id if primary else '—'}"
                            f"（{baseline_libs or '—'} 库）+ 实时增量计算；服务身份已登记 {workspaces} 个知识库。")
     return {
