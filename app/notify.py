@@ -1,10 +1,14 @@
 """Review-result push over the DingTalk robot, with an auditable outbox.
 
-Flow: a review whose verdict is not `pass` enqueues a Notification row; the
-worker drains pending rows, resolves the uploader's userId from their unionId
-when needed, and sends a one-to-one robot markdown message. Failures keep the
-row with an error code instead of silently dropping — the diagnostics view
-lists recent rows so a broken permission is visible, not guessed.
+Flow: a finished review enqueues a Notification row (non-pass always; pass
+verdicts only when KG_NOTIFY_ON_PASS is on); the worker drains pending rows,
+resolves the uploader's userId from their unionId when needed, and sends a
+one-to-one robot markdown message. Failures keep the row with an error code
+instead of silently dropping — the diagnostics view lists recent rows so a
+broken permission is visible, not guessed.
+
+试点口径（2026-08-12 用户拍板）：低分不走退回流程，推送只做"低分说明"，
+所有消息带试点尾注，避免"文档被退回/删除"的歧义。
 
 Nothing here stores document body content; messages carry name, score and
 finding summaries only.
@@ -22,25 +26,44 @@ from .integrations import DingtalkClient, IntegrationError
 
 VERDICT_LABEL = {"pass": "通过", "manual_review": "待人工审核", "return": "退回"}
 
+# 试点尾注：随每条推送发出（含汇总），措辞为用户指定原文。
+PILOT_FOOTER = ('\n\n---\n<font color="#9CA3AF">此功能由AI应用研发部-陈鹏列开发，'
+                '当前试点阶段，不会对文档产生影响，如有使用意见请及时反馈。</font>')
+
 
 def build_message(doc: Document, instance: ReviewInstance) -> tuple[str, str]:
-    findings = [f.get("message", "") for f in (instance.findings or [])[:3] if isinstance(f, dict)]
-    lines = [
-        f"### 知识库文档评审：{VERDICT_LABEL.get(instance.verdict, instance.verdict)}",
-        f"- 文档：**{doc.name}**",
-        f"- AI 评分：**{instance.ai_score:.0f} / 100**（{'完整正文' if instance.review_scope == 'full_content' else '元数据合规'}口径，规则 {instance.rule_version}）",
-    ]
-    if findings:
-        lines.append("- 主要问题：")
-        lines.extend(f"  {index}. {message}" for index, message in enumerate(findings, 1))
-    lines.append("")
-    lines.append("请在钉钉知识库中修改原文档；修改会被自动发现并重新评审，历史评分保留。")
-    return f"文档评审{VERDICT_LABEL.get(instance.verdict, '')}：{doc.name}"[:60], "\n".join(lines)
+    """单条推送：通过 = 正反馈；低分 = 说明语气（试点期无退回流程）。"""
+    scope = '完整正文' if instance.review_scope == 'full_content' else '元数据合规'
+    if instance.verdict == "pass":
+        lines = [
+            "### 知识库文档评审：通过 ✅",
+            f"- 文档：**{doc.name}**",
+            f"- AI 评分：**{instance.ai_score:.0f} / 100**（{scope}口径，规则 {instance.rule_version}）",
+            "",
+            "文档质量达标，感谢维护。后续修改会被自动发现并重新评审。",
+        ]
+        title = f"文档评审通过：{doc.name}"[:60]
+    else:
+        findings = [f.get("message", "") for f in (instance.findings or [])[:3] if isinstance(f, dict)]
+        lines = [
+            "### 知识库文档评审：低分说明 ⚠️",
+            f"- 文档：**{doc.name}**",
+            f"- AI 评分：**{instance.ai_score:.0f} / 100**（{scope}口径，规则 {instance.rule_version}）",
+        ]
+        if findings:
+            lines.append("- 主要扣分点：")
+            lines.extend(f"  {index}. {message}" for index, message in enumerate(findings, 1))
+        lines.append("")
+        lines.append("以上仅为质量提示，不影响文档本身；在钉钉知识库中修改原文档会被自动发现并重新评审，历史评分保留。")
+        title = f"文档评审低分说明：{doc.name}"[:60]
+    return title, "\n".join(lines) + PILOT_FOOTER
 
 
 def enqueue_review_notification(db: Session, settings: Settings, doc: Document, instance: ReviewInstance) -> Notification | None:
-    """Queue a push for a non-pass review. Caller commits."""
-    if not settings.notify_enabled or instance.verdict == "pass":
+    """Queue a push for a finished review. Caller commits."""
+    if not settings.notify_enabled:
+        return None
+    if instance.verdict == "pass" and not settings.notify_on_pass:
         return None
     allowed = {token.strip() for token in settings.notify_workspaces.split(",") if token.strip()}
     if allowed and doc.workspace_id not in allowed:
@@ -66,22 +89,34 @@ def _age_seconds(now, moment) -> float:
     return (now.replace(tzinfo=None) - moment.replace(tzinfo=None)).total_seconds()
 
 
-def _digest_message(db: Session, rows: list[Notification]) -> tuple[str, str]:
-    """One message for a burst: counts plus a one-line summary per document."""
-    from .db import ReviewInstance
+def digest_message(entries: list[dict]) -> tuple[str, str]:
+    """One message for a burst: entries = [{"name", "score", "verdict"}]
+    （score/verdict 可缺省）。独立于 DB，样例脚本可原样复用生产文案。"""
+    passed = sum(1 for e in entries if e.get("verdict") == "pass")
+    low = sum(1 for e in entries if e.get("verdict") not in (None, "", "pass"))
+    parts = ([f"通过 {passed} 份"] if passed else []) + ([f"低分说明 {low} 份"] if low else [])
+    summary = f"（{' · '.join(parts)}）" if parts else ""
+    lines = [f"### 知识库文档评审汇总：{len(entries)} 份{summary}", ""]
+    for entry in entries[:10]:
+        name, score, verdict = entry.get("name", "未知文档"), entry.get("score"), entry.get("verdict")
+        badge = " · ✅ 通过" if verdict == "pass" else (" · ⚠️ 低分" if verdict else "")
+        score_part = f" — {score:.0f} 分" if isinstance(score, (int, float)) else ""
+        lines.append(f"- **{name}**{score_part}{badge}")
+    if len(entries) > 10:
+        lines.append(f"- ……其余 {len(entries) - 10} 份见治理看板")
+    if low:
+        lines += ["", "低分仅为质量提示，不影响文档本身；修改原文档会被自动发现并重新评审，历史评分保留。"]
+    return f"文档评审汇总：{len(entries)} 份{summary}"[:60], "\n".join(lines) + PILOT_FOOTER
 
-    lines = [f"### 知识库文档评审汇总：{len(rows)} 份待处理", ""]
-    for row in rows[:10]:
+
+def _digest_message(db: Session, rows: list[Notification]) -> tuple[str, str]:
+    entries = []
+    for row in rows:
         instance = db.get(ReviewInstance, row.review_instance_id) if row.review_instance_id else None
-        name = row.title.split("：", 1)[-1]
-        if instance:
-            lines.append(f"- **{name}** — {instance.ai_score:.0f} 分 · {VERDICT_LABEL.get(instance.verdict, instance.verdict)}")
-        else:
-            lines.append(f"- **{name}**")
-    if len(rows) > 10:
-        lines.append(f"- ……其余 {len(rows) - 10} 份见治理看板")
-    lines += ["", "请在钉钉知识库中修改原文档；修改会被自动发现并重新评审，历史评分保留。"]
-    return f"文档评审汇总：{len(rows)} 份待处理", "\n".join(lines)
+        entries.append({"name": row.title.split("：", 1)[-1],
+                        "score": instance.ai_score if instance else None,
+                        "verdict": instance.verdict if instance else ""})
+    return digest_message(entries)
 
 
 def process_pending_notifications(db: Session, settings: Settings, batch: int = 100) -> int:

@@ -232,7 +232,8 @@ def test_notification_digest_batches_bursts(monkeypatch):
         db.commit()
         assert notify_module.process_pending_notifications(db, settings) == 3
         digest = [item for item in sent if "批量文档" in item[2]]
-        assert len(digest) == 1 and "3 份待处理" in digest[0][1]
+        assert len(digest) == 1 and "3 份" in digest[0][1]
+        assert "此功能由AI应用研发部-陈鹏列开发" in digest[0][2]
         statuses = {row.status for row in db.query(Notification)
                     .filter(Notification.target_union_id == "70000001").all()}
         assert statuses == {"sent"}
@@ -271,7 +272,35 @@ def test_notification_digest_max_delay_forces_flush(monkeypatch):
                              title="文档评审退回：刚上传的文档.docx", body="正文", status="pending")
         db.add(fresh); db.commit()  # burst still ongoing, but max delay wins
         assert notify_module.process_pending_notifications(db, settings) == 2
-        assert any("2 份待处理" in item[1] for item in sent)
+        assert any("2 份" in item[1] for item in sent)
+
+
+def test_notify_pass_gate_copy_and_pilot_footer():
+    from types import SimpleNamespace
+
+    from app import notify as notify_module
+
+    doc = SimpleNamespace(node_id="pass-1", workspace_id="ws-x", uploader_key="u-1", name="样例.docx")
+    ok = SimpleNamespace(review_instance_id="ri-ok", ai_score=88.0, verdict="pass",
+                         review_scope="full_content", rule_version="V1.1", findings=[])
+    low = SimpleNamespace(review_instance_id="ri-low", ai_score=54.0, verdict="return",
+                          review_scope="metadata_only", rule_version="V1.1",
+                          findings=[{"message": "标题未标注版本号"}])
+    t_ok, b_ok = notify_module.build_message(doc, ok)
+    t_low, b_low = notify_module.build_message(doc, low)
+    assert "通过" in t_ok and "✅" in b_ok
+    # 试点口径：低分只做说明，不出现"退回"字样，明确不影响文档
+    assert "低分说明" in t_low and "退回" not in b_low and "不影响文档本身" in b_low
+    for body in (b_ok, b_low):
+        assert "此功能由AI应用研发部-陈鹏列开发" in body
+
+    init_db()
+    with SessionLocal() as db:
+        base = get_settings().model_copy(update={"notify_enabled": True, "notify_workspaces": ""})
+        assert notify_module.enqueue_review_notification(db, base, doc, ok) is None  # 默认不推合格
+        row = notify_module.enqueue_review_notification(db, base.model_copy(update={"notify_on_pass": True}), doc, ok)
+        assert row is not None and "通过" in row.title
+        db.rollback()
 
 
 def test_fileclass_and_notify_guardrails():

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     model_allow_content_transfer: bool = False
     # Push stays off until the robot permission is granted and a test send passes.
     notify_enabled: bool = False
+    # Also push pass verdicts (positive feedback). Off by default: passes are
+    # the common case and would dominate the robot quota once watch widens.
+    notify_on_pass: bool = False
     robot_code: str = ""  # defaults to the app key at call time when empty
     # Stream-mode event consumer (file-change events land in stream_events).
     # 2026-08-07: storage events verifiably do NOT fire for knowledge-base
