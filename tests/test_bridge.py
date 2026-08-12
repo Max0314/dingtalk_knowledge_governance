@@ -233,7 +233,7 @@ def test_notification_digest_batches_bursts(monkeypatch):
         assert notify_module.process_pending_notifications(db, settings) == 3
         digest = [item for item in sent if "批量文档" in item[2]]
         assert len(digest) == 1 and "3 份" in digest[0][1]
-        assert "此功能由AI应用研发部-陈鹏列开发" in digest[0][2]
+        assert "AI应用研发部-陈鹏列" in digest[0][2]
         statuses = {row.status for row in db.query(Notification)
                     .filter(Notification.target_union_id == "70000001").all()}
         assert statuses == {"sent"}
@@ -286,13 +286,14 @@ def test_notify_pass_gate_copy_and_pilot_footer():
     low = SimpleNamespace(review_instance_id="ri-low", ai_score=54.0, verdict="return",
                           review_scope="metadata_only", rule_version="V1.1",
                           findings=[{"message": "标题未标注版本号"}])
-    t_ok, b_ok = notify_module.build_message(doc, ok)
-    t_low, b_low = notify_module.build_message(doc, low)
-    assert "通过" in t_ok and "✅" in b_ok
-    # 试点口径：低分只做说明，不出现"退回"字样，明确不影响文档
-    assert "低分说明" in t_low and "退回" not in b_low and "不影响文档本身" in b_low
+    t_ok, b_ok = notify_module.build_message(doc, ok, "https://kg.example.com/prefix")
+    t_low, b_low = notify_module.build_message(doc, low, "https://kg.example.com/prefix")
+    assert "通过" in t_ok and "质量达标" in b_ok
+    # 试点口径：低分只做说明，不出现"退回"字样；带分析页链接
+    assert "低分说明" in t_low and "退回" not in b_low and "质量提示" in b_low
+    assert "https://kg.example.com/prefix/#/doc/pass-1" in b_low and "](http" not in b_ok
     for body in (b_ok, b_low):
-        assert "此功能由AI应用研发部-陈鹏列开发" in body
+        assert "AI应用研发部-陈鹏列" in body
 
     init_db()
     with SessionLocal() as db:

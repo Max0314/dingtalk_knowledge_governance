@@ -26,35 +26,48 @@ from .integrations import DingtalkClient, IntegrationError
 
 VERDICT_LABEL = {"pass": "通过", "manual_review": "待人工审核", "return": "退回"}
 
-# 试点尾注：随每条推送发出（含汇总），措辞为用户指定原文。
-PILOT_FOOTER = ('\n\n---\n<font color="#9CA3AF">此功能由AI应用研发部-陈鹏列开发，'
-                '当前试点阶段，不会对文档产生影响，如有使用意见请及时反馈。</font>')
+# 试点尾注：随每条推送发出（含汇总）。
+PILOT_FOOTER = '\n\n---\n<font color="#9CA3AF">试点功能 · 不影响文档 · 意见反馈：AI应用研发部-陈鹏列</font>'
+
+GREEN, AMBER, RED = "#16A34A", "#D97706", "#DC2626"
 
 
-def build_message(doc: Document, instance: ReviewInstance) -> tuple[str, str]:
-    """单条推送：通过 = 正反馈；低分 = 说明语气（试点期无退回流程）。"""
-    scope = '完整正文' if instance.review_scope == 'full_content' else '元数据合规'
+def _score_color(score: float, verdict: str) -> str:
+    if verdict == "pass":
+        return GREEN
+    return AMBER if (score or 0) >= 60 else RED
+
+
+def _doc_link(base_url: str, node_id: str) -> str:
+    from urllib.parse import quote
+    return f"{base_url.rstrip('/')}/#/doc/{quote(str(node_id), safe='')}"
+
+
+def build_message(doc: Document, instance: ReviewInstance, base_url: str = "") -> tuple[str, str]:
+    """单条推送：通过 = 正反馈；低分 = 说明语气 + 分析页链接（试点期无退回流程）。
+    状态用彩色文字呈现（钉钉里 emoji 图标观感差）。"""
+    score = f'<font color="{_score_color(instance.ai_score, instance.verdict)}">**{instance.ai_score:.0f} / 100**</font>'
     if instance.verdict == "pass":
         lines = [
-            "### 知识库文档评审：通过 ✅",
-            f"- 文档：**{doc.name}**",
-            f"- AI 评分：**{instance.ai_score:.0f} / 100**（{scope}口径，规则 {instance.rule_version}）",
+            "### 文档评审：通过",
+            f"**{doc.name}**",
             "",
-            "文档质量达标，感谢维护。后续修改会被自动发现并重新评审。",
+            f"{score} · 文档质量达标，感谢维护。",
         ]
         title = f"文档评审通过：{doc.name}"[:60]
     else:
         findings = [f.get("message", "") for f in (instance.findings or [])[:3] if isinstance(f, dict)]
         lines = [
-            "### 知识库文档评审：低分说明 ⚠️",
-            f"- 文档：**{doc.name}**",
-            f"- AI 评分：**{instance.ai_score:.0f} / 100**（{scope}口径，规则 {instance.rule_version}）",
+            "### 文档评审：低分说明",
+            f"**{doc.name}**",
+            "",
+            f"{score}，主要扣分点：",
         ]
-        if findings:
-            lines.append("- 主要扣分点：")
-            lines.extend(f"  {index}. {message}" for index, message in enumerate(findings, 1))
+        lines.extend(f"{index}. {message}" for index, message in enumerate(findings, 1))
         lines.append("")
-        lines.append("以上仅为质量提示，不影响文档本身；在钉钉知识库中修改原文档会被自动发现并重新评审，历史评分保留。")
+        lines.append("以上仅为质量提示，修改后会自动重新评审。")
+        if base_url and getattr(doc, "node_id", ""):
+            lines.append(f"[查看完整评审分析 →]({_doc_link(base_url, doc.node_id)})")
         title = f"文档评审低分说明：{doc.name}"[:60]
     return title, "\n".join(lines) + PILOT_FOOTER
 
@@ -78,7 +91,7 @@ def enqueue_review_notification(db: Session, settings: Settings, doc: Document, 
                                     status="skipped", error_code="uploader_unknown")
         db.add(notification)
         return notification
-    title, body = build_message(doc, instance)
+    title, body = build_message(doc, instance, settings.public_base_url)
     notification = Notification(node_id=doc.node_id, review_instance_id=instance.review_instance_id,
                                 target_union_id=doc.uploader_key, title=title, body=body)
     db.add(notification)
@@ -89,34 +102,38 @@ def _age_seconds(now, moment) -> float:
     return (now.replace(tzinfo=None) - moment.replace(tzinfo=None)).total_seconds()
 
 
-def digest_message(entries: list[dict]) -> tuple[str, str]:
+def digest_message(entries: list[dict], base_url: str = "") -> tuple[str, str]:
     """One message for a burst: entries = [{"name", "score", "verdict"}]
     （score/verdict 可缺省）。独立于 DB，样例脚本可原样复用生产文案。"""
     passed = sum(1 for e in entries if e.get("verdict") == "pass")
     low = sum(1 for e in entries if e.get("verdict") not in (None, "", "pass"))
-    parts = ([f"通过 {passed} 份"] if passed else []) + ([f"低分说明 {low} 份"] if low else [])
+    parts = ([f"通过 {passed}"] if passed else []) + ([f"低分 {low}"] if low else [])
     summary = f"（{' · '.join(parts)}）" if parts else ""
-    lines = [f"### 知识库文档评审汇总：{len(entries)} 份{summary}", ""]
+    lines = [f"### 文档评审汇总：{len(entries)} 份{summary}", ""]
     for entry in entries[:10]:
         name, score, verdict = entry.get("name", "未知文档"), entry.get("score"), entry.get("verdict")
-        badge = " · ✅ 通过" if verdict == "pass" else (" · ⚠️ 低分" if verdict else "")
-        score_part = f" — {score:.0f} 分" if isinstance(score, (int, float)) else ""
-        lines.append(f"- **{name}**{score_part}{badge}")
+        if isinstance(score, (int, float)):
+            score_part = f' — <font color="{_score_color(score, verdict)}">**{score:.0f} 分**</font>'
+        else:
+            score_part = ""
+        lines.append(f"- **{name}**{score_part}")
     if len(entries) > 10:
-        lines.append(f"- ……其余 {len(entries) - 10} 份见治理看板")
+        lines.append(f"- ……其余 {len(entries) - 10} 份")
     if low:
-        lines += ["", "低分仅为质量提示，不影响文档本身；修改原文档会被自动发现并重新评审，历史评分保留。"]
+        lines += ["", "低分仅为质量提示，修改后会自动重新评审。"]
+        if base_url:
+            lines.append(f"[查看评审分析 →]({base_url.rstrip('/')}/#/reviews)")
     return f"文档评审汇总：{len(entries)} 份{summary}"[:60], "\n".join(lines) + PILOT_FOOTER
 
 
-def _digest_message(db: Session, rows: list[Notification]) -> tuple[str, str]:
+def _digest_message(db: Session, rows: list[Notification], base_url: str = "") -> tuple[str, str]:
     entries = []
     for row in rows:
         instance = db.get(ReviewInstance, row.review_instance_id) if row.review_instance_id else None
         entries.append({"name": row.title.split("：", 1)[-1],
                         "score": instance.ai_score if instance else None,
                         "verdict": instance.verdict if instance else ""})
-    return digest_message(entries)
+    return digest_message(entries, base_url)
 
 
 def process_pending_notifications(db: Session, settings: Settings, batch: int = 100) -> int:
@@ -164,7 +181,7 @@ def process_pending_notifications(db: Session, settings: Settings, batch: int = 
             if len(group) == 1:
                 title, body = group[0].title, group[0].body
             else:
-                title, body = _digest_message(db, group)
+                title, body = _digest_message(db, group, settings.public_base_url)
             asyncio.run(client.send_robot_markdown([user_id], title, prefix + body))
             for row in group:
                 row.target_user_id = user_id

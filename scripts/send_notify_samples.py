@@ -26,8 +26,8 @@ from app.notify import build_message, digest_message
 DEFAULT_USER = "01115324500438248944"  # 陈鹏列
 
 
-def sample(name: str, score: float, verdict: str, findings: list[str] | None = None):
-    doc = SimpleNamespace(name=name)
+def sample(name: str, score: float, verdict: str, findings: list[str] | None = None, node_id: str = ""):
+    doc = SimpleNamespace(name=name, node_id=node_id)
     instance = SimpleNamespace(ai_score=score, verdict=verdict, review_scope="full_content",
                                rule_version="V1.1", findings=[{"message": m} for m in (findings or [])])
     return doc, instance
@@ -35,22 +35,25 @@ def sample(name: str, score: float, verdict: str, findings: list[str] | None = N
 
 def main() -> None:
     user = sys.argv[sys.argv.index("--user") + 1] if "--user" in sys.argv else DEFAULT_USER
+    settings = get_settings()
+    base = settings.public_base_url
     messages = [
-        build_message(*sample("接口发布规范_V1.0.docx", 88, "pass")),
+        build_message(*sample("接口发布规范_V1.0.docx", 88, "pass"), base_url=base),
+        # 真实存在的低分文档节点：样例里的「查看完整评审分析」链接可直接打开
         build_message(*sample("智能网关IPV6测试步骤.docx", 54, "return", [
             "标题未标注版本号（形如 V1.0）。",
             "存在超过 800 字未分级的大段落。",
             "存在未在首次出现处释义的英文缩写。",
-        ])),
+        ], node_id="gwva2dxOW4yMxDdBUkRobPwBVbkz3BRL"), base_url=base),
         digest_message([
             {"name": "接口发布规范_V1.0.docx", "score": 88, "verdict": "pass"},
             {"name": "数据治理说明_V2.1.docx", "score": 92, "verdict": "pass"},
             {"name": "服务巡检清单_V1.2.md", "score": 76, "verdict": "pass"},
             {"name": "智能网关IPV6测试步骤.docx", "score": 54, "verdict": "return"},
             {"name": "会议纪要20260812.docx", "score": 63, "verdict": "manual_review"},
-        ]),
+        ], base_url=base),
     ]
-    client = DingtalkClient(get_settings())
+    client = DingtalkClient(settings)
     for title, body in messages:
         asyncio.run(client.send_robot_markdown([user], title, body))
         print("sent:", title)
