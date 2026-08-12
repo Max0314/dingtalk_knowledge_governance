@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, literal, select, union_all
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from . import metrics, orgmap
 from .config import get_settings
@@ -250,12 +250,18 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
 
 @app.get("/api/v1/files")
 def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
+                  department: str = "", uploader: str = "",
                   offset: int = Query(default=0, ge=0),
                   limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     """The single merged document list: primary-baseline snapshot rows plus the
     live increment mirror, deduplicated by node_id (the live row wins — it has
     fresher attribution and review state), soft-deleted nodes hidden. Newest
-    first, so page one is "最新入库"."""
+    first, so page one is "最新入库".
+
+    Paging never materializes the union: each source is read newest-first with
+    its own LIMIT (the snapshot side rides ix_hfn_snapshot_created) and the two
+    ordered streams are merged in Python — page one costs ~2×(offset+limit)
+    indexed rows instead of a 140k-row temp-table sort."""
     snapshot = metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
     base = select(
         HistoricalFileNode.node_id, HistoricalFileNode.workspace_id, HistoricalFileNode.name,
@@ -275,14 +281,32 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     if query:
         base = base.where(HistoricalFileNode.name.contains(query))
         live = live.where(Document.name.contains(query))
+    if department:  # 知识库归属部门（workspaces.owner_department_name，宜搭回填）
+        dept_ws = select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))
+        base = base.where(HistoricalFileNode.workspace_id.in_(dept_ws))
+        live = live.where(Document.workspace_id.in_(dept_ws))
+    if uploader:  # 姓名经 bi_center 员工缓存解析；同时接受原始 userId/uploader_key
+        emp_ids = select(EmployeeMap.user_id).where(EmployeeMap.name.contains(uploader))
+        base = base.where(or_(HistoricalFileNode.creator_user_id.in_(emp_ids),
+                              HistoricalFileNode.creator_user_id == uploader))
+        live = live.where(or_(Document.uploader_name.contains(uploader), Document.uploader_key == uploader))
     if folder:  # folder browsing is a snapshot feature; the live mirror stores no parent
-        stmt = base.where(HistoricalFileNode.parent_node_id == ("" if folder == "(根目录)" else folder))
+        base = base.where(HistoricalFileNode.parent_node_id == ("" if folder == "(根目录)" else folder))
+        total = db.scalar(select(func.count()).select_from(base.subquery())) or 0
+        rows = db.execute(base.order_by(HistoricalFileNode.source_created_at.desc(), HistoricalFileNode.node_id.desc())
+                          .offset(offset).limit(limit)).all()
     else:
-        stmt = union_all(base.where(HistoricalFileNode.node_id.not_in(select(Document.node_id))), live)
-    sub = stmt.subquery()
-    total = db.scalar(select(func.count()).select_from(sub)) or 0
-    rows = db.execute(select(sub).order_by(sub.c.created_at.desc(), sub.c.node_id.desc())
-                      .offset(offset).limit(limit)).all()
+        base = base.where(HistoricalFileNode.node_id.not_in(select(Document.node_id)))
+        need = offset + limit
+        merged = sorted(
+            db.execute(base.order_by(HistoricalFileNode.source_created_at.desc(),
+                                     HistoricalFileNode.node_id.desc()).limit(need)).all() +
+            db.execute(live.order_by(Document.source_created_at.desc(),
+                                     Document.node_id.desc()).limit(need)).all(),
+            key=lambda r: ((r.created_at or ""), r.node_id), reverse=True)
+        rows = merged[offset:offset + limit]
+        total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
+                (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
     ids = [r.node_id for r in rows]
     docs = {d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {}
     latest_review: dict[str, ReviewInstance] = {}
@@ -325,13 +349,19 @@ async def notification_test(payload: NotifyTestRequest):
 
 @app.get("/api/v1/reviews")
 def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_review|return)$"),
-                 query: str = "", offset: int = Query(default=0, ge=0),
+                 query: str = "", department: str = "", uploader: str = "",
+                 offset: int = Query(default=0, ge=0),
                  limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     stmt = select(ReviewInstance, Document).join(Document, Document.node_id == ReviewInstance.node_id)
     if verdict:
         stmt = stmt.where(ReviewInstance.verdict == verdict)
     if query:
         stmt = stmt.where(Document.name.contains(query))
+    if department:  # 知识库归属部门
+        stmt = stmt.where(Document.workspace_id.in_(
+            select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))))
+    if uploader:
+        stmt = stmt.where(or_(Document.uploader_name.contains(uploader), Document.uploader_key == uploader))
     total = db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = db.execute(stmt.order_by(ReviewInstance.created_at.desc()).offset(offset).limit(limit)).all()
     return {"total": total, "offset": offset, "limit": limit,
@@ -378,6 +408,16 @@ def notifications(status: str = "", limit: int = Query(default=20, ge=1, le=100)
                        "title": n.title, "target_user_id": n.target_user_id,
                        "created_at": n.created_at.isoformat() if n.created_at else None,
                        "sent_at": n.sent_at.isoformat() if n.sent_at else None} for n in db.scalars(stmt).all()]}
+
+
+@app.get("/api/v1/filters/departments")
+def department_options(db: Session = Depends(db_session)):
+    """知识库归属部门选项（workspaces.owner_department_name，来源：宜搭知识库登记）。"""
+    rows = db.execute(select(Workspace.owner_department_name, func.count())
+                      .where(Workspace.owner_department_name != "")
+                      .group_by(Workspace.owner_department_name)
+                      .order_by(func.count().desc())).all()
+    return {"items": [{"name": r[0], "count": r[1]} for r in rows]}
 
 
 WORKSPACE_LEVEL_PATTERN = re.compile(r"^([CDPIcdpi])[\-_—－]")

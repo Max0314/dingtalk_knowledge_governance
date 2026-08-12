@@ -133,9 +133,10 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
   const chartRows=sorted.map(r=>({month:lvl==='year'?r.key+'年':lvl==='month'?r.key.slice(5)+'月':r.key.slice(8)+'日',total:r.total,bulk_import:r.bulk,routine:r.routine}));
   card.innerHTML=`<div class="card-head"><h2>增量构成</h2><span class="hint">点击柱状图或表格行下钻：年 → 月 → 日 · 点击图表空白处回退</span></div>
     <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">${crumbs}<span style="flex:1"></span>
-      <input class="input" id="tf-dept" placeholder="部门" value="${st.fDept}" style="width:120px">
-      <input class="input" id="tf-group" placeholder="业务组" value="${st.fGroup}" style="width:105px">
-      <input class="input" id="tf-person" placeholder="成员" value="${st.fPerson}" style="width:95px">
+      <input class="input" id="tf-dept" list="dl-dept" placeholder="部门" value="${st.fDept}" style="width:130px">
+      <input class="input" id="tf-group" list="dl-group" placeholder="业务组" value="${st.fGroup}" style="width:115px">
+      <input class="input" id="tf-person" list="dl-person" placeholder="成员" value="${st.fPerson}" style="width:105px">
+      <datalist id="dl-dept"></datalist><datalist id="dl-group"></datalist><datalist id="dl-person"></datalist>
       <button class="primary" id="tf-go">筛选</button>${(st.fDept||st.fGroup||st.fPerson)?'<button class="secondary" id="tf-clear">清除</button>':''}
     </div>
     ${tree.filter_label?`<p class="hint" style="margin:0 0 8px">当前筛选：${tree.filter_label}</p>`:''}
@@ -148,13 +149,30 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
   card.querySelectorAll('[data-tdrill]').forEach(r=>r.onclick=()=>{const k=r.dataset.tdrill;if(lvl==='year'){st.year=k;st.month=''}else if(lvl==='month'){st.month=k}refreshIncSections()});
   card.querySelectorAll('[data-tcrumb]').forEach(b=>b.onclick=()=>{const c=b.dataset.tcrumb;if(c==='root'){st.year='';st.month=''}else if(c==='year'){if(st.month)st.year=st.month.slice(0,4);st.month=''}refreshIncSections()});
   card.querySelector('#tf-go').onclick=()=>{st.fDept=card.querySelector('#tf-dept').value.trim();st.fGroup=card.querySelector('#tf-group').value.trim();st.fPerson=card.querySelector('#tf-person').value.trim();renderTreeSection()};
-  card.querySelectorAll('#tf-dept,#tf-group,#tf-person').forEach(i=>i.onkeydown=e=>{if(e.key==='Enter')card.querySelector('#tf-go').click()});
+  card.querySelectorAll('#tf-dept,#tf-group,#tf-person').forEach(i=>{
+    i.onkeydown=e=>{if(e.key==='Enter')card.querySelector('#tf-go').click()};
+    i.oninput=()=>fillIncDatalists()});
+  fillIncDatalists();
   const tfc=card.querySelector('#tf-clear');if(tfc)tfc.onclick=()=>{st.fDept='';st.fGroup='';st.fPerson='';renderTreeSection()}}
+
+/* 筛选下拉选项：部门/业务组/成员来自 /metrics/org 的嵌套结果，业务组、成员
+   随已输入的上级联动收窄。datalist = 原生"下拉+可搜索"。 */
+function fillIncDatalists(){const st=state.inc,org=st&&st._org;if(!org)return;
+  const dd=document.querySelector('#dl-dept');if(!dd)return;
+  const deptVal=(document.querySelector('#tf-dept')||{value:''}).value.trim();
+  const groupVal=(document.querySelector('#tf-group')||{value:''}).value.trim();
+  const groups=[],people=[];
+  org.filter(x=>!deptVal||(x.department_name||'').includes(deptVal)).forEach(x=>(x.groups||[]).forEach(g=>{
+    if(g.biz_group_name)groups.push(g.biz_group_name);
+    if(!groupVal||(g.biz_group_name||'').includes(groupVal))(g.people||[]).forEach(pp=>{if(pp.name)people.push(pp.name)})}));
+  const fill=(sel,arr)=>{const el=document.querySelector(sel);if(el)el.innerHTML=[...new Set(arr)].slice(0,400).map(v=>`<option value="${v}">`).join('')};
+  fill('#dl-dept',org.map(x=>x.department_name).filter(Boolean));fill('#dl-group',groups);fill('#dl-person',people)}
 
 async function renderOrgSection(){const st=state.inc,card=document.querySelector('#orgCard');if(!card)return;
   const orgYear=st.month?'':(st.year||st.latestYear);
   const org=await api('/api/v1/metrics/org?'+new URLSearchParams({year:orgYear,month:st.month||''})).catch(()=>({items:[]}));
   if(!document.querySelector('#orgCard'))return;
+  st._org=org.items||[];fillIncDatalists();
   const periodLabel=st.month||((st.year||st.latestYear)+' 全年');
   const orgLevel=st.orgDept?(st.orgGroup?'person':'group'):'dept';
   const visibleOrg=(org.items||[]).filter(x=>!st.excl||!['系统/机器人','未映射'].includes(x.department_name));
@@ -218,31 +236,54 @@ function fileTable(d){if(!d.items.length)return '<div class="empty">未找到匹
     const ws=state.coverageNames[f.workspace_id]||f.workspace_id;
     return `<tr ${f.has_detail?`class="rowlink" data-doc="${f.node_id}"`:''}><td><b>${f.name}</b><br><small>${f.node_id}</small></td><td><small>${ws}</small></td><td>${fmt(f.uploader_name)}${f.department_name?`<br><small>${f.department_name}</small>`:''}</td><td class="num">${f.ai_score!=null?`<span class="score ${scoreClass(f.ai_score)}">${f.ai_score}</span>`:'—'}${f.verdict?`<br><span class="badge ${f.verdict}">${verdictText(f.verdict)}</span>`:''}</td><td>${fmt((f.created_at||'').slice(0,10))}</td><td>${f.url?`<a class="link-btn" href="${f.url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">打开 ↗</a>`:''}${f.has_detail?' <small style="color:#9ca3af">›</small>':''}</td></tr>`}).join('')}</tbody></table></div>
   <div class="controls section-gap"><span class="hint">共 ${nf(d.total)} 个 · 第 ${Math.floor(d.offset/d.limit)+1} / ${Math.max(1,Math.ceil(d.total/d.limit))} 页</span><button class="secondary" id="bl-prev" ${d.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="bl-next" ${d.offset+d.limit>=d.total?'disabled':''}>下一页</button></div>`}
-async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',offset:p.offset,limit:50});
-  const d=await api('/api/v1/files?'+qs);const box=document.querySelector('#bl-results');if(!box)return;box.innerHTML=fileTable(d);
+function renderFilesBox(d){const box=document.querySelector('#bl-results');if(!box)return;box.innerHTML=fileTable(d);
   const t=document.querySelector('#fl-total');if(t)t.textContent=nf(d.total);
   bindDocRows();
-  const prev=document.querySelector('#bl-prev'),next=document.querySelector('#bl-next');
+  const p=state.bl,prev=document.querySelector('#bl-prev'),next=document.querySelector('#bl-next');
   if(prev)prev.onclick=()=>{p.offset=Math.max(0,p.offset-50);blSearch()};
   if(next)next.onclick=()=>{p.offset+=50;blSearch()}}
+async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',department:p.dept||'',uploader:p.up||'',offset:p.offset,limit:50});
+  const d=await api('/api/v1/files?'+qs);state._filesLast=d;renderFilesBox(d)}
 
 async function documents(){
-  if(!Object.keys(state.coverageNames).length){try{const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}catch(e){}}
-  state.bl={query:'',ws:'',offset:0};
-  const wsOpts=['<option value="">全部知识库</option>'].concat(Object.entries(state.coverageNames).map(([k,v])=>`<option value="${k}">${v}</option>`)).join('');
-  shell('文档列表','基线快照与实时增量合并去重后的全部文档，默认展示最新入库；有评审的行可点击查看详情。',`
-  <section class="card"><div class="card-head"><h2>全部文档（<span id="fl-total">…</span>）</h2><div class="controls"><select class="input" id="bl-ws">${wsOpts}</select><input class="input" id="bl-q" placeholder="按文件名搜索"><button class="secondary" id="bl-btn">查询</button><button class="primary" id="sync" title="需要钉钉凭据权限开通后使用">执行增量同步</button></div></div><div id="bl-results"><div class="empty">正在加载最新文档…</div></div></section>`);
+  state.bl={query:'',ws:'',dept:'',up:'',offset:0};
+  shell('文档列表','基线快照与实时增量合并去重后的全部文档，默认展示最新入库；可按知识库、归属部门、上传人、文件名过滤，有评审的行可点击查看详情。',`
+  <section class="card"><div class="card-head"><h2>全部文档（<span id="fl-total">…</span>）</h2><div class="controls" style="flex-wrap:wrap;gap:8px">
+    <select class="input" id="bl-ws"><option value="">全部知识库</option></select>
+    <select class="input" id="fl-dept" title="知识库归属部门"><option value="">全部部门</option></select>
+    <input class="input" id="fl-up" placeholder="上传人" style="width:100px">
+    <input class="input" id="bl-q" placeholder="按文件名搜索">
+    <button class="secondary" id="bl-btn">查询</button></div></div>
+  <div id="bl-results"><div class="empty">正在加载最新文档…</div></div></section>`);
+  const applyFilters=()=>{state.bl.query=document.querySelector('#bl-q').value;state.bl.ws=document.querySelector('#bl-ws').value;state.bl.dept=document.querySelector('#fl-dept').value;state.bl.up=document.querySelector('#fl-up').value.trim();state.bl.offset=0;blSearch()};
+  document.querySelector('#bl-btn').onclick=applyFilters;
+  document.querySelectorAll('#bl-q,#fl-up').forEach(i=>i.onkeydown=e=>{if(e.key==='Enter')applyFilters()});
+  document.querySelectorAll('#bl-ws,#fl-dept').forEach(s=>s.onchange=applyFilters);
   blSearch().catch(e=>{const box=document.querySelector('#bl-results');if(box)box.innerHTML=`<div class="empty">${e.message}</div>`});
-  document.querySelector('#bl-btn').onclick=()=>{state.bl.query=document.querySelector('#bl-q').value;state.bl.ws=document.querySelector('#bl-ws').value;state.bl.offset=0;blSearch()};
-  document.querySelector('#bl-ws').onchange=()=>document.querySelector('#bl-btn').click();
-  document.querySelector('#bl-q').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#bl-btn').click()};
-  document.querySelector('#sync').onclick=async()=>{toast('同步已提交…');try{const r=await api('/api/v1/sync-runs',{method:'POST'});toast(r.status==='succeeded'?'增量同步完成':'同步未成功：'+(r.error_code||'请看连接诊断'));if(r.status==='succeeded')blSearch()}catch(e){toast(e.message)}}}
+  loadWorkspaceOptions('#bl-ws');
+  loadDeptOptions('#fl-dept')}
 
-async function reviews(state_={verdict:'',query:'',offset:0}){const qs=new URLSearchParams({verdict:state_.verdict,query:state_.query,offset:state_.offset,limit:50});
+async function loadWorkspaceOptions(sel){try{
+  if(!Object.keys(state.coverageNames).length){const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}
+  const el=document.querySelector(sel);if(!el)return;const cur=el.value;
+  el.innerHTML='<option value="">全部知识库</option>'+Object.entries(state.coverageNames).map(([k,v])=>`<option value="${k}">${v}</option>`).join('');
+  el.value=cur;
+  if(state._filesLast&&document.querySelector('#bl-results table'))renderFilesBox(state._filesLast)
+}catch(e){}}
+async function loadDeptOptions(sel){try{
+  state.deptOptions=state.deptOptions||(await api('/api/v1/filters/departments')).items;
+  const el=document.querySelector(sel);if(!el)return;const cur=el.value;
+  el.innerHTML='<option value="">全部部门</option>'+state.deptOptions.map(x=>`<option value="${x.name}">${x.name}（${x.count} 库）</option>`).join('');
+  el.value=cur
+}catch(e){}}
+
+async function reviews(state_={verdict:'',query:'',dept:'',up:'',offset:0}){const qs=new URLSearchParams({verdict:state_.verdict,query:state_.query,department:state_.dept||'',uploader:state_.up||'',offset:state_.offset,limit:50});
   const d=await api('/api/v1/reviews?'+qs);
   shell('评审记录','全部 AI 评审实例；实例不可变，重评产生新记录。分数为建议，最终结论由审核员保存。',`
-  <section class="card"><div class="card-head"><div class="controls">
+  <section class="card"><div class="card-head"><div class="controls" style="flex-wrap:wrap;gap:8px">
     <select class="input" id="rv-verdict"><option value="">全部结论</option><option value="pass" ${state_.verdict==='pass'?'selected':''}>通过</option><option value="manual_review" ${state_.verdict==='manual_review'?'selected':''}>待人工审核</option><option value="return" ${state_.verdict==='return'?'selected':''}>退回</option></select>
+    <select class="input" id="rv-dept" title="知识库归属部门"><option value="">全部部门</option>${state_.dept?`<option value="${state_.dept}" selected>${state_.dept}</option>`:''}</select>
+    <input class="input" id="rv-up" placeholder="上传人" value="${state_.up||''}" style="width:100px">
     <input class="input" id="rv-q" placeholder="按文档名搜索" value="${state_.query}"><button class="secondary" id="rv-btn">查询</button></div>
     <span class="hint">共 ${nf(d.total)} 条</span></div>
   ${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>文档</th><th>上传人 / 部门</th><th class="num">AI评分</th><th>结论</th><th>范围</th><th>触发</th><th>时间</th></tr></thead><tbody>
@@ -252,8 +293,10 @@ async function reviews(state_={verdict:'',query:'',offset:0}){const qs=new URLSe
   :'<div class="empty">暂无评审记录。评审在增量同步发现新文档、或文档详情页手动触发后产生。</div>'}
   </section>`);
   bindDocRows();
-  document.querySelector('#rv-btn').onclick=()=>reviews({verdict:document.querySelector('#rv-verdict').value,query:document.querySelector('#rv-q').value,offset:0});
-  document.querySelector('#rv-verdict').onchange=()=>document.querySelector('#rv-btn').click();
+  loadDeptOptions('#rv-dept').then(()=>{const el=document.querySelector('#rv-dept');if(el)el.value=state_.dept||''});
+  document.querySelector('#rv-btn').onclick=()=>reviews({verdict:document.querySelector('#rv-verdict').value,query:document.querySelector('#rv-q').value,dept:document.querySelector('#rv-dept').value,up:document.querySelector('#rv-up').value.trim(),offset:0});
+  document.querySelectorAll('#rv-verdict,#rv-dept').forEach(s=>s.onchange=()=>document.querySelector('#rv-btn').click());
+  document.querySelector('#rv-up').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#rv-btn').click()};
   const pv=document.querySelector('#rv-prev'),nx=document.querySelector('#rv-next');
   if(pv)pv.onclick=()=>reviews({...state_,offset:Math.max(0,state_.offset-50)});
   if(nx)nx.onclick=()=>reviews({...state_,offset:state_.offset+50})}
@@ -399,12 +442,17 @@ async function diagnostics(){const[d,n]=await Promise.all([api('/api/v1/diagnost
     <p class="hint">robotCode：${n.robot_code} · 不合格评审自动入队，worker 逐条发送并留痕。</p>
     <div class="controls"><input class="input" id="test-uid" placeholder="接收人 userId（如 01115324500438248944）" style="min-width:280px"><button class="secondary" id="test-send">发送测试消息</button></div>
     ${n.items.length?`<div class="table-wrap section-gap"><table class="data-table"><thead><tr><th>时间</th><th>标题</th><th>接收人</th><th>状态</th><th>错误码</th></tr></thead><tbody>${n.items.map(x=>`<tr><td><small>${(x.created_at||'').replace('T',' ').slice(0,19)}</small></td><td>${x.title||'—'}</td><td><small>${x.target_user_id||'—'}</small></td><td><span class="badge ${x.status==='sent'?'pass':x.status==='failed'?'return':''}">${x.status}</span></td><td><small>${x.error_code||'—'}</small></td></tr>`).join('')}</tbody></table></div>`:'<p class="hint section-gap">暂无推送记录。</p>'}</section>`:''}
+  <section class="card section-gap"><div class="card-head"><h2>手动增量同步</h2></div>
+    <p class="hint">调用钉钉接口全量拉取已登记知识库的文档元数据，需要企业应用 Wiki 读取权限。日常增量由 watcher 自动轮询发现，正常情况无需手动执行。</p>
+    <button class="secondary" id="manual-sync">执行增量同步</button></section>
   <section class="card section-gap"><h2>上线前检查</h2>
     <p class="hint">1. 钉钉企业应用开通知识库读取与机器人发送权限，并发布版本；operatorId 使用数字员工 UnionID。</p>
     <p class="hint">2. 数字员工需为目标知识库成员；缺失的库在「知识库管理」的待授权清单中。</p>
     <p class="hint">3. bi_center 只读 Token 用于员工/部门归属映射（employeeKey=UnionID）。</p>
     <p class="hint">4. 仅在合规确认后配置正文临时获取网关与模型正文传输策略。</p></section>`);
   document.querySelector('#refresh').onclick=diagnostics;
+  document.querySelector('#manual-sync').onclick=async()=>{if(!confirm('确认触发一次增量同步？日常增量已由 watcher 自动处理。'))return;
+    toast('同步已提交…');try{const r=await api('/api/v1/sync-runs',{method:'POST'});toast(r.status==='succeeded'?'增量同步完成':'同步未成功：'+(r.error_code||'见上方接口状态'))}catch(e){toast(e.message)}};
   const send=document.querySelector('#test-send');
   if(send)send.onclick=async()=>{const uid=document.querySelector('#test-uid').value.trim();if(!uid)return toast('请填写 userId');
     try{await api('/api/v1/notifications/test',{method:'POST',body:JSON.stringify({user_id:uid})});toast('已发送，请在钉钉查收')}catch(e){toast(e.message)}}}

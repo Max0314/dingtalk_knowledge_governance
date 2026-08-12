@@ -190,7 +190,9 @@ class HistoricalFileNode(Base):
     """Metadata only: no document body, attachment bytes, or extracted content."""
     __tablename__ = "historical_file_nodes"
     __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "node_id", name="uq_history_snapshot_node"),
-                      Index("ix_hfn_snapshot_creator", "snapshot_id", "creator_user_id"))
+                      Index("ix_hfn_snapshot_creator", "snapshot_id", "creator_user_id"),
+                      # newest-first paging of the merged document list
+                      Index("ix_hfn_snapshot_created", "snapshot_id", "source_created_at"))
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
