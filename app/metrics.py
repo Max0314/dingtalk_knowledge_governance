@@ -5,10 +5,10 @@ scan) and live documents (filled by incremental sync) are merged by node_id so
 a file is never counted twice. Months attribute by source createTime in
 Asia/Shanghai — the knowledge-base ingestion time.
 
-Bulk-import detection mirrors runtime/build_increment_report.py: a calendar
-day carrying >= BULK_DAY_SHARE of its month with >= BULK_DAY_MIN files is a
-migration event. Bulk files still count — the split annotates the total and
-never subtracts from it.
+Bulk-import classification (identity + person-day signature): robot uploads
+are always bulk; a person creating >= PERSON_DAY_BULK_MIN files in one day
+makes that person-day bulk. Bulk files still count — the split annotates the
+total and never subtracts from it.
 """
 from __future__ import annotations
 
@@ -26,8 +26,9 @@ from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, U
 def robot_ids() -> set[str]:
     return {value.strip() for value in get_settings().robot_user_ids.split(",") if value.strip()}
 
-BULK_DAY_MIN = 200
-BULK_DAY_SHARE = 0.25
+# A person creating this many files in one calendar day is doing a migration,
+# not daily knowledge work. Robots are bulk at any volume.
+PERSON_DAY_BULK_MIN = 200
 CACHE_TTL_SECONDS = 60
 
 _cache: dict[str, Any] = {"stamp": None, "at": 0.0, "value": None}
@@ -59,53 +60,57 @@ def primary_snapshot_id(db: Session) -> str:
 
 
 def _collect(db: Session) -> dict[str, Any]:
-    """One pass over both sources, deduplicated by node_id."""
+    """One pass over both sources, deduplicated by node_id.
+
+    Bulk classification (2026-08-12 rework, no more "bulk day"):
+      * every file created by a robot account counts as bulk import;
+      * a person creating >= PERSON_DAY_BULK_MIN files on one day makes that
+        whole person-day bulk (the migration signature);
+      * everything else is routine — a colleague's 15 normal uploads on a
+        migration day stay routine.
+    """
     baseline = primary_snapshot_id(db)
-    files: dict[str, tuple[str, str]] = {}  # node_id -> (workspace_id, created_at)
-    for workspace_id, node_id, created in db.execute(
-            select(HistoricalFileNode.workspace_id, HistoricalFileNode.node_id, HistoricalFileNode.source_created_at)
+    files: dict[str, tuple[str, str, str]] = {}  # node_id -> (workspace_id, created_at, creator)
+    for workspace_id, node_id, created, creator in db.execute(
+            select(HistoricalFileNode.workspace_id, HistoricalFileNode.node_id,
+                   HistoricalFileNode.source_created_at, HistoricalFileNode.creator_user_id)
             .where(HistoricalFileNode.snapshot_id == baseline,
                    HistoricalFileNode.node_type != "folder")):  # the 135-lib scan stores folders too
-        files[node_id] = (workspace_id, created or "")
-    for workspace_id, node_id, created in db.execute(
-            select(Document.workspace_id, Document.node_id, Document.source_created_at)
+        files[node_id] = (workspace_id, created or "", creator or "")
+    for workspace_id, node_id, created, creator in db.execute(
+            select(Document.workspace_id, Document.node_id, Document.source_created_at, Document.uploader_key)
             .where(Document.is_folder.is_(False), Document.is_deleted.is_(False))):
-        files.setdefault(node_id, (workspace_id, created or ""))
+        files.setdefault(node_id, (workspace_id, created or "", creator or ""))
     # A confirmed deletion (watcher/reconciliation soft-delete) overrides the
     # frozen baseline row — totals go down the moment the mirror knows.
     for (node_id,) in db.execute(select(Document.node_id).where(Document.is_deleted.is_(True))):
         files.pop(node_id, None)
 
-    monthly = collections.Counter()
-    month_days: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
-    day_spaces: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    robots = robot_ids()
+    creator_day = collections.Counter()  # (creator, YYYY-MM-DD) -> files
     space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     space_totals = collections.Counter()
-    for workspace_id, created in files.values():
+    for workspace_id, created, creator in files.values():
         space_totals[workspace_id] += 1
-        if len(created) < 7:
+        if len(created) < 10:
             continue
-        month, day = created[:7], created[:10]
-        monthly[month] += 1
-        space_months[workspace_id][month] += 1
-        if len(day) == 10:
-            month_days[month][day] += 1
-            day_spaces[day][workspace_id] += 1
+        space_months[workspace_id][created[:7]] += 1
+        creator_day[(creator, created[:10])] += 1
 
-    bulk_days = []
+    monthly = collections.Counter()
     bulk_by_month = collections.Counter()
-    for month in sorted(month_days):
-        for day, count in sorted(month_days[month].items()):
-            if count >= BULK_DAY_MIN and count / monthly[month] >= BULK_DAY_SHARE:
-                bulk_days.append({"day": day, "files": count, "share_of_month": round(count / monthly[month], 3),
-                                  "workspace_ids": [ws for ws, _ in day_spaces[day].most_common(5)]})
-                bulk_by_month[month] += count
+    for (creator, day), count in creator_day.items():
+        month = day[:7]
+        monthly[month] += count
+        if creator in robots or count >= PERSON_DAY_BULK_MIN:
+            bulk_by_month[month] += count
 
     return {
         "total_files": len(files),
         "monthly": dict(monthly),
         "bulk_by_month": dict(bulk_by_month),
-        "bulk_days": bulk_days,
+        "creator_day": dict(creator_day),
+        "robots": robots,
         "space_totals": dict(space_totals),
         "space_months": {ws: dict(months) for ws, months in space_months.items()},
     }
@@ -137,8 +142,7 @@ def monthly_increments(db: Session, year: str = "") -> dict[str, Any]:
     for month in months:
         total = data["monthly"][month]
         bulk = data["bulk_by_month"].get(month, 0)
-        rows.append({"month": month, "total": total, "bulk_import": bulk, "routine": total - bulk,
-                     "bulk_days": [b for b in data["bulk_days"] if b["day"][:7] == month]})
+        rows.append({"month": month, "total": total, "bulk_import": bulk, "routine": total - bulk})
     yearly: dict[str, dict[str, int]] = {}
     for month, total in data["monthly"].items():
         bucket = yearly.setdefault(month[:4], {"total": 0, "bulk_import": 0, "routine": 0})
@@ -151,15 +155,59 @@ def monthly_increments(db: Session, year: str = "") -> dict[str, Any]:
         "rows": rows,
         "yearly": {y: yearly[y] for y in sorted(yearly)},
         "total_files": data["total_files"],
-        "bulk_day_rule": f"单日 >= {BULK_DAY_MIN} 个文件且占当月 >= {BULK_DAY_SHARE:.0%} 判为批量导入日",
+        "bulk_day_rule": f"批量口径：数字员工导入全量计批量；人工同一人单日 ≥{PERSON_DAY_BULK_MIN} 份计批量",
         "metric_note": "全量为准；批量导入/日常仅拆分构成，不做扣减。月份按钉钉 createTime（Asia/Shanghai）归属。",
         "baseline": context,
         "caveats": [
             "下限口径：扫描前已删除的文件不可观测。",
-            "仅覆盖当前授权可见的知识库，不能表述为全公司。",
+            "覆盖服务身份已加入的知识库。",
             "createTime 是知识库入库时间，不是原文件的创建时间。",
         ],
     }
+
+
+def increments_tree(db: Session, year: str = "", month: str = "", department: str = "",
+                    biz_group: str = "", person: str = "") -> dict[str, Any]:
+    """Year -> month -> day drill over the cached creator-day counters — no
+    extra SQL beyond the shared 60-second collect cache (plus one small
+    employee_map read when a people filter is active)."""
+    data = collected(db)
+    robots = data["robots"]
+    creators: set[str] | None = None
+    filter_label = ""
+    if department or biz_group or person:
+        rows = db.scalars(select(EmployeeMap)).all()
+        picked = [row for row in rows
+                  if (not department or department in (row.department_name or ""))
+                  and (not biz_group or biz_group in (row.biz_group_name or ""))
+                  and (not person or person in (row.name or "") or person == row.user_id)]
+        creators = {row.user_id for row in picked}
+        parts = [part for part in (department, biz_group, person) if part]
+        filter_label = " / ".join(parts) + f"（{len(picked)} 人）"
+    buckets: dict[str, list[int]] = {}
+    for (creator, day), count in data["creator_day"].items():
+        if creators is not None and creator not in creators:
+            continue
+        if month:
+            if not day.startswith(month):
+                continue
+            key = day
+        elif year:
+            if not day.startswith(year):
+                continue
+            key = day[:7]
+        else:
+            key = day[:4]
+        bucket = buckets.setdefault(key, [0, 0])
+        bucket[0] += count
+        if creator in robots or count >= PERSON_DAY_BULK_MIN:
+            bucket[1] += count
+    level = "day" if month else ("month" if year else "year")
+    keys = sorted(buckets, reverse=(level == "year"))  # recent years on top
+    return {"level": level, "year": year, "month": month, "filter_label": filter_label,
+            "person_day_bulk_min": PERSON_DAY_BULK_MIN,
+            "rows": [{"key": key, "total": buckets[key][0], "bulk": buckets[key][1],
+                      "routine": buckets[key][0] - buckets[key][1]} for key in keys]}
 
 
 def coverage(db: Session) -> dict[str, Any]:

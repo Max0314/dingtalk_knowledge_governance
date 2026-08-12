@@ -117,6 +117,44 @@ def test_connectivity_never_claims_unconfigured_integrations_are_healthy():
         assert statuses["钉钉知识库"] == "not_configured"
 
 
+def test_bulk_classification_and_increments_tree(monkeypatch):
+    from app import metrics
+    from app.config import get_settings
+    from app.db import Document, SessionLocal
+
+    monkeypatch.setattr(metrics, "PERSON_DAY_BULK_MIN", 3)
+    os.environ["KG_ROBOT_USER_IDS"] = "r-bot"
+    get_settings.cache_clear()
+    try:
+        with TestClient(app) as client:
+            with SessionLocal() as db:
+                db.query(Document).filter(Document.node_id.like("bulk-t-%")).delete(synchronize_session=False)
+                rows = [Document(node_id="bulk-t-r", workspace_id="demo-workspace", name="机器人导入.docx",
+                                 uploader_key="r-bot", source_created_at="2030-05-10", file_class="document")]
+                rows += [Document(node_id=f"bulk-t-h{i}", workspace_id="demo-workspace", name=f"搬家{i}.docx",
+                                  uploader_key="h-mover", source_created_at="2030-05-11", file_class="document")
+                         for i in range(3)]
+                rows.append(Document(node_id="bulk-t-n", workspace_id="demo-workspace", name="正常上传.docx",
+                                     uploader_key="h-normal", source_created_at="2030-05-11", file_class="document"))
+                db.add_all(rows); db.commit()
+                metrics._cache.update(stamp=None, at=0)
+            months = client.get("/api/v1/metrics/increments/tree", params={"year": "2030"}).json()
+            row = next(r for r in months["rows"] if r["key"] == "2030-05")
+            # robot(1) + mover person-day of 3 = bulk 4; the single normal upload stays routine
+            assert row["total"] == 5 and row["bulk"] == 4 and row["routine"] == 1
+            years = client.get("/api/v1/metrics/increments/tree").json()
+            assert years["level"] == "year" and years["rows"][0]["key"] == "2030"  # recent years on top
+            days = client.get("/api/v1/metrics/increments/tree", params={"month": "2030-05"}).json()
+            assert {r["key"]: r["bulk"] for r in days["rows"]} == {"2030-05-10": 1, "2030-05-11": 3}
+            with SessionLocal() as db:
+                db.query(Document).filter(Document.node_id.like("bulk-t-%")).delete(synchronize_session=False)
+                db.commit()
+                metrics._cache.update(stamp=None, at=0)
+    finally:
+        os.environ.pop("KG_ROBOT_USER_IDS", None)
+        get_settings.cache_clear()
+
+
 def test_soft_deleted_document_leaves_the_headline_total():
     from app import metrics
     from app.db import Document, SessionLocal

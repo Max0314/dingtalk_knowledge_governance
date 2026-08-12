@@ -145,6 +145,18 @@ def metrics_coverage(db: Session = Depends(db_session)):
     return metrics.coverage(db)
 
 
+@app.get("/api/v1/metrics/increments/tree")
+def metrics_increments_tree(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
+                            month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                            department: str = "", biz_group: str = "", person: str = "",
+                            db: Session = Depends(db_session)):
+    """Drillable increment composition: no params -> years (recent first);
+    year -> its months; month -> its days. People filters narrow the
+    population via the bi_center employee cache."""
+    return metrics.increments_tree(db, year=year, month=month, department=department,
+                                   biz_group=biz_group, person=person)
+
+
 @app.get("/api/v1/metrics/workspaces/{workspace_id}/months")
 def metrics_workspace_months(workspace_id: str, db: Session = Depends(db_session)):
     return metrics.workspace_months(db, workspace_id)
