@@ -11,8 +11,9 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from . import metrics, orgmap
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
+from .scoring import RULE_VERSION, catalog_dict, effective_config
 from .service import document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -85,6 +86,18 @@ class ModelRequest(BaseModel):
     timeout_seconds: int = Field(default=30, ge=1, le=120)
     enabled: bool = False
     version: str = "v1"
+
+
+class RuleConfigRequest(BaseModel):
+    config: dict = Field(default_factory=dict)
+
+
+class RuleDepartmentCreateRequest(BaseModel):
+    department_name: str = Field(min_length=1, max_length=255)
+
+
+class RuleEditorsRequest(BaseModel):
+    editors: list[dict] = Field(default_factory=list, max_length=50)
 
 
 @app.get("/api/health")
@@ -369,7 +382,8 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
                        "workspace_id": d.workspace_id, "uploader_name": d.uploader_name,
                        "department_name": d.department_name, "ai_score": round(r.ai_score, 1),
                        "verdict": r.verdict, "review_scope": r.review_scope, "trigger": r.trigger,
-                       "rule_version": r.rule_version, "created_at": r.created_at.isoformat() if r.created_at else None}
+                       "rule_version": r.rule_version, "rule_config_ref": r.rule_config_ref,
+                       "created_at": r.created_at.isoformat() if r.created_at else None}
                       for r, d in rows]}
 
 
@@ -656,6 +670,216 @@ async def model_check(config_id: int, db: Session = Depends(db_session)):
     return await model_connection_check({"enabled": item.enabled, "base_url": item.base_url, "model_name": item.model_name,
                                          "api_key": item.api_key, "api_key_env_name": item.api_key_env_name,
                                          "timeout_seconds": item.timeout_seconds}, get_settings())
+
+
+# ---------------------------------------------------------------------------
+# Scoring rule configuration: global default + per-department overrides.
+# Viewing is open to every logged-in user (评分标准透明); editing requires the
+# global admin list or, for a department row, its registered 维护人.
+# ---------------------------------------------------------------------------
+
+def _rule_identity(request: Request) -> dict:
+    """Admin follows require_admin semantics; with auth off everything is open."""
+    settings = get_settings()
+    if not settings.auth_enabled:
+        return {"union_id": "", "name": settings.default_actor, "is_admin": True}
+    user = getattr(request.state, "user", None) or {}
+    admins = {token.strip() for token in settings.admin_union_ids.split(",") if token.strip()}
+    return {"union_id": user.get("union_id", ""), "name": user.get("name", ""),
+            "is_admin": user.get("union_id", "") in admins}
+
+
+def _rule_actor(identity: dict) -> str:
+    return identity["name"] or identity["union_id"] or get_settings().default_actor
+
+
+def _is_rule_editor(row: ScoringRuleConfig, union_id: str) -> bool:
+    return bool(union_id) and any((e or {}).get("union_id") == union_id for e in (row.editors or []))
+
+
+def _require_rule_edit(row: ScoringRuleConfig, identity: dict) -> None:
+    if identity["is_admin"]:
+        return
+    if row.scope == "department" and _is_rule_editor(row, identity["union_id"]):
+        return
+    raise HTTPException(403, "仅管理员可修改全局规则；部门规则还需是该部门登记的维护人。")
+
+
+def _rule_history(db: Session, row: ScoringRuleConfig, action: str, saved_by: str) -> None:
+    db.add(ScoringRuleConfigHistory(config_id=row.id, action=action, saved_by=saved_by,
+                                    snapshot={"scope": row.scope, "department_name": row.department_name,
+                                              "config": row.config, "editors": row.editors, "version": row.version}))
+
+
+def _rule_row_dict(row: ScoringRuleConfig) -> dict:
+    return {"config_id": row.id, "scope": row.scope, "department_name": row.department_name,
+            "config": effective_config(row.config), "editors": row.editors or [], "version": row.version,
+            "updated_by": row.updated_by, "updated_at": row.updated_at.isoformat() if row.updated_at else None}
+
+
+def _department_row(db: Session, department_name: str) -> ScoringRuleConfig:
+    row = db.scalar(select(ScoringRuleConfig).where(ScoringRuleConfig.scope == "department",
+                                                    ScoringRuleConfig.department_name == department_name))
+    if not row:
+        raise HTTPException(404, "该部门尚无独立规则配置。")
+    return row
+
+
+def _sanitize_editors(raw: list[dict]) -> list[dict]:
+    editors, seen = [], set()
+    for item in raw:
+        union_id = str((item or {}).get("union_id", "")).strip()[:128]
+        if not union_id or union_id in seen:
+            continue
+        seen.add(union_id)
+        editors.append({"union_id": union_id, "name": str((item or {}).get("name", "")).strip()[:128]})
+    return editors
+
+
+@app.get("/api/v1/scoring-rules")
+def scoring_rules(request: Request, db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    rows = db.scalars(select(ScoringRuleConfig).order_by(ScoringRuleConfig.department_name)).all()
+    global_row = next((r for r in rows if r.scope == "global"), None)
+    departments = [r for r in rows if r.scope == "department"]
+    candidates = {name for (name,) in db.execute(
+        select(func.distinct(EmployeeMap.department_name)).where(EmployeeMap.matched.is_(True))).all()
+        if name and name != "未映射"} | {d.department_name for d in departments}
+    editable = [d.department_name for d in departments if _is_rule_editor(d, identity["union_id"])]
+    return {
+        "rule_version": RULE_VERSION,
+        "catalog": catalog_dict(),
+        "defaults": effective_config(None),
+        "settings_rule_weight": get_settings().score_rule_weight,
+        "global": _rule_row_dict(global_row) if global_row else
+                  {"config_id": None, "scope": "global", "department_name": "", "config": effective_config(None),
+                   "editors": [], "version": 0, "updated_by": "", "updated_at": None},
+        "departments": [_rule_row_dict(d) for d in departments],
+        "department_candidates": sorted(candidates),
+        "permissions": {"is_admin": identity["is_admin"], "union_id": identity["union_id"],
+                        "editable_departments": editable},
+        "match_note": "评审时按上传人一级部门（bi_center 归属）匹配部门规则；无部门配置回落全局默认，再回落内置 V1.1。规则修改仅影响之后的评审。",
+    }
+
+
+@app.put("/api/v1/scoring-rules/global")
+def save_global_rules(body: RuleConfigRequest, request: Request, db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    if not identity["is_admin"]:
+        raise HTTPException(403, "仅管理员可修改全局评分规则。")
+    actor_name = _rule_actor(identity)
+    row = db.scalar(select(ScoringRuleConfig).where(ScoringRuleConfig.scope == "global"))
+    if row:
+        _rule_history(db, row, "update", actor_name)
+        row.version += 1
+    else:
+        row = ScoringRuleConfig(scope="global", department_name="", version=1)
+        db.add(row)
+    row.config = effective_config(body.config)
+    row.updated_by = actor_name
+    db.flush()
+    if row.version == 1:
+        _rule_history(db, row, "create", actor_name)
+    db.commit()
+    return _rule_row_dict(row)
+
+
+@app.post("/api/v1/scoring-rules/departments", status_code=201)
+def create_department_rules(body: RuleDepartmentCreateRequest, request: Request, db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    if not identity["is_admin"]:
+        raise HTTPException(403, "仅管理员可为部门创建独立规则。")
+    name = body.department_name.strip()
+    if not name or name == "未映射":
+        raise HTTPException(400, "部门名称无效。")
+    if db.scalar(select(ScoringRuleConfig).where(ScoringRuleConfig.scope == "department",
+                                                 ScoringRuleConfig.department_name == name)):
+        raise HTTPException(409, "该部门已有独立规则配置。")
+    actor_name = _rule_actor(identity)
+    global_row = db.scalar(select(ScoringRuleConfig).where(ScoringRuleConfig.scope == "global"))
+    # A department starts as a full copy of today's global effective config, so
+    # later global edits never silently shift a department that opted out.
+    row = ScoringRuleConfig(scope="department", department_name=name,
+                            config=effective_config(global_row.config if global_row else None),
+                            editors=[], version=1, updated_by=actor_name)
+    db.add(row)
+    db.flush()
+    _rule_history(db, row, "create", actor_name)
+    db.commit()
+    return _rule_row_dict(row)
+
+
+@app.put("/api/v1/scoring-rules/departments/{department_name}")
+def save_department_rules(department_name: str, body: RuleConfigRequest, request: Request,
+                          db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    row = _department_row(db, department_name)
+    _require_rule_edit(row, identity)
+    actor_name = _rule_actor(identity)
+    _rule_history(db, row, "update", actor_name)
+    row.config = effective_config(body.config)
+    row.version += 1
+    row.updated_by = actor_name
+    db.commit()
+    return _rule_row_dict(row)
+
+
+@app.put("/api/v1/scoring-rules/departments/{department_name}/editors")
+def save_department_editors(department_name: str, body: RuleEditorsRequest, request: Request,
+                            db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    if not identity["is_admin"]:
+        raise HTTPException(403, "仅管理员可指定部门规则维护人。")
+    row = _department_row(db, department_name)
+    actor_name = _rule_actor(identity)
+    _rule_history(db, row, "update", actor_name)
+    row.editors = _sanitize_editors(body.editors)
+    row.version += 1
+    row.updated_by = actor_name
+    db.commit()
+    return _rule_row_dict(row)
+
+
+@app.delete("/api/v1/scoring-rules/departments/{department_name}")
+def delete_department_rules(department_name: str, request: Request, db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    if not identity["is_admin"]:
+        raise HTTPException(403, "仅管理员可删除部门规则。")
+    row = _department_row(db, department_name)
+    _rule_history(db, row, "delete", _rule_actor(identity))
+    db.delete(row)
+    db.commit()
+    return {"deleted": department_name, "fallback": "global"}
+
+
+@app.get("/api/v1/scoring-rules/{config_id}/history")
+def scoring_rule_history(config_id: int, db: Session = Depends(db_session)):
+    rows = db.scalars(select(ScoringRuleConfigHistory).where(ScoringRuleConfigHistory.config_id == config_id)
+                      .order_by(ScoringRuleConfigHistory.saved_at.desc()).limit(30)).all()
+    return {"items": [{"id": h.id, "action": h.action, "saved_by": h.saved_by,
+                       "saved_at": h.saved_at.isoformat() if h.saved_at else None,
+                       "version": (h.snapshot or {}).get("version"),
+                       "scope": (h.snapshot or {}).get("scope", ""),
+                       "department_name": (h.snapshot or {}).get("department_name", "")} for h in rows]}
+
+
+@app.post("/api/v1/scoring-rules/{config_id}/rollback/{history_id}")
+def scoring_rule_rollback(config_id: int, history_id: int, request: Request, db: Session = Depends(db_session)):
+    identity = _rule_identity(request)
+    row = db.get(ScoringRuleConfig, config_id)
+    entry = db.get(ScoringRuleConfigHistory, history_id)
+    if not row or not entry or entry.config_id != config_id:
+        raise HTTPException(404, "配置或历史记录不存在。")
+    _require_rule_edit(row, identity)
+    actor_name = _rule_actor(identity)
+    _rule_history(db, row, "update", actor_name)
+    # Restore rule parameters only — editor lists stay admin-managed.
+    row.config = effective_config((entry.snapshot or {}).get("config"))
+    row.version += 1
+    row.updated_by = actor_name
+    _rule_history(db, row, "rollback", actor_name)
+    db.commit()
+    return {"config_id": row.id, "rolled_back_to": history_id, "version": row.version}
 
 
 @app.get("/api/v1/diagnostics/connectivity", dependencies=[Depends(require_admin)])

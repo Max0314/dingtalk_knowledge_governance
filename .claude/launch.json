@@ -4,8 +4,9 @@
     {
       "name": "kg-dev",
       "runtimeExecutable": "C:\\Users\\陈鹏列\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe",
-      "runtimeArgs": ["scripts/dev_server.py", "--port", "39027"],
-      "port": 39027
+      "runtimeArgs": ["scripts/dev_server.py"],
+      "port": 39027,
+      "autoPort": true
     }
   ]
 }

@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import Settings
-from .db import Document, ModelConfig, ReviewInstance, ReviewJob, SyncRun, Workspace, WorkspaceRole, utcnow
+from .db import Document, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, Workspace, WorkspaceRole, utcnow
 from .fileclass import classify, review_classes
 from .integrations import ADVISORY_GENRES, BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
-from .scoring import PASS_SCORE, RETURN_SCORE, RULE_VERSION, score_document
+from .scoring import RULE_VERSION, effective_config, score_document, verdict_for
 
 
 def iso(value):
@@ -23,7 +23,7 @@ def robot_keys(settings: Settings) -> set[str]:
 
 
 def review_dict(review: ReviewInstance, rerun_count: int = 0) -> dict:
-    return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "review_scope": review.review_scope, "rule_version": review.rule_version, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
+    return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "review_scope": review.review_scope, "rule_version": review.rule_version, "rule_config_ref": review.rule_config_ref, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
 
 
 def document_dict(doc: Document, review: ReviewInstance | None = None, rerun_count: int = 0) -> dict:
@@ -41,6 +41,22 @@ def workspace_dict(ws: Workspace, db: Session) -> dict:
 
 def active_model(db: Session) -> ModelConfig | None:
     return db.scalar(select(ModelConfig).where(ModelConfig.enabled.is_(True)).order_by(ModelConfig.updated_at.desc()))
+
+
+def resolve_rule_config(db: Session, department_name: str = "") -> ScoringRuleConfig | None:
+    """Uploader's 一级部门 override first, then the global row, else None
+    (builtin V1.1 defaults). "未映射" never matches a department row."""
+    row = None
+    if department_name and department_name != "未映射":
+        row = db.scalar(select(ScoringRuleConfig).where(ScoringRuleConfig.scope == "department",
+                                                        ScoringRuleConfig.department_name == department_name))
+    return row or db.scalar(select(ScoringRuleConfig).where(ScoringRuleConfig.scope == "global"))
+
+
+def rule_config_ref(row: ScoringRuleConfig | None) -> str:
+    if not row:
+        return "builtin"
+    return f"department:{row.department_name}@v{row.version}" if row.scope == "department" else f"global@v{row.version}"
 
 
 def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual") -> ReviewInstance:
@@ -63,7 +79,9 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
             except (IntegrationError, RuntimeError):
                 content = ""
         scope = "full_content" if content else "metadata_only"
-    result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n", doc.file_class or "document")
+    rule_row = resolve_rule_config(db, doc.department_name)
+    rule_cfg = effective_config(rule_row.config if rule_row else None)
+    result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n", doc.file_class or "document", rule_cfg)
     model = active_model(db)
     if content and model and settings.model_allow_content_transfer:
         model_result = asyncio.run(model_score_content({"base_url": model.base_url, "model_name": model.model_name,
@@ -86,7 +104,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
             rule_score = 100 - sum(dim["deduction"] for dim in result["dimensions"].values()
                                    if not dim.get("advisory"))
             model_score = model_result["score"]
-            weight = min(max(settings.score_rule_weight, 0.0), 1.0)
+            configured_weight = rule_cfg.get("rule_weight")
+            weight = min(max(configured_weight if configured_weight is not None else settings.score_rule_weight, 0.0), 1.0)
             composite = round(weight * rule_score + (1 - weight) * model_score)
             result["findings"].extend(model_result["findings"])
             result["dimensions"]["model"] = {
@@ -97,11 +116,10 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
                 "findings": model_result["findings"],
             }
             result["ai_score"] = composite
-            result["verdict"] = ("pass" if composite >= PASS_SCORE
-                                 else "manual_review" if composite >= RETURN_SCORE else "return")
+            result["verdict"] = verdict_for(composite, rule_cfg)
     instance = ReviewInstance(
         review_instance_id=str(uuid.uuid4()), node_id=node_id, ai_score=result["ai_score"], verdict=result["verdict"],
-        review_scope=scope, rule_version=RULE_VERSION,
+        review_scope=scope, rule_version=RULE_VERSION, rule_config_ref=rule_config_ref(rule_row),
         model_config_version=(model.version if model and content and settings.model_allow_content_transfer else "rule-engine"), trigger=trigger,
         content_fingerprint=result["fingerprint"], dimensions=result["dimensions"], findings=result["findings"],
     )

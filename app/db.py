@@ -94,6 +94,9 @@ class ReviewInstance(Base):
     verdict: Mapped[str] = mapped_column(String(32))
     review_scope: Mapped[str] = mapped_column(String(32))  # full_content | metadata_only
     rule_version: Mapped[str] = mapped_column(String(32), default="V1.1")
+    # Which parameter set scored this instance: "builtin"、"global@v3" or
+    # "department:研发中心@v2" — reviews stay traceable across rule edits.
+    rule_config_ref: Mapped[str] = mapped_column(String(160), default="")
     model_config_version: Mapped[str] = mapped_column(String(64), default="rule-engine")
     trigger: Mapped[str] = mapped_column(String(32), default="manual")
     content_fingerprint: Mapped[str] = mapped_column(String(128), default="")
@@ -166,6 +169,40 @@ class ModelConfigHistory(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     config_id: Mapped[int] = mapped_column(Integer, index=True)
     action: Mapped[str] = mapped_column(String(32), default="update")  # create | update | rollback
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    saved_by: Mapped[str] = mapped_column(String(128), default="")
+    saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ScoringRuleConfig(Base):
+    """Parameter overrides for the V1.1 rule engine (app.scoring.RULE_CATALOG).
+
+    One row with scope="global" is the org default; scope="department" rows are
+    full independent copies keyed by the bi_center 一级部门名称 — an uploader's
+    department picks its row at review time, falling back to global, then to
+    builtin defaults. ``config`` stores a complete effective_config() dict so a
+    later change to the global row never silently shifts a department's rules.
+    ``editors`` ([{"union_id","name"}]) lists who may edit a department row
+    besides global admins.
+    """
+    __tablename__ = "scoring_rule_configs"
+    __table_args__ = (UniqueConstraint("scope", "department_name", name="uq_rule_scope_department"),)
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    scope: Mapped[str] = mapped_column(String(32), default="global")  # global | department
+    department_name: Mapped[str] = mapped_column(String(255), default="")
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    editors: Mapped[list] = mapped_column(JSON, default=list)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    updated_by: Mapped[str] = mapped_column(String(128), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ScoringRuleConfigHistory(Base):
+    """Pre-change snapshots of scoring rule configs, enabling audit and rollback."""
+    __tablename__ = "scoring_rule_config_history"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    config_id: Mapped[int] = mapped_column(Integer, index=True)
+    action: Mapped[str] = mapped_column(String(32), default="update")  # create | update | rollback | delete
     snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     saved_by: Mapped[str] = mapped_column(String(128), default="")
     saved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -380,3 +417,22 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
                 raise RuntimeError(f"数据库在 {max_attempts * retry_delay:.0f} 秒内不可达。") from last_error
             time.sleep(retry_delay)
     Base.metadata.create_all(engine)
+    _ensure_columns()
+
+
+# create_all only creates missing tables; columns added to an existing model
+# need an explicit ALTER. Keep this list tiny and append-only.
+EXTRA_COLUMNS = {"review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''"}}
+
+
+def _ensure_columns() -> None:
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    for table, columns in EXTRA_COLUMNS.items():
+        if not inspector.has_table(table):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        for column, ddl in columns.items():
+            if column not in existing:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))

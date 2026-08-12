@@ -318,7 +318,7 @@ async function documentDetail(id){const d=await api('/api/v1/documents/'+id);con
   <section class="card"><div class="detail-header"><div class="document-icon">▤</div><div><h2 style="margin:0">${d.name}</h2><p class="sub">节点 ${d.node_id} · 知识库 ${state.coverageNames[d.workspace_id]||d.workspace_id}</p><div class="detail-meta"><span>上传人：${fmt(d.uploader_name)}</span><span>入库时间：${fmt(d.source_created_at)}</span><span>归属：${fmt(d.department_name)} / ${fmt(d.biz_group_name)}</span><span>重评次数：${d.rerun_count}</span></div></div><div class="big-score">${r&&r.ai_score>0?r.ai_score:'—'}<span>/100</span><br><small>${r?verdictText(r.verdict):'未评审'}</small></div></div></section>
   ${dualBanner}
   <section class="grid deductions section-gap">${ruleDims.map(x=>`<article class="card deduction${x.advisory?' muted':''}"><div class="field-label">${x.label}${x.advisory?' <span class="chip amber">仅提示不计分</span>':''}</div><div class="number">${x.advisory?'<small>该文体不适用</small>':`-${x.deduction}<small> / ${x.cap}</small>`}</div><ul>${x.findings.length?x.findings.map(f=>`<li>${f.message}</li>`).join(''):'<li>未发现扣分项</li>'}</ul></article>`).join('')||'<div class="card muted">暂无评审维度数据</div>'}</section>
-  <section class="card section-gap"><h2>评审记录</h2>${d.reviews.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>实例 ID</th><th class="num">分数</th><th>范围</th><th>触发</th><th>规则版本</th><th>时间</th></tr></thead><tbody>${d.reviews.map(x=>`<tr><td><small>${x.review_instance_id}</small></td><td class="num score ${scoreClass(x.ai_score)}">${x.ai_score}</td><td>${x.review_scope==='full_content'?'完整正文':'元数据合规'}</td><td>${x.trigger}</td><td>${x.rule_version}</td><td>${(x.created_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无记录</p>'}
+  <section class="card section-gap"><h2>评审记录</h2>${d.reviews.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>实例 ID</th><th class="num">分数</th><th>范围</th><th>触发</th><th>规则版本</th><th>时间</th></tr></thead><tbody>${d.reviews.map(x=>`<tr><td><small>${x.review_instance_id}</small></td><td class="num score ${scoreClass(x.ai_score)}">${x.ai_score}</td><td>${x.review_scope==='full_content'?'完整正文':'元数据合规'}</td><td>${x.trigger}</td><td>${x.rule_version}${x.rule_config_ref&&x.rule_config_ref!=='builtin'?`<br><small style="color:#9ca3af">${x.rule_config_ref}</small>`:''}</td><td>${(x.created_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无记录</p>'}
   <div class="section-gap"><button class="primary" id="rerun">重新评审</button><button class="secondary" id="back" style="margin-left:8px">返回</button></div></section>`);
   document.querySelector('#back').onclick=()=>goBack('documents');
   document.querySelector('#rerun').onclick=async()=>{const j=await api('/api/v1/documents/'+id+'/reviews',{method:'POST',body:JSON.stringify({trigger:'manual_rerun'})});toast('已提交评审任务 '+j.job_id.slice(0,8))}}
@@ -457,6 +457,80 @@ async function diagnostics(){const[d,n]=await Promise.all([api('/api/v1/diagnost
   if(send)send.onclick=async()=>{const uid=document.querySelector('#test-uid').value.trim();if(!uid)return toast('请填写 userId');
     try{await api('/api/v1/notifications/test',{method:'POST',body:JSON.stringify({user_id:uid})});toast('已发送，请在钉钉查收')}catch(e){toast(e.message)}}}
 
+/* ---- 评分规则配置：全局默认 + 部门覆盖，参数级编辑 ---- */
+function rcDimsHtml(cat,cfg,canEdit){const dis=canEdit?'':'disabled';
+  return cat.map(dm=>{const dc=(cfg.dimensions||{})[dm.key]||{cap:dm.cap,rules:{}};
+    return `<section class="card section-gap"><div class="card-head"><h2>${dm.label}</h2><span class="controls" style="gap:8px"><label class="rc-par">维度扣分上限<input class="input rc-num" type="number" min="0" max="100" data-cap="${dm.key}" value="${dc.cap}" ${dis}></label>${dm.document_only?'<span class="chip gray" title="表格类文件（sheet）不参与该维度评分">表格类不适用</span>':''}</span></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th style="width:52px">启用</th><th>规则</th><th class="num" style="width:92px">扣分</th><th class="num" style="width:92px">规则上限</th><th>检测参数</th></tr></thead><tbody>
+    ${dm.rules.map(r=>{const rc=dc.rules[r.key]||{enabled:true,points:r.points,max:r.max,params:{}};
+      return `<tr class="${rc.enabled?'':'rc-off'}"><td><input type="checkbox" data-rule="${dm.key}|${r.key}|enabled" ${rc.enabled?'checked':''} ${dis}></td>
+      <td><b>${r.key}</b> ${r.label}${r.count_type?'<br><small style="color:#9ca3af">按出现次数累计扣分</small>':''}</td>
+      <td class="num"><input class="input rc-num" type="number" min="0" max="100" data-rule="${dm.key}|${r.key}|points" value="${rc.points}" ${dis}></td>
+      <td class="num">${r.count_type?`<input class="input rc-num" type="number" min="0" max="100" data-rule="${dm.key}|${r.key}|max" value="${rc.max??r.max}" ${dis}>`:'—'}</td>
+      <td>${r.params.length?r.params.map(p=>`<label class="rc-par">${p.label}<input class="input rc-num" type="number" min="${p.min}" max="${p.max}" data-par="${dm.key}|${r.key}|${p.key}" value="${(rc.params||{})[p.key]??p.default}" ${dis}></label>`).join(' '):'—'}</td></tr>`}).join('')}
+    </tbody></table></div></section>`}).join('')}
+
+async function rules(){const d=await api('/api/v1/scoring-rules');
+  const st=state.rc=state.rc||{dept:''};
+  if(st.dept&&!d.departments.find(x=>x.department_name===st.dept))st.dept='';
+  const perm=d.permissions,cur=st.dept?d.departments.find(x=>x.department_name===st.dept):d.global;
+  const canEdit=perm.is_admin||(!!st.dept&&perm.editable_departments.includes(st.dept));
+  const cfg=cur.config,dis=canEdit?'':'disabled';
+  const chips=[`<button class="${st.dept?'secondary':'primary'}" data-rcscope="">全局默认</button>`]
+    .concat(d.departments.map(x=>`<button class="${st.dept===x.department_name?'primary':'secondary'}" data-rcscope="${x.department_name}">${x.department_name}</button>`)).join('');
+  const addBox=perm.is_admin?`<input class="input" id="rc-newdept" list="rc-cands" placeholder="部门名称（bi_center 口径）" style="width:190px"><datalist id="rc-cands">${d.department_candidates.filter(n=>!d.departments.find(x=>x.department_name===n)).map(n=>`<option value="${n}">`).join('')}</datalist><button class="secondary" id="rc-adddept">＋ 新建部门规则</button>`:'';
+  const metaLine=cur.config_id?`当前版本 v${cur.version} · 最近由 ${cur.updated_by||'—'} 于 ${(cur.updated_at||'').replace('T',' ').slice(0,16)} 修改`:'尚未保存过：当前生效的是内置 V1.1 默认参数';
+  const editorsBox=st.dept?`<div class="controls" style="flex-wrap:wrap;gap:8px;margin-top:10px"><span class="field-label">规则维护人</span>${perm.is_admin?`<input class="input" id="rc-editors" style="flex:1;min-width:260px" placeholder="unionId:姓名, unionId:姓名（逗号分隔）" value="${(cur.editors||[]).map(e=>e.union_id+(e.name?':'+e.name:'')).join(', ')}"><button class="secondary" id="rc-editors-save">保存维护人</button>`:`<span class="hint">${(cur.editors||[]).map(e=>e.name||e.union_id).join('、')||'未指定（仅全局管理员可修改本部门规则）'}</span>`}</div>`:'';
+  shell('评分规则配置',d.match_note,`
+  <section class="card"><div class="controls" style="flex-wrap:wrap;gap:8px">${chips}<span style="flex:1"></span>${addBox}</div></section>
+  <section class="card section-gap"><div class="card-head"><h2>${st.dept?st.dept+' · 部门规则':'全局默认规则'}</h2><div class="controls" style="flex-wrap:wrap;gap:8px">
+    ${canEdit?`<button class="secondary" id="rc-fill-default">填入内置默认</button>${st.dept?'<button class="secondary" id="rc-fill-global">填入全局当前值</button>':''}`:''}
+    ${cur.config_id?'<button class="secondary" id="rc-history-btn">历史</button>':''}
+    ${st.dept&&perm.is_admin?'<button class="secondary" id="rc-delete">删除部门配置</button>':''}
+    ${canEdit?'<button class="primary" id="rc-save">保存</button>':'<span class="chip gray">只读</span>'}
+  </div></div>
+  <p class="hint">${metaLine}${st.dept?'':' · 未建独立规则的部门与未映射人员按此配置评分'}</p>
+  <div class="controls" style="flex-wrap:wrap;gap:14px;margin-top:6px">
+    <label class="rc-par">通过线（分数 ≥ 为通过）<input class="input rc-num" type="number" min="0" max="100" id="rc-pass" value="${cfg.pass_score}" ${dis}></label>
+    <label class="rc-par">退回线（低于则退回，两线之间待人工审核）<input class="input rc-num" type="number" min="0" max="100" id="rc-return" value="${cfg.return_score}" ${dis}></label>
+    <label class="rc-par">规则分权重%（与模型内容分合成）<input class="input rc-num" type="number" min="0" max="100" id="rc-weight" placeholder="默认 ${Math.round(d.settings_rule_weight*100)}" value="${cfg.rule_weight==null?'':Math.round(cfg.rule_weight*100)}" ${dis}></label>
+  </div>${editorsBox}
+  <div id="rc-history" class="section-gap"></div></section>
+  <div id="rc-dims">${rcDimsHtml(d.catalog,cfg,canEdit)}</div>`);
+  const bindOff=()=>document.querySelectorAll('#rc-dims input[type=checkbox][data-rule]').forEach(cb=>cb.onchange=()=>cb.closest('tr').classList.toggle('rc-off',!cb.checked));
+  bindOff();
+  document.querySelectorAll('[data-rcscope]').forEach(b=>b.onclick=()=>{st.dept=b.dataset.rcscope;rules()});
+  const add=document.querySelector('#rc-adddept');
+  if(add)add.onclick=async()=>{const name=document.querySelector('#rc-newdept').value.trim();if(!name)return toast('请填写部门名称');
+    try{await api('/api/v1/scoring-rules/departments',{method:'POST',body:JSON.stringify({department_name:name})});st.dept=name;toast('已创建：初始值为全局当前参数');rules()}catch(e){toast(e.message)}};
+  function rcCollect(){const wv=document.querySelector('#rc-weight').value.trim();
+    const out={pass_score:+document.querySelector('#rc-pass').value,return_score:+document.querySelector('#rc-return').value,rule_weight:wv===''?null:+wv/100,dimensions:{}};
+    document.querySelectorAll('[data-cap]').forEach(i=>out.dimensions[i.dataset.cap]={cap:+i.value,rules:{}});
+    document.querySelectorAll('[data-rule]').forEach(i=>{const[dk,rk,f]=i.dataset.rule.split('|');const dim=out.dimensions[dk];if(!dim)return;const r=dim.rules[rk]=dim.rules[rk]||{};if(f==='enabled')r.enabled=i.checked;else r[f]=+i.value});
+    document.querySelectorAll('[data-par]').forEach(i=>{const[dk,rk,pk]=i.dataset.par.split('|');const r=(out.dimensions[dk]||{rules:{}}).rules[rk];if(r)(r.params=r.params||{})[pk]=+i.value});
+    return out}
+  const save=document.querySelector('#rc-save');
+  if(save)save.onclick=async()=>{try{const url=st.dept?'/api/v1/scoring-rules/departments/'+encodeURIComponent(st.dept):'/api/v1/scoring-rules/global';
+    await api(url,{method:'PUT',body:JSON.stringify({config:rcCollect()})});toast('已保存，之后的评审按新参数执行');rules()}catch(e){toast(e.message)}};
+  const fillFrom=g=>{document.querySelector('#rc-dims').innerHTML=rcDimsHtml(d.catalog,g,canEdit);bindOff();
+    document.querySelector('#rc-pass').value=g.pass_score;document.querySelector('#rc-return').value=g.return_score;
+    document.querySelector('#rc-weight').value=g.rule_weight==null?'':Math.round(g.rule_weight*100);toast('已填入，保存后生效')};
+  const fd=document.querySelector('#rc-fill-default');if(fd)fd.onclick=()=>fillFrom(d.defaults);
+  const fg=document.querySelector('#rc-fill-global');if(fg)fg.onclick=()=>fillFrom(d.global.config);
+  const del=document.querySelector('#rc-delete');
+  if(del)del.onclick=async()=>{if(!confirm(`删除「${st.dept}」的独立规则？该部门将回落使用全局默认。`))return;
+    try{await api('/api/v1/scoring-rules/departments/'+encodeURIComponent(st.dept),{method:'DELETE'});toast('已删除');st.dept='';rules()}catch(e){toast(e.message)}};
+  const ed=document.querySelector('#rc-editors-save');
+  if(ed)ed.onclick=async()=>{const editors=document.querySelector('#rc-editors').value.split(/[,，;；]+/).map(s=>s.trim()).filter(Boolean).map(s=>{const[i,n]=s.split(/[:：]/);return{union_id:(i||'').trim(),name:(n||'').trim()}});
+    try{await api('/api/v1/scoring-rules/departments/'+encodeURIComponent(st.dept)+'/editors',{method:'PUT',body:JSON.stringify({editors})});toast('维护人已更新');rules()}catch(e){toast(e.message)}};
+  const hb=document.querySelector('#rc-history-btn');
+  if(hb)hb.onclick=async()=>{const h=await api('/api/v1/scoring-rules/'+cur.config_id+'/history');
+    document.querySelector('#rc-history').innerHTML=`<div class="table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>动作</th><th>操作人</th><th class="num">版本</th><th></th></tr></thead><tbody>
+    ${h.items.map(it=>`<tr><td><small>${(it.saved_at||'').replace('T',' ').slice(0,16)}</small></td><td><span class="badge">${{create:'创建',update:'修改前留档',rollback:'回滚后',delete:'删除前留档'}[it.action]||it.action}</span></td><td>${it.saved_by||'—'}</td><td class="num">v${it.version??'—'}</td><td>${canEdit?`<button class="secondary" data-rcrb="${it.id}">回滚到此</button>`:''}</td></tr>`).join('')||'<tr><td colspan="5"><div class="empty">暂无历史</div></td></tr>'}
+    </tbody></table></div>`;
+    document.querySelectorAll('[data-rcrb]').forEach(r=>r.onclick=async()=>{if(!confirm('回滚到该历史版本的规则参数？当前状态会先留档。'))return;
+      try{await api('/api/v1/scoring-rules/'+cur.config_id+'/rollback/'+r.dataset.rcrb,{method:'POST'});toast('已回滚');rules()}catch(e){toast(e.message)}})}}
+
 /* ---- auth gate ---- */
 function renderLogin(){disposeCharts();document.body.classList.remove('sidebar-open');
   app.innerHTML=`<div class="login-wrap"><section class="card login-card"><div class="login-brand"><span class="brand-mark">知</span><div><b>钉钉知识库治理</b><br><small>入库可追溯 · 质量可评审 · 增量可统计</small></div></div>
@@ -474,7 +548,7 @@ function renderUser(u){const box=document.querySelector('#userBox');if(!box)retu
 
 /* ---- hash router：#/视图、#/doc/:id、#/ws/:id。浏览器前进/后退可用，
    详情页"返回"走 history.back() 回到真实来源页。 ---- */
-const views={overview,increments,documents,reviews,workspaces,models,diagnostics};
+const views={overview,increments,documents,reviews,rules,workspaces,models,diagnostics};
 function routeOf(hash){const h=(hash||'').replace(/^#\/?/,'');const i=h.indexOf('/');
   const head=i<0?h:h.slice(0,i),rest=i<0?'':decodeURIComponent(h.slice(i+1));
   if(head==='doc'&&rest)return{view:'documents',run:()=>documentDetail(rest)};
