@@ -620,13 +620,23 @@ async def dingtalk_nodes(workspace_id: str, operator_id: str, parent_node_id: st
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
+NO_STORE_SUFFIXES = (".html", ".js", ".css")
+
+
+def _static_response(path: Path) -> FileResponse:
+    # HTML/JS/CSS must revalidate every load — a stale cached app.js against a
+    # newer API broke the dashboard once (2026-08-12). 304s keep it cheap.
+    headers = {"Cache-Control": "no-cache"} if path.suffix in NO_STORE_SUFFIXES else None
+    return FileResponse(path, headers=headers)
+
+
 @app.get("/")
 def index():
-    return FileResponse(ROOT / "static" / "index.html")
+    return _static_response(ROOT / "static" / "index.html")
 
 
 @app.get("/{path:path}")
 def static_files(path: str):
     candidate = ROOT / "static" / path
-    if candidate.is_file() and candidate.resolve().is_relative_to((ROOT / "static").resolve()): return FileResponse(candidate)
-    return FileResponse(ROOT / "static" / "index.html")
+    if candidate.is_file() and candidate.resolve().is_relative_to((ROOT / "static").resolve()): return _static_response(candidate)
+    return _static_response(ROOT / "static" / "index.html")
