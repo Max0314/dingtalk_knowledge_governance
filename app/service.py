@@ -262,8 +262,10 @@ WATCH_RESOLUTION_TTL_SECONDS = 3600
 
 async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict:
     """Map KG_WATCH_WORKSPACES tokens (id, exact name or name fragment) to
-    workspace ids using the operator's workspace list. Cached for an hour so a
-    5-minute tick does not spend five list calls every round."""
+    workspace ids using the operator's workspace list; the single token `*`
+    watches every workspace the operator can see (org-wide rollout). Cached
+    for an hour so a 5-minute tick does not spend five list calls every
+    round."""
     tokens = [token.strip() for token in settings.watch_workspaces.split(",") if token.strip()]
     if not tokens:
         return {"resolved": [], "unresolved": []}
@@ -283,9 +285,12 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
     unresolved: list[str] = []
     seen_ids: set[str] = set()
     for token in tokens:
-        matches = ([space for space in spaces if space["workspace_id"] == token]
-                   or [space for space in spaces if space.get("name", "") == token]
-                   or [space for space in spaces if token in space.get("name", "")])
+        if token == "*":
+            matches = spaces
+        else:
+            matches = ([space for space in spaces if space["workspace_id"] == token]
+                       or [space for space in spaces if space.get("name", "") == token]
+                       or [space for space in spaces if token in space.get("name", "")])
         if not matches:
             unresolved.append(token)
             continue

@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # Comma list of workspace ids allowed to receive review push messages.
     # Empty = no restriction (pilot behavior). Set before org-wide rollout.
     notify_workspaces: str = ""
+    # Comma list of uploader departments (bi_center 一级部门名) allowed to
+    # receive pushes; empty = everyone. Go-live 2026-08-13 starts with
+    # 数字化转型部,AI应用研发部 — reviews still run and are recorded for all.
+    notify_departments: str = ""
     # Pilot observation mode: when set, every review push is redirected to
     # this userId (with the original recipient named in the body) instead of
     # messaging uploaders directly.

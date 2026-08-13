@@ -86,6 +86,13 @@ def enqueue_review_notification(db: Session, settings: Settings, doc: Document, 
                                     status="skipped", error_code="workspace_not_allowlisted")
         db.add(notification)
         return notification
+    allowed_depts = {token.strip() for token in settings.notify_departments.split(",") if token.strip()}
+    if allowed_depts and (getattr(doc, "department_name", "") or "") not in allowed_depts:
+        # 按上传人部门灰度：名单外（含"未映射"）只留痕不打扰，评审照常记录。
+        notification = Notification(node_id=doc.node_id, review_instance_id=instance.review_instance_id,
+                                    status="skipped", error_code="department_not_allowlisted")
+        db.add(notification)
+        return notification
     if not doc.uploader_key:
         notification = Notification(node_id=doc.node_id, review_instance_id=instance.review_instance_id,
                                     status="skipped", error_code="uploader_unknown")

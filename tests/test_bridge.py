@@ -304,6 +304,32 @@ def test_notify_pass_gate_copy_and_pilot_footer():
         db.rollback()
 
 
+def test_notify_department_allowlist():
+    from types import SimpleNamespace
+
+    from app import notify as notify_module
+
+    low = SimpleNamespace(review_instance_id="ri-dept", ai_score=50.0, verdict="return",
+                          review_scope="metadata_only", rule_version="V1.1", findings=[])
+    doc_in = SimpleNamespace(node_id="dept-1", workspace_id="ws-x", uploader_key="u-1",
+                             name="a.docx", department_name="AI应用研发部")
+    doc_out = SimpleNamespace(node_id="dept-2", workspace_id="ws-x", uploader_key="u-2",
+                              name="b.docx", department_name="质量部")
+    doc_unmapped = SimpleNamespace(node_id="dept-3", workspace_id="ws-x", uploader_key="u-3",
+                                   name="c.docx", department_name="未映射")
+    init_db()
+    with SessionLocal() as db:
+        settings = get_settings().model_copy(update={
+            "notify_enabled": True, "notify_workspaces": "",
+            "notify_departments": "数字化转型部, AI应用研发部"})
+        row_in = notify_module.enqueue_review_notification(db, settings, doc_in, low)
+        assert row_in is not None and row_in.status == "pending"
+        for doc in (doc_out, doc_unmapped):
+            row = notify_module.enqueue_review_notification(db, settings, doc, low)
+            assert row is not None and row.status == "skipped" and row.error_code == "department_not_allowlisted"
+        db.rollback()
+
+
 def test_fileclass_and_notify_guardrails():
     assert classify("docx") == "document" and classify("adoc") == "native_doc"
     assert classify("log") == "engineering" and classify("png") == "image" and classify("", True) == "folder"
