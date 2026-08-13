@@ -10,10 +10,16 @@ from sqlalchemy import select
 
 from app import audit_bridge
 from app.config import get_settings
-from app.db import Document, FileAuditEvent, SessionLocal, SpaceMap, Workspace, init_db
+from app.db import Document, FileAuditEvent, ReviewJob, SessionLocal, SpaceMap, Workspace, init_db
 from app.fileclass import classify, review_classes
 
 WS = "bridge-ws"
+DEFAULT_GMT = 1786400000000  # add_event 的默认事件时间
+
+
+def gmt_iso(gmt_ms=DEFAULT_GMT):
+    from datetime import datetime, timezone as _tz
+    return datetime.fromtimestamp(gmt_ms / 1000, tz=_tz.utc).isoformat()
 
 
 @pytest.fixture()
@@ -36,11 +42,19 @@ def env(monkeypatch):
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("tb-%")).delete(synchronize_session=False)
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("999%")).delete(synchronize_session=False)
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
+        # 上一次失败运行可能留下测试文档（各测试的收尾清理没跑到），开场兜底
+        for node_id in ("bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b"):
+            leftover = db.get(Document, node_id)
+            if leftover:
+                db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+                db.delete(leftover)
         if not db.get(Workspace, WS):
             db.add(Workspace(workspace_id=WS, name="桥接测试库"))
-        if not db.get(Document, "bridge-A"):
-            db.add(Document(node_id="bridge-A", workspace_id=WS, name="桥接测试文档.docx",
-                            extension="docx", file_class="document"))
+        # 镜像文档带与默认事件时间互证得上的时间戳（真实 watcher 建档必有）；
+        # 共享测试库里可能残留旧行，字段必须每次刷新
+        db.merge(Document(node_id="bridge-A", workspace_id=WS, name="桥接测试文档.docx",
+                          extension="docx", file_class="document", storage_dentry_id="",
+                          source_created_at=gmt_iso(), source_updated_at=gmt_iso()))
         db.commit()
     settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_debounce_seconds": 900,
                                                  "bridge_locator_enabled": False,
@@ -49,12 +63,20 @@ def env(monkeypatch):
 
 
 def add_event(biz_id, resource, space_id="2932890480", action_view="知识库上传文件",
-              module_view="团队空间", extension="docx", gmt=1786400000000):
+              module_view="团队空间", extension="docx", gmt=1786400000000, received=None):
     with SessionLocal() as db:
-        db.add(FileAuditEvent(biz_id=biz_id, gmt_create=gmt, action_view=action_view,
-                              module_view=module_view, resource=resource, extension=extension,
-                              target_space_id=space_id))
+        kwargs = dict(biz_id=biz_id, gmt_create=gmt, action_view=action_view,
+                      module_view=module_view, resource=resource, extension=extension,
+                      target_space_id=space_id)
+        if received is not None:
+            kwargs["received_at"] = received  # 重试窗口基准（默认=入库当下）
+        db.add(FileAuditEvent(**kwargs))
         db.commit()
+
+
+def old_received(days=3):
+    from datetime import datetime, timedelta, timezone as tz
+    return datetime.now(tz.utc) - timedelta(days=days)
 
 
 def run_bridge(settings):
@@ -64,7 +86,7 @@ def run_bridge(settings):
 
 def test_wiki_event_sweeps_governed_set_with_debounce(env):
     settings, walks, _ = env
-    add_event("tb-1", "桥接测试文档", "99001")
+    add_event("tb-1", "桥接测试文档", "99001", received=old_received())  # 过期→死信归档路径
     summary = run_bridge(settings)
     assert summary["wiki_events"] == 1 and summary["matched"] == 1
     walked = {walk["workspace_id"] for walk in walks}
@@ -196,9 +218,11 @@ def test_unlocated_event_stays_pending_until_locator_confirms(env, monkeypatch):
     with SessionLocal() as db:
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99920000001"))
         assert event.processed is False and event.matched_node_id == "" and event.last_attempt_at is not None
-        # watcher 把文档建进镜像；此时名称联结只能 provisional，不完成
+        # watcher 把文档建进镜像（带真实时间戳）；名称联结只能 provisional
+        now_iso = gmt_iso(int(time_module.time() * 1000))
         db.merge(Document(node_id="bridge-late-doc", workspace_id=WS, name="重试到镜像出现.docx",
-                          extension="docx", file_class="document"))
+                          extension="docx", file_class="document",
+                          source_created_at=now_iso, source_updated_at=now_iso))
         db.commit()
     s_mid = run_bridge(org)
     with SessionLocal() as db:
@@ -240,7 +264,7 @@ def test_stale_unmatched_event_becomes_observable_dead_letter(env, monkeypatch):
     monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
     org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
     add_event("99930000001", "永远找不到的文件", "99030",
-              gmt=int(time_module.time() * 1000) - 3 * 24 * 3600 * 1000)
+              gmt=int(time_module.time() * 1000) - 3 * 24 * 3600 * 1000, received=old_received())
     summary = run_bridge(org)
     assert summary.get("dead_letter") == 1 and summary.get("pending_retry") == 0
     with SessionLocal() as db:
@@ -291,6 +315,116 @@ def test_locator_budget_rotates_fairly(env, monkeypatch):
     with SessionLocal() as db:
         events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.biz_id.like("tb-rot%"))).all()
         assert len(events) == 9 and all(event.last_attempt_at is not None for event in events)
+
+
+def test_search_hit_on_old_same_name_doc_is_not_confirmed(env, monkeypatch):
+    """codex 第五轮 P0：同名新文件未入索引时，搜索只会返回旧节点——搜索
+    唯一命中也不得 confirmed，必须与镜像时间/扩展名互证。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    with SessionLocal() as db:
+        db.merge(Document(node_id="old-same-2", workspace_id=WS, name="互证同名.docx", extension="docx",
+                          file_class="document", source_created_at="2026-08-01T09:00:00Z",
+                          source_updated_at="2026-08-01T09:00:00Z"))
+        db.commit()
+
+    class OldOnlySearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "old-same-2", "name": "互证同名.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "互证同名.docx", "workspace_id": WS, "node_id": "old-same-2"}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", OldOnlySearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99950000001", "互证同名", "99060", gmt=int(time_module.time() * 1000))
+    summary = run_bridge(org)
+    assert summary.get("uncorroborated") == 1 and summary["confirmed"] == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99950000001"))
+        old = db.get(Document, "old-same-2")
+        assert old.storage_dentry_id == ""            # 新文件的键没有挂到旧文档
+        assert event.processed is False and event.match_status != "confirmed"
+        db.delete(old)
+        db.commit()
+
+
+def test_same_workspace_double_enqueue_no_conflict(env, monkeypatch):
+    """codex 第五轮 P0：同一库连续多条事件同一事务内排队巡走，不得撞
+    bridge_walk_queue 主键。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    with SessionLocal() as db:
+        db.merge(Document(node_id="dup-a", workspace_id=WS, name="同库文件A.docx",
+                          extension="docx", file_class="document"))
+        db.merge(Document(node_id="dup-b", workspace_id=WS, name="同库文件B.docx",
+                          extension="docx", file_class="document"))
+        db.commit()
+    now_ms = int(time_module.time() * 1000)
+    add_event("99960000001", "同库文件A", "99070", gmt=now_ms)
+    add_event("99960000002", "同库文件B", "99070", gmt=now_ms + 1)
+    summary = run_bridge(org)  # 修复前：IntegrityError 使整轮回滚
+    assert any(walk["workspace_id"] == WS for walk in summary["walks"])
+    with SessionLocal() as db:
+        for node_id in ("dup-a", "dup-b"):
+            doc = db.get(Document, node_id)
+            if doc:
+                db.delete(doc)
+        db.commit()
+
+
+def test_locator_rotation_reaches_beyond_batch_window(env, monkeypatch):
+    """codex 第五轮 P0：定位候选在数据库层全局按最久未尝试取额——BATCH
+    窗口之外的事件同样按轮次获得机会。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "BATCH", 10)
+    monkeypatch.setattr(audit_bridge, "WIKI_LOCATE_BUDGET", 2)
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    now_ms = int(time_module.time() * 1000)
+    for index in range(12):
+        add_event(f"tb-glob{index}", f"批外轮转{index}", "99080", gmt=now_ms + index)
+    for _ in range(6):
+        run_bridge(org)
+    with SessionLocal() as db:
+        events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.biz_id.like("tb-glob%"))).all()
+        assert len(events) == 12
+        assert all(event.last_attempt_at is not None for event in events)
+
+
+def test_reopened_dead_letter_gets_fresh_retry_window(env, monkeypatch):
+    """codex 第五轮 P1：死信重开重置 received_at，获得完整的新 48h 窗口，
+    不会一轮之内立即再次死信。"""
+    import time as time_module
+
+    from app.db import utcnow as db_utcnow
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    old_ms = int(time_module.time() * 1000) - 5 * 24 * 3600 * 1000
+    add_event("99970000001", "死信重开样本", "99090", gmt=old_ms, received=old_received(5))
+    first = run_bridge(org)
+    assert first.get("dead_letter") == 1
+    with SessionLocal() as db:  # 与 reopen_dead_letters.py 相同的重开语义
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99970000001"))
+        event.processed, event.resolution, event.last_attempt_at = False, "", None
+        event.received_at = db_utcnow()
+        db.commit()
+    second = run_bridge(org)
+    assert second.get("dead_letter", 0) == 0 and second.get("pending_retry") == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99970000001"))
+        assert event.processed is False and event.last_attempt_at is not None
 
 
 def test_walk_queue_continues_next_pass(env):

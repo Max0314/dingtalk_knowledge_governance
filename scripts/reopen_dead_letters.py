@@ -36,10 +36,12 @@ def main() -> None:
             print(f"[死信] {event.resolution} · {event.resource or '?'} · biz={event.biz_id}")
         if not apply_changes:
             return
+        now = utcnow()
         for event in rows:
             event.processed = False
             event.resolution = ""
             event.last_attempt_at = None
+            event.received_at = now  # 重试窗口基准重置：获得完整的 48h 新生命周期
         db.commit()
         print("done")
 

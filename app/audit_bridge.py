@@ -127,8 +127,13 @@ def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -
                          trigger="content_key", requested_by="system"))
 
 
-def _enqueue_walk(db: Session, workspace_id: str) -> None:
-    if workspace_id and db.get(BridgeWalk, workspace_id) is None:
+def _enqueue_walk(db: Session, workspace_id: str, queued: set[str]) -> None:
+    """queued 是本轮事务内的去重集合：autoflush 关闭时 db.get 看不到同事务
+    刚 add 的行，同一库两条事件会撞主键炸掉整轮（codex 第五轮 P0）。"""
+    if not workspace_id or workspace_id in queued:
+        return
+    queued.add(workspace_id)
+    if db.get(BridgeWalk, workspace_id) is None:
         db.add(BridgeWalk(workspace_id=workspace_id))
 
 
@@ -138,7 +143,8 @@ def _finish(db: Session, event: FileAuditEvent, resolution: str) -> None:
     _tally_space(db, event)
 
 
-def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings, summary: dict) -> bool:
+def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings, summary: dict,
+                          queued: set[str]) -> bool:
     """成功终态的完整定义（codex 第四轮 P0）：locator 确认的节点 + 文档已入
     镜像 + 正文下载键在文档上。键挂不上（bizId 非数字）转死信而非伪装成功；
     文档未入镜像保持 pending 重试。"""
@@ -148,7 +154,7 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
     doc = db.get(Document, event.matched_node_id)
     if doc is None:
         return False
-    _enqueue_walk(db, doc.workspace_id)  # 事件说这个库有写操作：欠一次快巡走
+    _enqueue_walk(db, doc.workspace_id, queued)  # 事件说这个库有写操作：欠一次快巡走
     if doc.storage_dentry_id:
         _finish(db, event, "done")
         return True
@@ -157,6 +163,51 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
         summary["dead_letter"] = summary.get("dead_letter", 0) + 1
         return True
     return False
+
+
+def _near_event(iso_value: str, gmt_ms: int, tolerance_seconds: int = 900) -> bool:
+    if not iso_value or not gmt_ms:
+        return False
+    try:
+        moment = datetime.fromisoformat(str(iso_value).replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return abs(moment.timestamp() * 1000 - gmt_ms) <= tolerance_seconds * 1000
+    except ValueError:
+        return False
+
+
+def _event_matches_node(db: Session, event: FileAuditEvent, node_id: str, snapshot_id: str) -> bool:
+    """搜索命中唯一 ≠ 就是本事件的节点：同名新文件未进索引时，搜索只会返回
+    旧节点（codex 第五轮 P0）。互证规则——
+    * 节点在镜像：键已相等 → 是；扩展名冲突 → 否；否则创建/修改时间须与
+      审计时间接近（±15 分钟）；
+    * 镜像没有但快照认识 → 旧存量，时间无法互证 → 否（等镜像跟上再确认）；
+    * 镜像与快照都不认识 → 全新节点，与"新上传"事件自洽 → 是。"""
+    doc = db.get(Document, node_id)
+    if doc is not None:
+        if doc.storage_dentry_id and doc.storage_dentry_id == (event.biz_id or ""):
+            return True
+        if event.extension and doc.extension and event.extension.lower() != doc.extension.lower():
+            return False
+        return (_near_event(doc.source_created_at, event.gmt_create)
+                or _near_event(doc.source_updated_at, event.gmt_create))
+    if snapshot_id and db.scalar(select(HistoricalFileNode.id)
+                                 .where(HistoricalFileNode.snapshot_id == snapshot_id,
+                                        HistoricalFileNode.node_id == node_id).limit(1)):
+        return False
+    return True
+
+
+def _expired(event: FileAuditEvent, now_ms: int) -> bool:
+    """重试窗口基准是入库时间 received_at（死信重开后重置它即获得完整新窗口，
+    审计回填的历史事件也各有 48h 处理机会），无 received_at 才退回事件时间。"""
+    moment = event.received_at
+    if moment is not None:
+        if moment.tzinfo is not None:
+            moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+        return (now_ms - moment.timestamp() * 1000) > GIVE_UP_AFTER_MS
+    return bool(event.gmt_create) and (now_ms - event.gmt_create) > GIVE_UP_AFTER_MS
 
 
 def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, summary: dict) -> None:
@@ -180,6 +231,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
     snapshot_id = _latest_snapshot_id(db)
+    queued: set[str] = set()  # 本轮事务内的巡走去重
     wiki_events: list[FileAuditEvent] = []
     for event in events:
         if not _is_wiki_write(event):
@@ -191,47 +243,51 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         if event.match_status == "provisional" and event.matched_node_id:
             doc = db.get(Document, event.matched_node_id)
             if doc is not None:
-                _enqueue_walk(db, doc.workspace_id)  # 门铃提示：该库可能有写操作
-        _try_finish_confirmed(db, event, settings, summary)
+                _enqueue_walk(db, doc.workspace_id, queued)  # 门铃提示：该库可能有写操作
+        _try_finish_confirmed(db, event, settings, summary, queued)
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
 
     # Locator: a wiki-search by file name gives the doorbell an address, and
-    # its exact node ids are the ONLY authoritative match. 公平轮转：按
-    # 最久未尝试优先，避免固定队首饿死后来者。
+    # its exact, corroborated node id is the ONLY authoritative match.
+    # 公平轮转在数据库层全局取额（最久未尝试优先）——不受 BATCH 截断影响，
+    # 第 501 条事件同样按轮次获得定位机会（codex 第五轮 P0）。
     governed = set(_governed_workspaces(db))
     located_ungoverned: set[str] = set()
     unlocated = 0
     now = utcnow()
     now_ms = int(time.time() * 1000)
-    def _attempt_key(event: FileAuditEvent):
-        # SQLite 回读为 naive、MySQL 驱动亦然；统一裁成 naive UTC 排序
-        at = event.last_attempt_at
-        if at is None:
-            return (datetime.min, event.gmt_create or 0)
-        if at.tzinfo is not None:
-            at = at.astimezone(timezone.utc).replace(tzinfo=None)
-        return (at, event.gmt_create or 0)
-
-    candidates = sorted((e for e in pending_wiki if e.match_status != "confirmed"), key=_attempt_key)
+    candidates = db.scalars(
+        select(FileAuditEvent)
+        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status != "confirmed",
+               or_(FileAuditEvent.action_view.like("%知识库%"), FileAuditEvent.module_view == "团队空间"))
+        .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
+                  FileAuditEvent.last_attempt_at.asc(), FileAuditEvent.gmt_create.asc())
+        .limit(WIKI_LOCATE_BUDGET)).all()
     if settings.bridge_locator_enabled and settings.wiki_storage_space_id and candidates:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
         started = time.monotonic()
-        for event in candidates[:WIKI_LOCATE_BUDGET]:
-            if time.monotonic() - started > LOCATE_TIME_BUDGET_SECONDS:
+
+        async def _locate(names: list[str]):
+            # Storage search returns dentryUuids (== wiki nodeIds); the wiki
+            # batch query then names the workspace each hit lives in.
+            dentries = await client.search_dentries(names[0], operator, [settings.wiki_storage_space_id])
+            exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
+            return await client.batch_query_wiki_nodes(exact_ids, operator) if exact_ids else []
+
+        for event in candidates:
+            remaining = LOCATE_TIME_BUDGET_SECONDS - (time.monotonic() - started)
+            if remaining <= 0:
                 break
             event.last_attempt_at = now
             names = _name_candidates(event)
             try:
-                # Storage search returns dentryUuids (== wiki nodeIds); the wiki
-                # batch query then names the workspace each hit lives in.
-                dentries = asyncio.run(client.search_dentries(names[0], operator,
-                                                              [settings.wiki_storage_space_id]))
-                exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
-                nodes = asyncio.run(client.batch_query_wiki_nodes(exact_ids, operator)) if exact_ids else []
-            except (IntegrationError, RuntimeError):
-                unlocated += 1  # 网络失败：事件保持 pending，下一轮重试
+                # 硬时间预算：整组请求包在剩余时间内，40s 的一对外呼不能把
+                # 30s 预算撑到 70s（codex 第五轮 P1）。
+                nodes = asyncio.run(asyncio.wait_for(_locate(names), timeout=remaining))
+            except (IntegrationError, RuntimeError, TimeoutError):
+                unlocated += 1  # 网络失败/超时：事件保持 pending，下一轮重试
                 continue
             hits = [node for node in nodes if node.get("name") in names]
             workspaces = {node.get("workspace_id") for node in hits if node.get("workspace_id")}
@@ -240,24 +296,29 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                 continue
             for workspace_id in workspaces:
                 if workspace_id in governed or settings.bridge_scope == "mapped":
-                    _enqueue_walk(db, workspace_id)
+                    _enqueue_walk(db, workspace_id, queued)
                 else:
                     located_ungoverned.add(workspace_id)
             node_ids = {node["node_id"] for node in hits if node.get("node_id")}
             if len(node_ids) == 1:
-                confirmed_id = node_ids.pop()
-                if event.matched_node_id != confirmed_id:
-                    summary["matched"] += 1
-                event.matched_node_id = confirmed_id
-                event.match_status = "confirmed"
-                summary["confirmed"] += 1
-            _try_finish_confirmed(db, event, settings, summary)
+                confirmed_id = next(iter(node_ids))
+                # 搜索唯一还不够：须与镜像/快照互证（同名新文件未入索引时，
+                # 唯一命中的很可能是旧节点）。互证失败保持 pending。
+                if _event_matches_node(db, event, confirmed_id, snapshot_id):
+                    if event.matched_node_id != confirmed_id:
+                        summary["matched"] += 1
+                    event.matched_node_id = confirmed_id
+                    event.match_status = "confirmed"
+                    summary["confirmed"] += 1
+                else:
+                    summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
+            _try_finish_confirmed(db, event, settings, summary, queued)
     elif candidates:
         unlocated = len(candidates)
     if unlocated:
         if len(governed) <= settings.bridge_sweep_max_governed:
             for workspace_id in governed:
-                _enqueue_walk(db, workspace_id)  # 试点规模的兜底扫，代价可控
+                _enqueue_walk(db, workspace_id, queued)  # 试点规模的兜底扫，代价可控
         else:
             # org 级规模：未定位事件不触发全库兜底；发现与评审由 watcher
             # 轮巡 + KG_REVIEW_SINCE 兜底。
@@ -265,11 +326,12 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     summary["unlocated"] = unlocated
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
 
-    # 死信裁决：到期仍未完成的事件带原因归档，绝不伪装成功。
+    # 死信裁决：到期仍未完成的事件带原因归档，绝不伪装成功。窗口基准是
+    # received_at——死信重开重置它即获得完整新窗口。
     for event in pending_wiki:
         if event.processed:
             continue
-        if event.gmt_create and now_ms - event.gmt_create > GIVE_UP_AFTER_MS:
+        if _expired(event, now_ms):
             reason = "dead_letter_no_doc" if event.match_status == "confirmed" else "dead_letter_unmatched"
             _finish(db, event, reason)
             summary["dead_letter"] = summary.get("dead_letter", 0) + 1

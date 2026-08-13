@@ -53,17 +53,30 @@ def main() -> None:
             "seeded": db.scalar(select(func.count()).select_from(Workspace)
                                 .where(Workspace.watch_seeded.is_(True))) or 0}
         week_ago = utcnow() - timedelta(days=7)
+        from sqlalchemy import or_ as sa_or
+
+        from app.fileclass import review_classes
+        # 无键新增文档：只统计"应当有键"的对象——上线时刻之后创建/修改、
+        # 可评审文件类型、非机器人（否则重种存量/图片/机器人同步全是假阳性）
+        no_key_conds = [Document.is_folder.is_(False), Document.is_deleted.is_(False),
+                        Document.storage_dentry_id == "", Document.discovered_at >= week_ago,
+                        Document.file_class.in_(sorted(review_classes(settings.review_classes)))]
+        for prefix in (p.strip() for p in settings.robot_name_prefixes.split(",") if p.strip()):
+            no_key_conds.append(~Document.uploader_name.like(f"{prefix}%"))
+        robot_ids = [t.strip() for t in settings.robot_user_ids.split(",") if t.strip()]
+        if robot_ids:
+            no_key_conds.append(Document.uploader_key.not_in(robot_ids))
+        if settings.review_since:
+            no_key_conds.append(sa_or(Document.source_created_at >= settings.review_since,
+                                      Document.source_updated_at >= settings.review_since))
         out["bridge"] = {
             "pending_retry": db.scalar(select(func.count()).select_from(FileAuditEvent)
                                        .where(FileAuditEvent.processed.is_(False))) or 0,
             "dead_letter_total": db.scalar(select(func.count()).select_from(FileAuditEvent)
                                            .where(FileAuditEvent.resolution.like("dead_letter%"))) or 0,
             "walk_queue": db.scalar(select(func.count()).select_from(BridgeWalk)) or 0,
-            # 新增文档没拿到正文下载键的规模：正文评审保障的直接观测口径
-            "new_docs_without_key_7d": db.scalar(
-                select(func.count()).select_from(Document)
-                .where(Document.is_folder.is_(False), Document.is_deleted.is_(False),
-                       Document.storage_dentry_id == "", Document.discovered_at >= week_ago)) or 0,
+            "reviewable_new_docs_without_key_7d": db.scalar(
+                select(func.count()).select_from(Document).where(*no_key_conds)) or 0,
         }
         latest_audit_ms = db.scalar(select(func.max(FileAuditEvent.gmt_create)))
         audit_state = db.scalars(select(AuditState)).first()
