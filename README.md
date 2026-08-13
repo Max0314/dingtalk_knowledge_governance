@@ -1,60 +1,49 @@
-# DingTalk Knowledge Governance
+# DingTalk Knowledge Governance · 钉钉知识库治理
 
-## Quick start
+面向"入库可追溯 · 质量可评审 · 增量可统计"的知识库治理服务。
+2026-08-13 起正式运行：全库监控 + AI 评审 + 部门灰度推送。
+
+## 已上线能力
+
+- **全库实时镜像**：watcher 按 `KG_WATCH_WORKSPACES`（`*` = 服务身份可见的全部知识库）分片轮巡；首轮只建镜像不评审存量，之后新增/变更自动入评审队列，连续缺席软删除。分片间穿插评审任务、推送与审计拉取，长周期不饿死其他后台能力。
+- **AI 评审**：V1.1 规则引擎（7 维度 24 条，参数可配置）+ 可选大模型正文评审（`KG_MODEL_ALLOW_CONTENT_TRANSFER`），按上传人一级部门解析规则（部门覆盖 → 全局 → 内置），实例不可变、逐条留痕 `rule_config_ref` 与正文不可用原因 `content_note`。数字员工（机器人）上传不参与评审。
+- **评分规则配置页**：全局默认 + 各部门覆盖；全局管理员与部门维护人两级编辑权限，修改留历史可回滚。
+- **评审推送**：机器人单聊，通过/低分双文案（低分为说明语气，带分析页链接与试点尾注），按人静默去抖汇总（5 分钟静默/30 分钟兜底），`KG_NOTIFY_DEPARTMENTS` 按上传人部门灰度，`KG_NOTIFY_ON_PASS` 控制合格推送。
+- **看板**：总览（月度趋势下钻 月→日）、数据看板（年→月→日 图表下钻 + 部门→业务组→成员组织下钻）、统一文档列表（基线快照 + 实时增量去重合并，部门/上传人/文件名检索）、评审记录、知识库管理（宜搭登记表回填归属部门）、连接诊断。
+- **组织归属**：bi_center 只读契约解析上传人（employeeKey=UnionID）；知识库归属部门来自宜搭「知识库基本信息表」（scripts/backfill_yida_departments.py）。
+
+## 架构与平台约束
+
+- FastAPI（api 容器）+ 单 worker 轮询（无 Redis，队列即数据库表）；前端为 vendored ECharts 的原生 JS 单页（hash 路由）。
+- 平台规则：应用栈不含数据库容器，`KG_DATABASE_URL` 指向外部 MySQL；正文只存在于评审进程内存/tmpfs，绝不落库、落盘、进日志。
+- 端口 39021，默认只绑定 127.0.0.1（本机 nginx 反代对外）；`KG_PUBLISH_BIND` 可显式放开。
+- 服务器访问 GitHub 受限，部署走服务器裸仓库双推：`git push origin main && git push neoflow main`，服务器 `git pull && docker compose up --build -d`。详见 [docs/deployment-guide.md](docs/deployment-guide.md)（脱敏版；真实凭据在仓库外的运维手册）。
+
+## 本地开发
 
 ```powershell
-Copy-Item .env.example .env
-docker compose up --build -d
+python scripts/dev_server.py --port 39027   # SQLite 副本预览（runtime/local_ui.db）
+python -m pytest tests/ -q                  # 全量测试
 ```
 
-Open `http://localhost:39021`. If Docker is not installed, run a local SQLite demonstration:
+或 Docker 演示模式：`Copy-Item .env.example .env; docker compose up --build -d` 后打开 http://localhost:39021 。
 
-```powershell
-$env:KG_DATABASE_URL='sqlite:///./runtime/knowledge_governance.db'
-$env:KG_DEMO_MODE='true'
-python -m uvicorn app.main:app --port 39021
-```
+## 常用运维脚本（容器内执行）
 
-Docker Compose runs the API and the review worker only. Per platform rules the
-stack contains no database container: `KG_DATABASE_URL` must point at the
-external MySQL server. There is no Redis — the worker polls the database. API
-and worker use `/tmp` tmpfs and do not mount a persistent document volume.
-
-Server deployment: see [docs/deployment-guide.md](docs/deployment-guide.md)
-(sanitized; live credentials stay in the local ops manual outside this repo).
-
-## Implemented capabilities
-
-- Read-only DingTalk workspace/node adapters, incremental sync batches, and connection diagnostics.
-- Targeted workspace watcher (`KG_WATCH_WORKSPACES`): periodic complete walks of pilot workspaces that seed silently, queue reviews for new/changed files, and soft-delete files missing for consecutive walks.
-- Document metadata, ingestion time, monthly counts, new/changed increments, immutable review instances, and derived rerun counts.
-- Read-only `bi_center` identity contract adapter using `employeeKey=UnionID`.
-- Explainable deductions based on the provided V1.1 rule; see [scoring mapping](docs/scoring-standard-v1.1-mapping.md).
-- Model configuration, environment-only API-key references, connectivity checks, and governance UI.
-
-When DingTalk, bi_center, or model credentials have not been injected, diagnostics explicitly return `not_configured`; the service never fabricates connectivity or persists document body content.
-
-钉钉知识库治理服务的设计起点，面向“入库可追溯、质量可评审、增量可统计”的管理诉求。
+| 脚本 | 用途 |
+|------|------|
+| `scripts/status_brief.py` | 一屏生产体检：镜像规模、watch 成败、评审量、推送发件箱 |
+| `scripts/watch_status.py` | watcher 详情（逐库文档/任务/评审计数） |
+| `scripts/backfill_yida_departments.py` | 宜搭 → 知识库归属部门回填（dry-run 默认） |
+| `scripts/cleanup_robot_reviews.py` | 清理数字员工文档误入的历史评审（dry-run 默认） |
+| `scripts/send_notify_samples.py` | 把三种推送样例真实发给指定人 |
+| `scripts/migrate_*.py` | 结构迁移（常规列由启动时 `_ensure_columns` 自动补齐） |
 
 ## 命名
 
-- 目录 / 服务标识：`dingtalk_knowledge_governance`
-- 中文名：钉钉知识库治理服务
-- 不命名为“知识库管理”：该名称容易与钉钉知识库本身的创建、编辑、删除能力混淆；本服务的边界是采集、评审、统计与治理，不替代钉钉。
+- 目录 / 服务标识：`dingtalk_knowledge_governance`；中文名：钉钉知识库治理服务。
+- 不叫"知识库管理"：本服务边界是采集、评审、统计与治理，不替代钉钉知识库本身的增删改。
 
-## 当前结论
+## 设计文档
 
-可行，但应拆成两个能力层：
-
-1. **只读治理层（建议先做）**：采集知识库、节点和文件元数据，统计文件数量、入库时间与新增/变更/删除增量；保存自身审计快照。
-2. **入库质量门禁（后续验证）**：在文件进入钉钉前提取正文并评分，只有通过后才由本服务执行入库。若继续使用钉钉原生入口直接上传，则只能“入库后评审”，不能在入库前阻断。
-
-钉钉节点元数据可提供创建时间、修改时间、创建人、文件大小和可选字数统计；其中没有“知识库评审分数”字段。因此评分必须由本服务定义、计算并持久化，不能把钉钉当作评分数据源。
-
-完整的可行性判断、架构、数据模型、风险和 POC 验收项见 [docs/feasibility-and-design.md](docs/feasibility-and-design.md)。
-
-结合 Docker Compose、正文临时处理、`bi_center` 组织契约、管理角色、评分实例和 UI 的一期实施规划见 [docs/phase-1-plan.md](docs/phase-1-plan.md)。
-
-## 本阶段产物
-
-本目录目前只包含设计材料，未配置密钥、未调用钉钉生产接口、也未读取任何真实知识库文件。
+[可行性与架构](docs/feasibility-and-design.md) · [一期规划](docs/phase-1-plan.md)（历史文档，以当前实现为准） · [评分规则映射](docs/scoring-standard-v1.1-mapping.md) · [增量口径设计](docs/incremental-design.md)

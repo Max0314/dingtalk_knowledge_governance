@@ -102,6 +102,9 @@ class ReviewInstance(Base):
     content_fingerprint: Mapped[str] = mapped_column(String(128), default="")
     dimensions: Mapped[dict] = mapped_column(JSON, default=dict)
     findings: Mapped[list] = mapped_column(JSON, default=list)
+    # Why the body was unavailable when scope is metadata_only
+    # (no_numeric_id / unsupported / too_large / disabled / fetch_failed:*).
+    content_note: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     document: Mapped[Document] = relationship(back_populates="reviews")
 
@@ -134,6 +137,11 @@ class SyncRun(Base):
     run_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     mode: Mapped[str] = mapped_column(String(32), default="incremental")
+    # Which workspace a watch run walked, and the failure detail — without
+    # these a failed run cannot be attributed (2026-08-13 finding).
+    workspace_id: Mapped[str] = mapped_column(id_string(), default="")
+    workspace_name: Mapped[str] = mapped_column(String(255), default="")
+    error_detail: Mapped[str] = mapped_column(String(512), default="")
     workspaces_seen: Mapped[int] = mapped_column(Integer, default=0)
     documents_seen: Mapped[int] = mapped_column(Integer, default=0)
     documents_new: Mapped[int] = mapped_column(Integer, default=0)
@@ -422,7 +430,13 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
 
 # create_all only creates missing tables; columns added to an existing model
 # need an explicit ALTER. Keep this list tiny and append-only.
-EXTRA_COLUMNS = {"review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''"}}
+EXTRA_COLUMNS = {
+    "review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''",
+                         "content_note": "VARCHAR(64) NOT NULL DEFAULT ''"},
+    "sync_runs": {"workspace_id": "VARCHAR(128) NOT NULL DEFAULT ''",
+                  "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
+                  "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
+}
 
 
 def _ensure_columns() -> None:

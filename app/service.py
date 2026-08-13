@@ -22,8 +22,23 @@ def robot_keys(settings: Settings) -> set[str]:
     return {token.strip() for token in settings.robot_user_ids.split(",") if token.strip()}
 
 
+def is_robot_uploader(settings: Settings, *identifiers: str) -> bool:
+    """数字员工识别：KG_ROBOT_USER_IDS 的 id/名字精确匹配 + 名称前缀兜底
+    （默认"数字员工"）。bi_center 会把机器人解析成正式员工身份并替换
+    uploader_key，只比对原始 id 拦不住其文档进评审（2026-08-13 生产实测）。"""
+    robots = robot_keys(settings)
+    prefixes = tuple(p.strip() for p in settings.robot_name_prefixes.split(",") if p.strip())
+    for ident in identifiers:
+        value = (ident or "").strip()
+        if not value:
+            continue
+        if value in robots or (prefixes and value.startswith(prefixes)):
+            return True
+    return False
+
+
 def review_dict(review: ReviewInstance, rerun_count: int = 0) -> dict:
-    return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "review_scope": review.review_scope, "rule_version": review.rule_version, "rule_config_ref": review.rule_config_ref, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
+    return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "review_scope": review.review_scope, "content_note": review.content_note, "rule_version": review.rule_version, "rule_config_ref": review.rule_config_ref, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
 
 
 def document_dict(doc: Document, review: ReviewInstance | None = None, rerun_count: int = 0) -> dict:
@@ -68,17 +83,22 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     # The only body holder is this local variable. It is never assigned to an ORM field or logged.
     content = ""
     scope = "metadata_only"
+    content_note = ""
     if not doc.is_folder:
         try:
-            content, _source = asyncio.run(fetch_document_content(settings, doc))
-        except (IntegrationError, RuntimeError):
-            content = ""
+            content, content_note = asyncio.run(fetch_document_content(settings, doc))
+        except IntegrationError as exc:
+            content, content_note = "", f"fetch_failed:{exc.code}"[:64]
+        except RuntimeError:
+            content, content_note = "", "fetch_failed:runtime"
         if not content and settings.dingtalk_doc_content_url_template:
             try:
                 content = asyncio.run(DingtalkClient(settings).fetch_ephemeral_content(node_id))
             except (IntegrationError, RuntimeError):
                 content = ""
         scope = "full_content" if content else "metadata_only"
+        if content:
+            content_note = ""  # 正文拿到了，原因字段只服务于 metadata_only 的可观测性
     rule_row = resolve_rule_config(db, doc.department_name)
     rule_cfg = effective_config(rule_row.config if rule_row else None)
     result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n", doc.file_class or "document", rule_cfg)
@@ -119,7 +139,7 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
             result["verdict"] = verdict_for(composite, rule_cfg)
     instance = ReviewInstance(
         review_instance_id=str(uuid.uuid4()), node_id=node_id, ai_score=result["ai_score"], verdict=result["verdict"],
-        review_scope=scope, rule_version=RULE_VERSION, rule_config_ref=rule_config_ref(rule_row),
+        review_scope=scope, content_note=content_note, rule_version=RULE_VERSION, rule_config_ref=rule_config_ref(rule_row),
         model_config_version=(model.version if model and content and settings.model_allow_content_transfer else "rule-engine"), trigger=trigger,
         content_fingerprint=result["fingerprint"], dimensions=result["dimensions"], findings=result["findings"],
     )
@@ -139,6 +159,13 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     job = db.scalar(select(ReviewJob).where(ReviewJob.status == "pending").order_by(ReviewJob.created_at).limit(1))
     if not job:
         return False
+    # 第二道闸：入队侧漏网（老任务、批量导入）也不评审数字员工文档；
+    # 详情页手动重评（manual_rerun）视为明确的人为意图，放行。
+    doc = db.get(Document, job.node_id)
+    if doc is not None and job.trigger != "manual_rerun" and is_robot_uploader(settings, doc.uploader_key, doc.uploader_name):
+        job.status, job.error_code, job.finished_at = "skipped", "robot_uploader", utcnow()
+        db.commit()
+        return True
     job.status = "running"
     db.commit()
     try:
@@ -196,8 +223,7 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    robots = robot_keys(settings)
-    uploaded_by_robot = doc.uploader_key in robots or (item.get("creator_id", "") in robots)
+    uploaded_by_robot = is_robot_uploader(settings, doc.uploader_key, item.get("creator_id", ""), doc.uploader_name)
     if (enqueue and (is_new or changed) and not doc.is_folder and not uploaded_by_robot
             and doc.file_class in review_classes(settings.review_classes)):
         db.flush()
@@ -317,7 +343,8 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     ``space`` is the normalized workspace listing item; when given, the walk
     trusts its rootNodeId instead of calling the detail endpoint, which fails
     for some personal spaces."""
-    run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode)
+    run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode, workspace_id=workspace_id,
+                  workspace_name=(space or {}).get("name", ""))
     db.add(run); db.commit()
     client = DingtalkClient(settings)
     operator = settings.dingtalk_sync_operator_id
@@ -351,6 +378,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         ws.source_updated_at = raw.get("updated_at", "") or ws.source_updated_at
         ws.creator_key = raw.get("creator_id", "") or ws.creator_key
         ws.synced_at = utcnow()
+        run.workspace_name = ws.name
         run.workspaces_seen = 1
         seeding = (db.scalar(select(func.count()).select_from(Document).where(Document.workspace_id == workspace_id)) or 0) == 0
         if seeding:
@@ -388,9 +416,11 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     except IntegrationError as exc:
         db.rollback()
         run.status, run.error_code, run.finished_at = "failed", f"{exc.code}:{exc.status_code}"[:64], utcnow()
-    except Exception:
+        run.error_detail = str(exc)[:512]
+    except Exception as exc:
         db.rollback()
         run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
+        run.error_detail = f"{type(exc).__name__}: {exc}"[:512]
     try:
         db.commit()
     except Exception:
@@ -413,8 +443,52 @@ async def run_watch_cycle_async(db: Session, settings: Settings) -> dict:
 
 
 def run_watch_cycle(db: Session, settings: Settings) -> dict:
-    """Synchronous entry for the worker loop."""
+    """Synchronous full cycle — kept for the manual /api/v1/watch/run endpoint
+    and scripts; the worker loop uses run_watch_slice instead."""
     return asyncio.run(run_watch_cycle_async(db, settings))
+
+
+_watch_rotation: dict = {"queue": []}
+
+
+async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2) -> dict:
+    """Walk at most ``batch`` workspaces of the current rotation, then return.
+    The worker drains review jobs / notifications / audit pull between slices,
+    so a 140-workspace cycle cannot starve them for hours (2026-08-13
+    finding). An exhausted rotation reports cycle_completed and refills on the
+    next call."""
+    targets = await resolve_watch_targets(settings)
+    by_id = {t["workspace_id"]: t for t in targets["resolved"]}
+    if not _watch_rotation["queue"]:
+        _watch_rotation["queue"] = list(by_id.keys())
+    walked = []
+    while _watch_rotation["queue"] and len(walked) < max(1, batch):
+        ws_id = _watch_rotation["queue"].pop(0)
+        target = by_id.get(ws_id)
+        if not target:  # renamed/revoked since the rotation was built
+            continue
+        run = await watch_workspace(db, settings, ws_id, target.get("space"))
+        walked.append({"workspace_id": ws_id, "name": target["name"], "run_id": run.run_id,
+                       "mode": run.mode, "status": run.status, "documents_seen": run.documents_seen,
+                       "documents_new": run.documents_new, "documents_changed": run.documents_changed,
+                       "error_code": run.error_code})
+    return {"walked": walked, "remaining": len(_watch_rotation["queue"]), "total": len(by_id),
+            "unresolved": targets["unresolved"], "cycle_completed": not _watch_rotation["queue"]}
+
+
+def run_watch_slice(db: Session, settings: Settings, batch: int = 2) -> dict:
+    return asyncio.run(run_watch_slice_async(db, settings, batch))
+
+
+def sweep_stale_runs(db: Session) -> int:
+    """Mark runs a dead process left in "running" as interrupted. Called once
+    at worker boot — with a single worker, anything still "running" then is a
+    leftover, not live work (7 such rows accumulated by 2026-08-13)."""
+    stale = db.scalars(select(SyncRun).where(SyncRun.status == "running")).all()
+    for run in stale:
+        run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
+    db.commit()
+    return len(stale)
 
 
 def seed_demo(db: Session) -> None:

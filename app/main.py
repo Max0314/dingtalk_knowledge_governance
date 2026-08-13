@@ -108,7 +108,12 @@ def health():
 @app.get("/api/v1/dashboard/overview")
 def dashboard(db: Session = Depends(db_session)):
     workspaces = db.scalar(select(func.count()).select_from(Workspace)) or 0
-    reviews = db.scalars(select(ReviewInstance).order_by(ReviewInstance.created_at.desc())).all()
+    # 均值口径：每份文档只取最新实例——旧实例是审计留痕（含早期 35/0 分误判
+    # 存成 pass 的历史），不再参与平均分。
+    latest_per_doc: dict[str, ReviewInstance] = {}
+    for item in db.scalars(select(ReviewInstance).order_by(ReviewInstance.created_at.desc())).all():
+        latest_per_doc.setdefault(item.node_id, item)
+    reviews = list(latest_per_doc.values())
     average = round(sum(x.ai_score for x in reviews) / len(reviews), 1) if reviews else None
     increments = metrics.monthly_increments(db)
     current_month = datetime.now(timezone.utc).strftime("%Y-%m")

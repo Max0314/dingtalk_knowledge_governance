@@ -8,7 +8,9 @@ services:
     environment:
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "${KG_PUBLISH_PORT:-39021}:39021"
+      # Loopback by default: the platform nginx on this host is the only
+      # intended client; override KG_PUBLISH_BIND=0.0.0.0 only deliberately.
+      - "${KG_PUBLISH_BIND:-127.0.0.1}:${KG_PUBLISH_PORT:-39021}:39021"
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     healthcheck:

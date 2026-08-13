@@ -1,0 +1,151 @@
+"""2026-08-13 运维加固回归：切片轮转、数字员工闸、统计口径、僵尸清理、正文原因。"""
+import os
+from datetime import timedelta
+
+from fastapi.testclient import TestClient
+
+os.environ["KG_DATABASE_URL"] = "sqlite:///./runtime/test_knowledge_governance.db"
+os.environ["KG_DEMO_MODE"] = "true"
+
+from sqlalchemy import func, select
+
+from app.main import app
+from app.config import get_settings
+from app.db import Document, ReviewInstance, ReviewJob, SessionLocal, SyncRun, Workspace, init_db, utcnow
+
+
+def _ensure_demo_workspace(db) -> None:
+    if not db.get(Workspace, "demo-workspace"):
+        db.add(Workspace(workspace_id="demo-workspace", name="演示库"))
+        db.commit()
+
+
+def test_watch_slice_rotation(monkeypatch):
+    from types import SimpleNamespace
+
+    from app import service
+
+    service._watch_rotation["queue"] = []
+    targets = [{"workspace_id": f"ws-{i}", "name": f"库{i}", "space": {}} for i in range(5)]
+    walked_log = []
+
+    async def fake_resolve(settings, force=False):
+        return {"resolved": targets, "unresolved": []}
+
+    async def fake_walk(db, settings, ws_id, space, mode="watch"):
+        walked_log.append(ws_id)
+        return SimpleNamespace(run_id="r-" + ws_id, mode="watch", status="succeeded",
+                               documents_seen=1, documents_new=0, documents_changed=0, error_code="")
+
+    monkeypatch.setattr(service, "resolve_watch_targets", fake_resolve)
+    monkeypatch.setattr(service, "watch_workspace", fake_walk)
+    settings = get_settings()
+    s1 = service.run_watch_slice(None, settings, batch=2)
+    assert [w["workspace_id"] for w in s1["walked"]] == ["ws-0", "ws-1"]
+    assert not s1["cycle_completed"] and s1["remaining"] == 3
+    service.run_watch_slice(None, settings, batch=2)
+    s3 = service.run_watch_slice(None, settings, batch=2)
+    assert s3["cycle_completed"] and s3["remaining"] == 0
+    assert walked_log == [f"ws-{i}" for i in range(5)]
+    s4 = service.run_watch_slice(None, settings, batch=2)  # 新一轮自动补队列
+    assert [w["workspace_id"] for w in s4["walked"]] == ["ws-0", "ws-1"]
+    service._watch_rotation["queue"] = []
+
+
+def test_robot_uploader_detection_and_job_skip():
+    from app.service import is_robot_uploader, process_next_job
+
+    settings = get_settings()
+    assert is_robot_uploader(settings, "数字员工")        # 姓名前缀默认命中
+    assert is_robot_uploader(settings, "", "数字员工4")
+    assert not is_robot_uploader(settings, "陈鹏列")
+    assert is_robot_uploader(settings.model_copy(update={"robot_user_ids": "robot-001"}), "robot-001")
+
+    init_db()
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        db.merge(Document(node_id="robot-doc-1", workspace_id="demo-workspace", name="禅道同步件.docx",
+                          extension="docx", uploader_key="u-robot", uploader_name="数字员工",
+                          department_name="AI应用研发部", org_matched=True))
+        db.merge(ReviewJob(job_id="job-robot-1", node_id="robot-doc-1", trigger="watch"))
+        db.commit()
+        # 队列里可能有其他测试排入的人类任务，逐个泵直到机器人任务被处理
+        for _ in range(10):
+            db.expire_all()
+            if db.get(ReviewJob, "job-robot-1").status != "pending":
+                break
+            if not process_next_job(db, settings):
+                break
+        job = db.get(ReviewJob, "job-robot-1")
+        assert job.status == "skipped" and job.error_code == "robot_uploader"
+        assert (db.scalar(select(func.count()).select_from(ReviewInstance)
+                          .where(ReviewInstance.node_id == "robot-doc-1")) or 0) == 0
+        db.delete(job)
+        db.delete(db.get(Document, "robot-doc-1"))
+        db.commit()
+
+
+def test_dashboard_average_uses_latest_instance_per_doc():
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            _ensure_demo_workspace(db)
+            db.merge(Document(node_id="avg-doc", workspace_id="demo-workspace", name="均值口径.docx", extension="docx"))
+            db.merge(ReviewInstance(review_instance_id="avg-old", node_id="avg-doc", ai_score=0,
+                                    verdict="return", review_scope="metadata_only"))
+            db.merge(ReviewInstance(review_instance_id="avg-new", node_id="avg-doc", ai_score=100,
+                                    verdict="pass", review_scope="metadata_only"))
+            db.commit()
+            old = db.get(ReviewInstance, "avg-old")
+            old.created_at = utcnow() - timedelta(days=1)
+            db.commit()
+            latest = {}
+            for item in db.scalars(select(ReviewInstance).order_by(ReviewInstance.created_at.desc())).all():
+                latest.setdefault(item.node_id, item)
+            expected = round(sum(x.ai_score for x in latest.values()) / len(latest), 1)
+            all_rows = db.scalars(select(ReviewInstance)).all()
+            all_mean = round(sum(x.ai_score for x in all_rows) / len(all_rows), 1)
+        got = client.get("/api/v1/dashboard/overview").json()["metrics"]["average_ai_score"]
+        assert got == expected
+        if all_mean != expected:  # 旧 0 分被排除才会出现的差异
+            assert got != all_mean
+        with SessionLocal() as db:
+            for pk in ("avg-old", "avg-new"):
+                row = db.get(ReviewInstance, pk)
+                if row:
+                    db.delete(row)
+            doc = db.get(Document, "avg-doc")
+            if doc:
+                db.delete(doc)
+            db.commit()
+
+
+def test_sweep_stale_runs():
+    from app.service import sweep_stale_runs
+
+    init_db()
+    with SessionLocal() as db:
+        db.merge(SyncRun(run_id="stale-1", status="running", mode="watch", workspace_id="ws-z"))
+        db.commit()
+        assert sweep_stale_runs(db) >= 1
+        row = db.get(SyncRun, "stale-1")
+        assert row.status == "failed" and row.error_code == "interrupted_by_restart" and row.finished_at
+        db.delete(row)
+        db.commit()
+
+
+def test_review_records_content_note():
+    from app.service import run_review
+
+    init_db()
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        db.merge(Document(node_id="note-doc", workspace_id="demo-workspace", name="正文原因_V1.0.docx",
+                          extension="docx", uploader_name="张三", department_name="研发中心"))
+        db.commit()
+        instance = run_review(db, get_settings(), "note-doc", trigger="test")
+        assert instance.review_scope == "metadata_only"
+        # 本地无存储配置：原因应被记录而不是丢弃
+        assert instance.content_note in {"disabled", "no_numeric_id", "unsupported"}
+        db.delete(db.get(ReviewInstance, instance.review_instance_id))
+        db.delete(db.get(Document, "note-doc"))
+        db.commit()

@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # enqueue reviews for new/changed files and soft-delete missing ones.
     watch_workspaces: str = ""
     watch_interval_seconds: int = 300
+    # Workspaces walked per worker slice; between slices the loop drains
+    # review jobs / notifications / audit pull, so a 140-workspace cycle
+    # cannot starve them (2026-08-13 finding).
+    watch_slice_size: int = 2
     # A document is soft-deleted after this many consecutive complete walks
     # without seeing it (recycle-bin restores clear the flag again).
     watch_delete_misses: int = 2
@@ -85,6 +89,9 @@ class Settings(BaseSettings):
     # classifies the digital employee as an official employee, so the service
     # marks its own operator account explicitly (both id forms).
     robot_user_ids: str = ""
+    # 机器人姓名前缀兜底：bi_center 把数字员工解析成正式员工身份（employeeKey
+    # 替换原始 id），仅靠 id 名单拦不住其文档进评审（2026-08-13 生产实测）。
+    robot_name_prefixes: str = "数字员工"
     # Union ids allowed to operate model configs and diagnostics when auth is
     # on. Empty denies everyone (fail closed); local dev with auth off is open.
     admin_union_ids: str = ""
