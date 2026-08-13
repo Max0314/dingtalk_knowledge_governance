@@ -323,6 +323,7 @@ def test_notify_department_allowlist():
             "notify_enabled": True, "notify_workspaces": "",
             "notify_departments": "数字化转型部, AI应用研发部"})
         row_in = notify_module.enqueue_review_notification(db, settings, doc_in, low)
+        db.flush()  # column default for status lands at flush time
         assert row_in is not None and row_in.status == "pending"
         for doc in (doc_out, doc_unmapped):
             row = notify_module.enqueue_review_notification(db, settings, doc, low)
