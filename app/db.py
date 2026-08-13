@@ -38,6 +38,10 @@ class Workspace(Base):
     owner_department_id: Mapped[str] = mapped_column(String(128), default="")
     owner_department_name: Mapped[str] = mapped_column(String(255), default="未映射")
     owner_biz_group_name: Mapped[str] = mapped_column(String(255), default="未映射")
+    # Set only by a COMPLETE seed walk. Inferring "already seeded" from a
+    # non-empty mirror mistakes an interrupted seed for done and floods the
+    # review queue with stock files on the next walk.
+    watch_seeded: Mapped[bool] = mapped_column(Boolean, default=False)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     documents: Mapped[list["Document"]] = relationship(back_populates="workspace")
 
@@ -436,6 +440,7 @@ EXTRA_COLUMNS = {
     "sync_runs": {"workspace_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
                   "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
+    "workspaces": {"watch_seeded": "TINYINT(1) NOT NULL DEFAULT 0"},
 }
 
 

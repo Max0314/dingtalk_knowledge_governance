@@ -380,7 +380,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         ws.synced_at = utcnow()
         run.workspace_name = ws.name
         run.workspaces_seen = 1
-        seeding = (db.scalar(select(func.count()).select_from(Document).where(Document.workspace_id == workspace_id)) or 0) == 0
+        # 显式补种标记：只有"完整走完"的 seed 轮才置位。用"镜像非空"推断会把
+        # 中途被重启打断的库误判为已补种，下一轮把剩余存量全当新增灌进评审。
+        seeding = not bool(ws.watch_seeded)
         if seeding:
             run.mode = f"{mode}_seed"
         seen: set[str] = set()
@@ -412,6 +414,8 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
             doc.watch_misses += 1
             if doc.watch_misses >= max(1, settings.watch_delete_misses):
                 doc.is_deleted = True
+        if seeding:
+            ws.watch_seeded = True
         run.status, run.finished_at = "succeeded", utcnow()
     except IntegrationError as exc:
         db.rollback()
