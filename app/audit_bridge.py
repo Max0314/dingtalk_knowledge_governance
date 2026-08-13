@@ -41,6 +41,14 @@ from .service import watch_workspace
 logger = logging.getLogger("kg.bridge")
 
 BATCH = 500
+# 每轮远程定位的 wiki 事件上限：单事件是"搜索+批量节点查询"两个 20s 超时的
+# 串行外呼，放开会独占 worker（codex 2026-08-13 第三轮 P0）。
+WIKI_LOCATE_BUDGET = 8
+# 每轮桥接巡走的库数上限；没走到的库因其事件仍 pending，下一轮自动重建。
+WALK_BUDGET = 5
+# 未匹配 wiki 事件的放弃时限：超时后标记 processed 止损（评审与发现由
+# watcher 轮巡 + KG_REVIEW_SINCE 兜底，只损失该文件的提前正文键）。
+GIVE_UP_AFTER_MS = 48 * 3600 * 1000
 
 # In-memory debounce: workspace_id -> monotonic seconds of the last bridge
 # walk. Worker restarts forget it; one extra walk is harmless. Failed walks
@@ -116,38 +124,60 @@ def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -
                          trigger="content_key", requested_by="system"))
 
 
+def _complete_wiki_event(db: Session, event: FileAuditEvent, settings: Settings) -> Document | None:
+    """已匹配的事件只有在文档进入镜像后才算完成：挂上数字下载键（或键已在）
+    再标记 processed。文档未到 → 保持 pending，等 watcher/巡走建档后重试。
+    返回镜像文档（用于把它的库加入巡走 ring），未完成返回 None。"""
+    if not event.matched_node_id:
+        return None
+    _attach_numeric_id(db, event, settings)
+    doc = db.get(Document, event.matched_node_id)
+    if doc is None:
+        return None
+    if not event.processed:
+        event.processed = True
+        _tally_space(db, event)
+    return doc
+
+
 def process_audit_events(db: Session, settings: Settings) -> dict:
-    """One bridge cycle. Returns a summary for the worker log."""
+    """One bridge cycle. Wiki 事件采用"完成才消费"生命周期（codex 第三轮）：
+    未定位/文档未入镜像的事件保持 pending 逐轮重试，超时才放弃；每轮的远程
+    定位与巡走都有预算，绝不独占 worker。非 wiki 事件一次性消费。"""
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "walks": []}
     snapshot_id = _latest_snapshot_id(db)
     wiki_events: list[FileAuditEvent] = []
+    ring: set[str] = set()  # 已定位/已完成事件对应的库：定向快巡走
     for event in events:
-        event.processed = True
         if not _is_wiki_write(event):
+            event.processed = True
             continue
         summary["wiki_events"] += 1
         wiki_events.append(event)
-        _tally_space(db, event)
-        node_id = _unique_node_match(db, event, snapshot_id)
-        if node_id:
-            event.matched_node_id = node_id
-            summary["matched"] += 1
+        if not event.matched_node_id:
+            node_id = _unique_node_match(db, event, snapshot_id)
+            if node_id:
+                event.matched_node_id = node_id
+                summary["matched"] += 1
+        done = _complete_wiki_event(db, event, settings)
+        if done is not None:
+            ring.add(done.workspace_id)  # 事件说这个库有写操作：快巡走做节点级 diff
     db.commit()
-    if not wiki_events:
+    pending_wiki = [event for event in wiki_events if not event.processed]
+    if not pending_wiki and not ring:
         return summary
 
-    # Locator: a wiki-search by file name gives the doorbell an address. Only
-    # events the search cannot place fall back to sweeping the governed set.
+    # Locator: a wiki-search by file name gives the doorbell an address.
     governed = set(_governed_workspaces(db))
-    ring: set[str] = set()
     located_ungoverned: set[str] = set()
     unlocated = 0
-    if settings.bridge_locator_enabled and settings.wiki_storage_space_id:
+    now_ms = int(time.time() * 1000)
+    if settings.bridge_locator_enabled and settings.wiki_storage_space_id and pending_wiki:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
-        for event in wiki_events:
+        for event in [e for e in pending_wiki if not e.matched_node_id][:WIKI_LOCATE_BUDGET]:
             names = _name_candidates(event)
             try:
                 # Storage search returns dentryUuids (== wiki nodeIds); the wiki
@@ -157,12 +187,12 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                 exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
                 nodes = asyncio.run(client.batch_query_wiki_nodes(exact_ids, operator)) if exact_ids else []
             except (IntegrationError, RuntimeError):
-                unlocated += 1
+                unlocated += 1  # 网络失败：事件保持 pending，下一轮重试
                 continue
             hits = [node for node in nodes if node.get("name") in names]
             workspaces = {node.get("workspace_id") for node in hits if node.get("workspace_id")}
             if not workspaces:
-                unlocated += 1  # brand-new files may not be indexed yet -> sweep
+                unlocated += 1  # 尚未进搜索索引：保持 pending，下一轮重试
                 continue
             for workspace_id in workspaces:
                 if workspace_id in governed or settings.bridge_scope == "mapped":
@@ -173,24 +203,25 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if not event.matched_node_id and len(node_ids) == 1:
                 event.matched_node_id = node_ids.pop()
                 summary["matched"] += 1
-            _attach_numeric_id(db, event, settings)
+            done = _complete_wiki_event(db, event, settings)
+            if done is not None:
+                ring.add(done.workspace_id)
     else:
-        unlocated = len(wiki_events)
+        unlocated = len(pending_wiki)
     if unlocated:
         if len(governed) <= settings.bridge_sweep_max_governed:
             ring |= governed  # 试点规模的兜底扫，代价可控
         else:
-            # org 级规模：未定位事件不再触发全库串行扫（会独占 worker 数小时，
-            # codex 2026-08-13 阻断项3）。常规 watcher 轮巡 + KG_REVIEW_SINCE
-            # 是最终发现与评审兜底，下载键由入队时的事件回捞补上。
+            # org 级规模：未定位事件不触发全库串行扫；事件保持 pending，
+            # 发现与评审由 watcher 轮巡 + KG_REVIEW_SINCE 兜底。
             summary["sweep_skipped_governed"] = len(governed)
     summary["unlocated"] = unlocated
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
 
     debounce = max(60, settings.bridge_debounce_seconds)
     for workspace_id in sorted(ring):
-        if len(summary["walks"]) >= 5:
-            # 单轮桥接巡走预算：没走到的库不记时间戳，下一轮自然续走
+        if len(summary["walks"]) >= WALK_BUDGET:
+            # 巡走预算：没走到的库对应事件仍 pending，下一轮 ring 会重建
             summary["walks_deferred"] = summary.get("walks_deferred", 0) + 1
             continue
         if time.time() - _last_walk.get(workspace_id, 0) < debounce:
@@ -202,14 +233,23 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         summary["walks"].append({"workspace_id": workspace_id, "run_id": run.run_id, "mode": run.mode,
                                  "status": run.status, "new": run.documents_new,
                                  "changed": run.documents_changed, "error_code": run.error_code})
-    # Files the walks just mirrored can now satisfy the unique-name join.
-    for event in wiki_events:
+    # Files the walks just mirrored can now satisfy the unique-name join;
+    # anything still unmatched past the deadline gives up (loss = early body
+    # key only — discovery and review are covered elsewhere).
+    for event in pending_wiki:
+        if event.processed:
+            continue
         if not event.matched_node_id:
             node_id = _unique_node_match(db, event, snapshot_id)
             if node_id:
                 event.matched_node_id = node_id
                 summary["matched"] += 1
-        _attach_numeric_id(db, event, settings)
+        if _complete_wiki_event(db, event, settings) is None:
+            if event.gmt_create and now_ms - event.gmt_create > GIVE_UP_AFTER_MS:
+                event.processed = True
+                _tally_space(db, event)
+                summary["gave_up"] = summary.get("gave_up", 0) + 1
+    summary["pending_retry"] = sum(1 for event in pending_wiki if not event.processed)
     db.commit()
     return summary
 

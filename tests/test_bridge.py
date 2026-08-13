@@ -41,7 +41,8 @@ def env(monkeypatch):
                             extension="docx", file_class="document"))
         db.commit()
     settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_debounce_seconds": 900,
-                                                 "bridge_locator_enabled": False})
+                                                 "bridge_locator_enabled": False,
+                                                 "bridge_sweep_max_governed": 999})  # 旧测试保留试点兜底扫语义
     return settings, walks, fail_next
 
 
@@ -164,6 +165,68 @@ def test_locator_miss_falls_back_to_sweep(env, monkeypatch):
     summary = run_bridge(locator_settings(settings))
     assert summary["unlocated"] == 1
     assert WS in {walk["workspace_id"] for walk in summary["walks"]}  # governed sweep fired
+
+
+class _EmptySearchClient:
+    def __init__(self, _settings):
+        pass
+
+    async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+        return []
+
+    async def batch_query_wiki_nodes(self, node_ids, operator_id):
+        return []
+
+
+def test_unlocated_event_stays_pending_until_doc_arrives(env, monkeypatch):
+    """codex 第三轮 P0：org 级规模下未定位事件不再被消费，保持 pending
+    重试；watcher 建档后事件完成、下载键挂上、正文重评入队。"""
+    import time as time_module
+
+    from app.db import ReviewJob
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99920000001", "重试到镜像出现", "99020", gmt=int(time_module.time() * 1000))
+    s1 = run_bridge(org)
+    assert s1["unlocated"] == 1 and s1["walks"] == [] and s1.get("pending_retry") == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99920000001"))
+        assert event.processed is False and event.matched_node_id == ""
+        # watcher 把文档建进镜像
+        db.merge(Document(node_id="bridge-late-doc", workspace_id=WS, name="重试到镜像出现.docx",
+                          extension="docx", file_class="document"))
+        db.commit()
+    s2 = run_bridge(org)
+    assert s2["matched"] == 1 and s2.get("pending_retry", 0) == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99920000001"))
+        assert event.processed is True and event.matched_node_id == "bridge-late-doc"
+        doc = db.get(Document, "bridge-late-doc")
+        assert doc.storage_dentry_id == "99920000001"
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "bridge-late-doc")).all()
+        assert [job.trigger for job in jobs] == ["content_key"]
+        for job in jobs:
+            db.delete(job)
+        db.delete(doc)
+        db.commit()
+
+
+def test_stale_unmatched_event_gives_up(env, monkeypatch):
+    """超过时限仍无法匹配的事件止损消费，不再永久占用重试队列。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99930000001", "永远找不到的文件", "99030",
+              gmt=int(time_module.time() * 1000) - 3 * 24 * 3600 * 1000)
+    summary = run_bridge(org)
+    assert summary.get("gave_up") == 1 and summary.get("pending_retry") == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99930000001"))
+        assert event.processed is True and event.matched_node_id == ""
 
 
 def test_notify_override_redirects_to_operator(monkeypatch):
