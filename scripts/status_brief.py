@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db import (Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob, SessionLocal, SyncRun,
-                    Workspace, init_db, utcnow)
+from app.db import (AuditState, Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob, SessionLocal,
+                    SyncRun, Workspace, init_db, utcnow)
 
 
 def main() -> None:
@@ -53,9 +53,15 @@ def main() -> None:
             "seeded": db.scalar(select(func.count()).select_from(Workspace)
                                 .where(Workspace.watch_seeded.is_(True))) or 0}
         latest_audit_ms = db.scalar(select(func.max(FileAuditEvent.gmt_create)))
-        out["audit"] = {"enabled": settings.audit_pull_enabled,
-                        "latest_event_at": (datetime.fromtimestamp(latest_audit_ms / 1000, tz=timezone.utc)
-                                            .isoformat(timespec="seconds") if latest_audit_ms else None)}
+        audit_state = db.scalars(select(AuditState)).first()
+        out["audit"] = {
+            "enabled": settings.audit_pull_enabled,
+            # 拉取循环自身的新鲜度（没有新写操作时事件时间不会动，须看这里）
+            "last_run_at": (audit_state.last_run_at.isoformat(timespec="seconds")
+                            if audit_state and audit_state.last_run_at else None),
+            "last_rows": audit_state.last_rows if audit_state else None,
+            "latest_event_at": (datetime.fromtimestamp(latest_audit_ms / 1000, tz=timezone.utc)
+                                .isoformat(timespec="seconds") if latest_audit_ms else None)}
         out["mirror"] = {
             "workspaces": db.scalar(select(func.count(func.distinct(Document.workspace_id)))) or 0,
             "documents": db.scalar(select(func.count()).select_from(Document)

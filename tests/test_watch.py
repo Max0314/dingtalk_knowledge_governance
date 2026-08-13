@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app import service
 from app.config import get_settings
-from app.db import Document, ReviewInstance, ReviewJob, SessionLocal, Workspace, init_db
+from app.db import Document, FileAuditEvent, ReviewInstance, ReviewJob, SessionLocal, Workspace, init_db
 
 WS = "watch-ws"
 
@@ -183,6 +183,32 @@ def test_seed_reviews_files_created_after_go_live(settings):
     with SessionLocal() as db:
         assert jobs_for(db, "watch-stock") == []
         assert [job.trigger for job in jobs_for(db, "watch-fresh")] == ["watch"]
+
+
+def test_review_since_precise_moment_updated_at_and_key_recovery(settings):
+    """codex 阻断项1/2：上线时刻精确到分钟——当天更早上传的仍是存量；
+    存量在上线后被修改也要评审；桥接先消费的下载键在入队时找回。"""
+    live = settings.model_copy(update={"review_since": "2026-08-12T08:00:00Z"})
+    with SessionLocal() as db:
+        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id == "987654321").delete(synchronize_session=False)
+        db.add(FileAuditEvent(biz_id="987654321", gmt_create=1755000000000,
+                              matched_node_id="watch-after", processed=True))
+        db.commit()
+    FakeClient.nodes = {
+        "E": node("watch-early", created_at="2026-08-12T07:59:00"),
+        "A": node("watch-after", created_at="2026-08-12T08:30:00"),
+        "M": node("watch-modified", created_at="2026-08-07T09:00:00",
+                  updated_at="2026-08-13T09:00:00"),
+    }
+    result = cycle(live)
+    assert result["runs"][0]["mode"] == "watch_seed"
+    with SessionLocal() as db:
+        assert jobs_for(db, "watch-early") == []                                   # 上线前 1 分钟 → 存量
+        assert [j.trigger for j in jobs_for(db, "watch-after")] == ["watch"]       # 上线后创建 → 评审
+        assert [j.trigger for j in jobs_for(db, "watch-modified")] == ["watch"]    # 存量上线后被改 → 评审
+        assert db.get(Document, "watch-after").storage_dentry_id == "987654321"    # 下载键找回
+        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id == "987654321").delete(synchronize_session=False)
+        db.commit()
 
 
 def test_watch_skips_unreviewable_file_classes(settings):

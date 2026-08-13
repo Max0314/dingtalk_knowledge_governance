@@ -177,12 +177,22 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     else:
         unlocated = len(wiki_events)
     if unlocated:
-        ring |= governed
+        if len(governed) <= settings.bridge_sweep_max_governed:
+            ring |= governed  # 试点规模的兜底扫，代价可控
+        else:
+            # org 级规模：未定位事件不再触发全库串行扫（会独占 worker 数小时，
+            # codex 2026-08-13 阻断项3）。常规 watcher 轮巡 + KG_REVIEW_SINCE
+            # 是最终发现与评审兜底，下载键由入队时的事件回捞补上。
+            summary["sweep_skipped_governed"] = len(governed)
     summary["unlocated"] = unlocated
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
 
     debounce = max(60, settings.bridge_debounce_seconds)
     for workspace_id in sorted(ring):
+        if len(summary["walks"]) >= 5:
+            # 单轮桥接巡走预算：没走到的库不记时间戳，下一轮自然续走
+            summary["walks_deferred"] = summary.get("walks_deferred", 0) + 1
+            continue
         if time.time() - _last_walk.get(workspace_id, 0) < debounce:
             continue
         _last_walk[workspace_id] = time.time()

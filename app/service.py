@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import Settings
-from .db import Document, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, Workspace, WorkspaceRole, utcnow
+from .db import Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, Workspace, WorkspaceRole, utcnow
 from .fileclass import classify, review_classes
 from .integrations import ADVISORY_GENRES, BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
@@ -20,6 +20,23 @@ def iso(value):
 def robot_keys(settings: Settings) -> set[str]:
     """Machine accounts in either id form (numeric userId / UnionID)."""
     return {token.strip() for token in settings.robot_user_ids.split(",") if token.strip()}
+
+
+def _at_or_after(value: str, cutoff: str) -> bool:
+    """时间到达判定：双方按 ISO 解析（Z 归一为 +00:00，无时区按 UTC），
+    解析失败退回按日字符串前缀比较。空值恒 False。"""
+    if not value or not cutoff:
+        return False
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        edge = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        if edge.tzinfo is None:
+            edge = edge.replace(tzinfo=timezone.utc)
+        return moment >= edge
+    except ValueError:
+        return value[:10] >= cutoff[:10]
 
 
 def is_robot_uploader(settings: Settings, *identifiers: str) -> bool:
@@ -226,13 +243,21 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     uploaded_by_robot = is_robot_uploader(settings, doc.uploader_key, item.get("creator_id", ""), doc.uploader_name)
     allow_enqueue = enqueue
     if not allow_enqueue and settings.review_since:
-        # 补种轮吸收存量，但"上线日之后创建"的文件是真实新增：补种前上传的
-        # 文档不能被静默吞掉（审计桥不巡走未 governed 的库，事件已被消费）。
-        created = (item.get("created_at") or "")[:10]
-        if created and created >= settings.review_since:
+        # 补种轮吸收存量，但上线时刻之后"创建或修改"的都是真实增量：不能被
+        # 静默吞掉（审计桥消费 ungoverned 事件后不会再评）。精确到时刻，
+        # 部署当天早晨传的文件仍算存量（codex 2026-08-13 阻断项1）。
+        if (_at_or_after(item.get("created_at") or "", settings.review_since)
+                or _at_or_after(item.get("updated_at") or "", settings.review_since)):
             allow_enqueue = True
     if (allow_enqueue and (is_new or changed) and not doc.is_folder and not uploaded_by_robot
             and doc.file_class in review_classes(settings.review_classes)):
+        if not doc.storage_dentry_id:
+            # 事件先到、文档后入镜像：桥接当时挂不上的数字下载键在此找回，
+            # 否则补建的评审只能 metadata_only（codex 阻断项2）。
+            event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.matched_node_id == doc.node_id)
+                              .order_by(FileAuditEvent.gmt_create.desc()).limit(1))
+            if event and (event.biz_id or "").isdigit():
+                doc.storage_dentry_id = event.biz_id
         db.flush()
         pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
         if not pending:
@@ -431,7 +456,8 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     except Exception as exc:
         db.rollback()
         run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
-        run.error_detail = f"{type(exc).__name__}: {exc}"[:512]
+        # 只留异常类型：原始 message 可能携带文档名/SQL 参数，不得入错误留痕
+        run.error_detail = type(exc).__name__
     try:
         db.commit()
     except Exception:

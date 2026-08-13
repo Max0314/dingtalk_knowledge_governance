@@ -39,10 +39,11 @@ class Settings(BaseSettings):
     # cannot starve them (2026-08-13 finding). One at a time: a single big
     # library can already take tens of minutes.
     watch_slice_size: int = 1
-    # Seed walks absorb stock silently EXCEPT files created on/after this date
-    # (YYYY-MM-DD, go-live day): an upload into a not-yet-seeded workspace must
-    # still get its review — the audit bridge consumes such events without
-    # walking ungoverned spaces (codex 2026-08-13 blocker #2).
+    # Go-live cutoff, ISO time with timezone (e.g. 2026-08-13T18:30+08:00; a
+    # bare date = that day 00:00 UTC). Seed walks absorb stock silently EXCEPT
+    # files created OR updated at/after this moment: an upload into a
+    # not-yet-seeded workspace must still get its review — the audit bridge
+    # consumes such events without walking ungoverned spaces.
     review_since: str = ""
     # A document is soft-deleted after this many consecutive complete walks
     # without seeing it (recycle-bin restores clear the flag again).
@@ -56,6 +57,9 @@ class Settings(BaseSettings):
     # a debounced targeted walk of the touched workspace does node-exact diffs.
     bridge_enabled: bool = False
     bridge_debounce_seconds: int = 900
+    # Unlocated events sweep ALL governed workspaces only below this count;
+    # at org scale the regular watcher rotation is the discovery fallback.
+    bridge_sweep_max_governed: int = 5
     # "watched" walks only workspaces the mirror already governs (pilot-safe);
     # "mapped" walks any workspace with a learned space mapping (org rollout).
     bridge_scope: str = "watched"
