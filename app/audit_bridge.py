@@ -32,8 +32,10 @@ import uuid as uuid_module
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from datetime import datetime, timezone
+
 from .config import Settings
-from .db import Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewJob, SpaceMap
+from .db import BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewJob, SpaceMap, utcnow
 from .fileclass import review_classes
 from .integrations import DingtalkClient, IntegrationError
 from .service import watch_workspace
@@ -41,13 +43,14 @@ from .service import watch_workspace
 logger = logging.getLogger("kg.bridge")
 
 BATCH = 500
-# 每轮远程定位的 wiki 事件上限：单事件是"搜索+批量节点查询"两个 20s 超时的
-# 串行外呼，放开会独占 worker（codex 2026-08-13 第三轮 P0）。
-WIKI_LOCATE_BUDGET = 8
-# 每轮桥接巡走的库数上限；没走到的库因其事件仍 pending，下一轮自动重建。
+# 每轮远程定位的事件上限与时间预算：单事件是"搜索+批量节点查询"两个 20s
+# 超时的串行外呼，必须双重限额，绝不独占 worker。
+WIKI_LOCATE_BUDGET = 5
+LOCATE_TIME_BUDGET_SECONDS = 30
+# 每轮桥接巡走的库数上限；没走到的库留在持久化队列里下一轮续走。
 WALK_BUDGET = 5
-# 未匹配 wiki 事件的放弃时限：超时后标记 processed 止损（评审与发现由
-# watcher 轮巡 + KG_REVIEW_SINCE 兜底，只损失该文件的提前正文键）。
+# 未能确认匹配的事件转入死信的时限：终态带 dead_letter_* 原因可观测，
+# 不伪装成功（发现与评审由 watcher 轮巡 + KG_REVIEW_SINCE 兜底）。
 GIVE_UP_AFTER_MS = 48 * 3600 * 1000
 
 # In-memory debounce: workspace_id -> monotonic seconds of the last bridge
@@ -124,60 +127,101 @@ def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -
                          trigger="content_key", requested_by="system"))
 
 
-def _complete_wiki_event(db: Session, event: FileAuditEvent, settings: Settings) -> Document | None:
-    """已匹配的事件只有在文档进入镜像后才算完成：挂上数字下载键（或键已在）
-    再标记 processed。文档未到 → 保持 pending，等 watcher/巡走建档后重试。
-    返回镜像文档（用于把它的库加入巡走 ring），未完成返回 None。"""
-    if not event.matched_node_id:
-        return None
+def _enqueue_walk(db: Session, workspace_id: str) -> None:
+    if workspace_id and db.get(BridgeWalk, workspace_id) is None:
+        db.add(BridgeWalk(workspace_id=workspace_id))
+
+
+def _finish(db: Session, event: FileAuditEvent, resolution: str) -> None:
+    event.processed = True
+    event.resolution = resolution
+    _tally_space(db, event)
+
+
+def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings, summary: dict) -> bool:
+    """成功终态的完整定义（codex 第四轮 P0）：locator 确认的节点 + 文档已入
+    镜像 + 正文下载键在文档上。键挂不上（bizId 非数字）转死信而非伪装成功；
+    文档未入镜像保持 pending 重试。"""
+    if event.match_status != "confirmed" or not event.matched_node_id:
+        return False
     _attach_numeric_id(db, event, settings)
     doc = db.get(Document, event.matched_node_id)
     if doc is None:
-        return None
-    if not event.processed:
-        event.processed = True
-        _tally_space(db, event)
-    return doc
+        return False
+    _enqueue_walk(db, doc.workspace_id)  # 事件说这个库有写操作：欠一次快巡走
+    if doc.storage_dentry_id:
+        _finish(db, event, "done")
+        return True
+    if not (event.biz_id or "").isdigit():
+        _finish(db, event, "dead_letter_no_numeric_biz_id")
+        summary["dead_letter"] = summary.get("dead_letter", 0) + 1
+        return True
+    return False
+
+
+def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, summary: dict) -> None:
+    """名称唯一联结只给 provisional 候选：同名新上传绝不能据此挂到旧节点
+    （codex 第四轮 P0）。仅 locator 的精确 node id 才能 confirmed。"""
+    if event.matched_node_id:
+        return
+    node_id = _unique_node_match(db, event, snapshot_id)
+    if node_id:
+        event.matched_node_id = node_id
+        event.match_status = "provisional"
+        summary["matched"] += 1
 
 
 def process_audit_events(db: Session, settings: Settings) -> dict:
-    """One bridge cycle. Wiki 事件采用"完成才消费"生命周期（codex 第三轮）：
-    未定位/文档未入镜像的事件保持 pending 逐轮重试，超时才放弃；每轮的远程
-    定位与巡走都有预算，绝不独占 worker。非 wiki 事件一次性消费。"""
+    """One bridge cycle.「完成才消费」生命周期：wiki 事件唯有 locator 确认
+    节点、文档入镜像、下载键在文档上才算 done；到期未确认转 dead_letter_*
+    可观测死信。定位按"最久未尝试"轮转取额（公平），巡走走持久化队列
+    （预算外的库下轮续走），两者都有硬预算，绝不独占 worker。"""
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
-    summary = {"events": len(events), "wiki_events": 0, "matched": 0, "walks": []}
+    summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
     snapshot_id = _latest_snapshot_id(db)
     wiki_events: list[FileAuditEvent] = []
-    ring: set[str] = set()  # 已定位/已完成事件对应的库：定向快巡走
     for event in events:
         if not _is_wiki_write(event):
             event.processed = True
             continue
         summary["wiki_events"] += 1
         wiki_events.append(event)
-        if not event.matched_node_id:
-            node_id = _unique_node_match(db, event, snapshot_id)
-            if node_id:
-                event.matched_node_id = node_id
-                summary["matched"] += 1
-        done = _complete_wiki_event(db, event, settings)
-        if done is not None:
-            ring.add(done.workspace_id)  # 事件说这个库有写操作：快巡走做节点级 diff
+        _provisional_match(db, event, snapshot_id, summary)
+        if event.match_status == "provisional" and event.matched_node_id:
+            doc = db.get(Document, event.matched_node_id)
+            if doc is not None:
+                _enqueue_walk(db, doc.workspace_id)  # 门铃提示：该库可能有写操作
+        _try_finish_confirmed(db, event, settings, summary)
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
-    if not pending_wiki and not ring:
-        return summary
 
-    # Locator: a wiki-search by file name gives the doorbell an address.
+    # Locator: a wiki-search by file name gives the doorbell an address, and
+    # its exact node ids are the ONLY authoritative match. 公平轮转：按
+    # 最久未尝试优先，避免固定队首饿死后来者。
     governed = set(_governed_workspaces(db))
     located_ungoverned: set[str] = set()
     unlocated = 0
+    now = utcnow()
     now_ms = int(time.time() * 1000)
-    if settings.bridge_locator_enabled and settings.wiki_storage_space_id and pending_wiki:
+    def _attempt_key(event: FileAuditEvent):
+        # SQLite 回读为 naive、MySQL 驱动亦然；统一裁成 naive UTC 排序
+        at = event.last_attempt_at
+        if at is None:
+            return (datetime.min, event.gmt_create or 0)
+        if at.tzinfo is not None:
+            at = at.astimezone(timezone.utc).replace(tzinfo=None)
+        return (at, event.gmt_create or 0)
+
+    candidates = sorted((e for e in pending_wiki if e.match_status != "confirmed"), key=_attempt_key)
+    if settings.bridge_locator_enabled and settings.wiki_storage_space_id and candidates:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
-        for event in [e for e in pending_wiki if not e.matched_node_id][:WIKI_LOCATE_BUDGET]:
+        started = time.monotonic()
+        for event in candidates[:WIKI_LOCATE_BUDGET]:
+            if time.monotonic() - started > LOCATE_TIME_BUDGET_SECONDS:
+                break
+            event.last_attempt_at = now
             names = _name_candidates(event)
             try:
                 # Storage search returns dentryUuids (== wiki nodeIds); the wiki
@@ -196,62 +240,66 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                 continue
             for workspace_id in workspaces:
                 if workspace_id in governed or settings.bridge_scope == "mapped":
-                    ring.add(workspace_id)
+                    _enqueue_walk(db, workspace_id)
                 else:
                     located_ungoverned.add(workspace_id)
             node_ids = {node["node_id"] for node in hits if node.get("node_id")}
-            if not event.matched_node_id and len(node_ids) == 1:
-                event.matched_node_id = node_ids.pop()
-                summary["matched"] += 1
-            done = _complete_wiki_event(db, event, settings)
-            if done is not None:
-                ring.add(done.workspace_id)
-    else:
-        unlocated = len(pending_wiki)
+            if len(node_ids) == 1:
+                confirmed_id = node_ids.pop()
+                if event.matched_node_id != confirmed_id:
+                    summary["matched"] += 1
+                event.matched_node_id = confirmed_id
+                event.match_status = "confirmed"
+                summary["confirmed"] += 1
+            _try_finish_confirmed(db, event, settings, summary)
+    elif candidates:
+        unlocated = len(candidates)
     if unlocated:
         if len(governed) <= settings.bridge_sweep_max_governed:
-            ring |= governed  # 试点规模的兜底扫，代价可控
+            for workspace_id in governed:
+                _enqueue_walk(db, workspace_id)  # 试点规模的兜底扫，代价可控
         else:
-            # org 级规模：未定位事件不触发全库串行扫；事件保持 pending，
-            # 发现与评审由 watcher 轮巡 + KG_REVIEW_SINCE 兜底。
+            # org 级规模：未定位事件不触发全库兜底；发现与评审由 watcher
+            # 轮巡 + KG_REVIEW_SINCE 兜底。
             summary["sweep_skipped_governed"] = len(governed)
     summary["unlocated"] = unlocated
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
 
-    debounce = max(60, settings.bridge_debounce_seconds)
-    for workspace_id in sorted(ring):
-        if len(summary["walks"]) >= WALK_BUDGET:
-            # 巡走预算：没走到的库对应事件仍 pending，下一轮 ring 会重建
-            summary["walks_deferred"] = summary.get("walks_deferred", 0) + 1
-            continue
-        if time.time() - _last_walk.get(workspace_id, 0) < debounce:
-            continue
-        _last_walk[workspace_id] = time.time()
-        run = asyncio.run(watch_workspace(db, settings, workspace_id, mode="bridge"))
-        if run.status != "succeeded":
-            _last_walk.pop(workspace_id, None)  # let the next event retry at once
-        summary["walks"].append({"workspace_id": workspace_id, "run_id": run.run_id, "mode": run.mode,
-                                 "status": run.status, "new": run.documents_new,
-                                 "changed": run.documents_changed, "error_code": run.error_code})
-    # Files the walks just mirrored can now satisfy the unique-name join;
-    # anything still unmatched past the deadline gives up (loss = early body
-    # key only — discovery and review are covered elsewhere).
+    # 死信裁决：到期仍未完成的事件带原因归档，绝不伪装成功。
     for event in pending_wiki:
         if event.processed:
             continue
-        if not event.matched_node_id:
-            node_id = _unique_node_match(db, event, snapshot_id)
-            if node_id:
-                event.matched_node_id = node_id
-                summary["matched"] += 1
-        if _complete_wiki_event(db, event, settings) is None:
-            if event.gmt_create and now_ms - event.gmt_create > GIVE_UP_AFTER_MS:
-                event.processed = True
-                _tally_space(db, event)
-                summary["gave_up"] = summary.get("gave_up", 0) + 1
+        if event.gmt_create and now_ms - event.gmt_create > GIVE_UP_AFTER_MS:
+            reason = "dead_letter_no_doc" if event.match_status == "confirmed" else "dead_letter_unmatched"
+            _finish(db, event, reason)
+            summary["dead_letter"] = summary.get("dead_letter", 0) + 1
     summary["pending_retry"] = sum(1 for event in pending_wiki if not event.processed)
     db.commit()
+    _drain_walk_queue(db, settings, summary)
+    db.commit()
     return summary
+
+
+def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
+    """持久化巡走队列：成功才出队，失败/超预算/去抖中的行留队续走——
+    "下一轮续走"是表结构保证，不是内存愿望（codex 第四轮 P1）。"""
+    debounce = max(60, settings.bridge_debounce_seconds)
+    rows = db.scalars(select(BridgeWalk).order_by(BridgeWalk.requested_at)).all()
+    for row in rows:
+        if len(summary["walks"]) >= WALK_BUDGET:
+            summary["walks_deferred"] = summary.get("walks_deferred", 0) + 1
+            continue
+        if time.time() - _last_walk.get(row.workspace_id, 0) < debounce:
+            continue  # 去抖窗口内：行留队，窗口过后自然续走
+        _last_walk[row.workspace_id] = time.time()
+        run = asyncio.run(watch_workspace(db, settings, row.workspace_id, mode="bridge"))
+        if run.status == "succeeded":
+            db.delete(row)
+        else:
+            _last_walk.pop(row.workspace_id, None)  # let the next pass retry at once
+        summary["walks"].append({"workspace_id": row.workspace_id, "run_id": run.run_id, "mode": run.mode,
+                                 "status": run.status, "new": run.documents_new,
+                                 "changed": run.documents_changed, "error_code": run.error_code})
 
 
 def bridge_status(db: Session) -> dict:

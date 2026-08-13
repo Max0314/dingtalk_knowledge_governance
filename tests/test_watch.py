@@ -192,7 +192,7 @@ def test_review_since_precise_moment_updated_at_and_key_recovery(settings):
     with SessionLocal() as db:
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id == "987654321").delete(synchronize_session=False)
         db.add(FileAuditEvent(biz_id="987654321", gmt_create=1755000000000,
-                              matched_node_id="watch-after", processed=True))
+                              matched_node_id="watch-after", match_status="confirmed", processed=True))
         db.commit()
     FakeClient.nodes = {
         "E": node("watch-early", created_at="2026-08-12T07:59:00"),

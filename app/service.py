@@ -253,8 +253,11 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             and doc.file_class in review_classes(settings.review_classes)):
         if not doc.storage_dentry_id:
             # 事件先到、文档后入镜像：桥接当时挂不上的数字下载键在此找回，
-            # 否则补建的评审只能 metadata_only（codex 阻断项2）。
-            event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.matched_node_id == doc.node_id)
+            # 否则补建的评审只能 metadata_only。只认 locator 确认的匹配——
+            # 名称联结是 provisional，同名新文件的键绝不能挂旧节点。
+            event = db.scalar(select(FileAuditEvent)
+                              .where(FileAuditEvent.matched_node_id == doc.node_id,
+                                     FileAuditEvent.match_status == "confirmed")
                               .order_by(FileAuditEvent.gmt_create.desc()).limit(1))
             if event and (event.biz_id or "").isdigit():
                 doc.storage_dentry_id = event.biz_id

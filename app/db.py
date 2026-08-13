@@ -333,8 +333,26 @@ class FileAuditEvent(Base):
     ip_address: Mapped[str] = mapped_column(String(64), default="")
     platform: Mapped[str] = mapped_column(String(32), default="")
     matched_node_id: Mapped[str] = mapped_column(id_string(), default="")  # filled by the future matcher
+    # Match confidence: "" (none) / "provisional" (name join — advisory only,
+    # never attaches keys: a same-named NEW upload must not be pinned to an
+    # old node) / "confirmed" (locator exact node id — authoritative).
+    match_status: Mapped[str] = mapped_column(String(16), default="")
+    # Terminal outcome when processed: "done" or a dead_letter_* reason —
+    # a give-up must be observable, not disguised as success.
+    resolution: Mapped[str] = mapped_column(String(32), default="")
+    # Fair retry rotation: locator picks the least-recently attempted first.
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class BridgeWalk(Base):
+    """Persistent bridge-walk queue: workspaces the audit bridge owes a fast
+    targeted walk. Rows survive restarts and per-pass walk budgets — the
+    sixth workspace of a burst is walked next pass, not forgotten."""
+    __tablename__ = "bridge_walk_queue"
+    workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuditDailyAgg(Base):
@@ -441,6 +459,9 @@ EXTRA_COLUMNS = {
                   "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
                   "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
     "workspaces": {"watch_seeded": "TINYINT(1) NOT NULL DEFAULT 0"},
+    "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
+                          "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
+                          "last_attempt_at": "DATETIME NULL"},
 }
 
 

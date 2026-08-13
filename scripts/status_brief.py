@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db import (AuditState, Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob, SessionLocal,
-                    SyncRun, Workspace, init_db, utcnow)
+from app.db import (AuditState, BridgeWalk, Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob,
+                    SessionLocal, SyncRun, Workspace, init_db, utcnow)
 
 
 def main() -> None:
@@ -52,6 +52,19 @@ def main() -> None:
             "registered_workspaces": db.scalar(select(func.count()).select_from(Workspace)) or 0,
             "seeded": db.scalar(select(func.count()).select_from(Workspace)
                                 .where(Workspace.watch_seeded.is_(True))) or 0}
+        week_ago = utcnow() - timedelta(days=7)
+        out["bridge"] = {
+            "pending_retry": db.scalar(select(func.count()).select_from(FileAuditEvent)
+                                       .where(FileAuditEvent.processed.is_(False))) or 0,
+            "dead_letter_total": db.scalar(select(func.count()).select_from(FileAuditEvent)
+                                           .where(FileAuditEvent.resolution.like("dead_letter%"))) or 0,
+            "walk_queue": db.scalar(select(func.count()).select_from(BridgeWalk)) or 0,
+            # 新增文档没拿到正文下载键的规模：正文评审保障的直接观测口径
+            "new_docs_without_key_7d": db.scalar(
+                select(func.count()).select_from(Document)
+                .where(Document.is_folder.is_(False), Document.is_deleted.is_(False),
+                       Document.storage_dentry_id == "", Document.discovered_at >= week_ago)) or 0,
+        }
         latest_audit_ms = db.scalar(select(func.max(FileAuditEvent.gmt_create)))
         audit_state = db.scalars(select(AuditState)).first()
         out["audit"] = {
