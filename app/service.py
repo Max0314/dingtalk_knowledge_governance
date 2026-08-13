@@ -224,7 +224,14 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
     uploaded_by_robot = is_robot_uploader(settings, doc.uploader_key, item.get("creator_id", ""), doc.uploader_name)
-    if (enqueue and (is_new or changed) and not doc.is_folder and not uploaded_by_robot
+    allow_enqueue = enqueue
+    if not allow_enqueue and settings.review_since:
+        # 补种轮吸收存量，但"上线日之后创建"的文件是真实新增：补种前上传的
+        # 文档不能被静默吞掉（审计桥不巡走未 governed 的库，事件已被消费）。
+        created = (item.get("created_at") or "")[:10]
+        if created and created >= settings.review_since:
+            allow_enqueue = True
+    if (allow_enqueue and (is_new or changed) and not doc.is_folder and not uploaded_by_robot
             and doc.file_class in review_classes(settings.review_classes)):
         db.flush()
         pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import func, select
 
 from app.config import get_settings
-from app.db import Document, Notification, ReviewInstance, ReviewJob, SessionLocal, SyncRun, init_db, utcnow
+from app.db import (Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob, SessionLocal, SyncRun,
+                    Workspace, init_db, utcnow)
 
 
 def main() -> None:
@@ -41,6 +42,20 @@ def main() -> None:
             .where(SyncRun.mode.in_(("watch", "watch_seed")), SyncRun.status == "failed",
                    SyncRun.created_at >= day_ago)
             .group_by(SyncRun.error_code)).all()}
+        out["failed_runs_24h"] = [
+            {"workspace": run.workspace_name or run.workspace_id or "?", "mode": run.mode,
+             "error": run.error_code, "detail": (run.error_detail or "")[:120],
+             "at": run.created_at.isoformat(timespec="seconds")}
+            for run in db.scalars(select(SyncRun).where(SyncRun.status == "failed", SyncRun.created_at >= day_ago)
+                                  .order_by(SyncRun.created_at.desc()).limit(5)).all()]
+        out["watch_seed_progress"] = {
+            "registered_workspaces": db.scalar(select(func.count()).select_from(Workspace)) or 0,
+            "seeded": db.scalar(select(func.count()).select_from(Workspace)
+                                .where(Workspace.watch_seeded.is_(True))) or 0}
+        latest_audit_ms = db.scalar(select(func.max(FileAuditEvent.gmt_create)))
+        out["audit"] = {"enabled": settings.audit_pull_enabled,
+                        "latest_event_at": (datetime.fromtimestamp(latest_audit_ms / 1000, tz=timezone.utc)
+                                            .isoformat(timespec="seconds") if latest_audit_ms else None)}
         out["mirror"] = {
             "workspaces": db.scalar(select(func.count(func.distinct(Document.workspace_id)))) or 0,
             "documents": db.scalar(select(func.count()).select_from(Document)

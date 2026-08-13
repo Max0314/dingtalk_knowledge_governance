@@ -9,6 +9,8 @@ const nf=v=>Number(v||0).toLocaleString('zh-CN');
 const fmt=v=>v||'—';
 const scoreClass=s=>s>=80?'good':s>=60?'warn':'bad';
 const verdictText=v=>({pass:'通过',manual_review:'待人工审核',return:'退回'})[v]||v;
+const NOTE_ZH={no_numeric_id:'缺正文下载键（等审计事件）',unsupported:'格式不支持提取',too_large:'文件过大',disabled:'正文提取未启用',empty_download:'下载为空',extract_empty:'提取结果为空'};
+const noteText=v=>!v?'':(NOTE_ZH[v]||(String(v).startsWith('fetch_failed')?'正文下载失败':v));
 const COLOR={routine:'#2563eb',bulk:'#f59e0b'};
 function toast(msg){const x=document.querySelector('#toast');x.textContent=msg;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),2800)}
 
@@ -318,7 +320,7 @@ async function documentDetail(id){const d=await api('/api/v1/documents/'+id);con
   <section class="card"><div class="detail-header"><div class="document-icon">▤</div><div><h2 style="margin:0">${d.name}</h2><p class="sub">节点 ${d.node_id} · 知识库 ${state.coverageNames[d.workspace_id]||d.workspace_id}</p><div class="detail-meta"><span>上传人：${fmt(d.uploader_name)}</span><span>入库时间：${fmt(d.source_created_at)}</span><span>归属：${fmt(d.department_name)} / ${fmt(d.biz_group_name)}</span><span>重评次数：${d.rerun_count}</span></div></div><div class="big-score">${r&&r.ai_score>0?r.ai_score:'—'}<span>/100</span><br><small>${r?verdictText(r.verdict):'未评审'}</small></div></div></section>
   ${dualBanner}
   <section class="grid deductions section-gap">${ruleDims.map(x=>`<article class="card deduction${x.advisory?' muted':''}"><div class="field-label">${x.label}${x.advisory?' <span class="chip amber">仅提示不计分</span>':''}</div><div class="number">${x.advisory?'<small>该文体不适用</small>':`-${x.deduction}<small> / ${x.cap}</small>`}</div><ul>${x.findings.length?x.findings.map(f=>`<li>${f.message}</li>`).join(''):'<li>未发现扣分项</li>'}</ul></article>`).join('')||'<div class="card muted">暂无评审维度数据</div>'}</section>
-  <section class="card section-gap"><h2>评审记录</h2>${d.reviews.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>实例 ID</th><th class="num">分数</th><th>范围</th><th>触发</th><th>规则版本</th><th>时间</th></tr></thead><tbody>${d.reviews.map(x=>`<tr><td><small>${x.review_instance_id}</small></td><td class="num score ${scoreClass(x.ai_score)}">${x.ai_score}</td><td>${x.review_scope==='full_content'?'完整正文':`元数据合规${x.content_note?`<br><small style="color:#9ca3af" title="正文不可用原因">${x.content_note}</small>`:''}`}</td><td>${x.trigger}</td><td>${x.rule_version}${x.rule_config_ref&&x.rule_config_ref!=='builtin'?`<br><small style="color:#9ca3af">${x.rule_config_ref}</small>`:''}</td><td>${(x.created_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无记录</p>'}
+  <section class="card section-gap"><h2>评审记录</h2>${d.reviews.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>实例 ID</th><th class="num">分数</th><th>范围</th><th>触发</th><th>规则版本</th><th>时间</th></tr></thead><tbody>${d.reviews.map(x=>`<tr><td><small>${x.review_instance_id}</small></td><td class="num score ${scoreClass(x.ai_score)}">${x.ai_score}</td><td>${x.review_scope==='full_content'?'完整正文':`元数据合规${x.content_note?`<br><small style="color:#9ca3af" title="${x.content_note}">${noteText(x.content_note)}</small>`:''}`}</td><td>${x.trigger}</td><td>${x.rule_version}${x.rule_config_ref&&x.rule_config_ref!=='builtin'?`<br><small style="color:#9ca3af">${x.rule_config_ref}</small>`:''}</td><td>${(x.created_at||'').replace('T',' ').slice(0,19)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无记录</p>'}
   <div class="section-gap"><button class="primary" id="rerun">重新评审</button><button class="secondary" id="back" style="margin-left:8px">返回</button></div></section>`);
   document.querySelector('#back').onclick=()=>goBack('documents');
   document.querySelector('#rerun').onclick=async()=>{const j=await api('/api/v1/documents/'+id+'/reviews',{method:'POST',body:JSON.stringify({trigger:'manual_rerun'})});toast('已提交评审任务 '+j.job_id.slice(0,8))}}
@@ -435,9 +437,13 @@ async function models(editing){const d=await api('/api/v1/model-configs');
     document.querySelectorAll('[data-rb]').forEach(r=>r.onclick=async()=>{if(!confirm('回滚到该历史版本？当前状态会先留档。'))return;
       await api('/api/v1/model-configs/'+r.dataset.cfg+'/rollback/'+r.dataset.rb,{method:'POST'});toast('已回滚');models()})})}
 
-async function diagnostics(){const[d,n]=await Promise.all([api('/api/v1/diagnostics/connectivity'),api('/api/v1/notifications?limit=10').catch(()=>null)]);
+async function diagnostics(){const[d,n,sr]=await Promise.all([api('/api/v1/diagnostics/connectivity'),api('/api/v1/notifications?limit=10').catch(()=>null),api('/api/v1/diagnostics/sync-runs?status=failed').catch(()=>null)]);
   shell('连接诊断',d.body_storage,`
   <section class="card"><h2>外部接口状态</h2>${d.items.map(x=>`<div class="diagnostic"><span class="health ${x.status}"></span><div><b>${x.name}</b><br><small>${x.status}</small></div><span class="message">${x.message}</span></div>`).join('')}<div class="section-gap"><button class="primary" id="refresh">刷新诊断</button></div></section>
+  ${sr&&sr.items&&sr.items.length?`<section class="card section-gap"><div class="card-head"><h2>最近监控异常</h2><span class="hint">近 30 条运行里的失败记录，含所属知识库与异常详情</span></div>
+    <div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>模式</th><th>错误码</th><th>详情</th><th>时间</th></tr></thead><tbody>
+    ${sr.items.slice(0,10).map(x=>`<tr><td><b>${x.workspace_name||x.workspace_id||'—'}</b></td><td><small>${x.mode}</small></td><td><small>${x.error_code||'—'}</small></td><td><small>${(x.error_detail||'').slice(0,90)||'—'}</small></td><td><small>${(x.created_at||'').replace('T',' ').slice(0,19)}</small></td></tr>`).join('')}
+  </tbody></table></div></section>`:''}
   ${n?`<section class="card section-gap"><div class="card-head"><h2>评审结果推送（机器人）</h2><span class="chip ${n.notify_enabled?'green':'gray'}">${n.notify_enabled?'已启用':'未启用（KG_NOTIFY_ENABLED）'}</span></div>
     <p class="hint">robotCode：${n.robot_code} · 不合格评审自动入队，worker 逐条发送并留痕。</p>
     <div class="controls"><input class="input" id="test-uid" placeholder="接收人 userId（如 01115324500438248944）" style="min-width:280px"><button class="secondary" id="test-send">发送测试消息</button></div>

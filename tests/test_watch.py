@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app import service
 from app.config import get_settings
-from app.db import Document, ReviewInstance, ReviewJob, SessionLocal, init_db
+from app.db import Document, ReviewInstance, ReviewJob, SessionLocal, Workspace, init_db
 
 WS = "watch-ws"
 
@@ -58,7 +58,10 @@ def settings(monkeypatch):
             db.query(ReviewJob).filter(ReviewJob.node_id.in_(node_ids)).delete(synchronize_session=False)
             db.query(ReviewInstance).filter(ReviewInstance.node_id.in_(node_ids)).delete(synchronize_session=False)
             db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
-            db.commit()
+        ws = db.get(Workspace, WS)
+        if ws:
+            ws.watch_seeded = False  # 补种标记持久于共享测试库，必须随夹具复位
+        db.commit()
     return get_settings().model_copy(update={"watch_workspaces": "个人库", "watch_delete_misses": 2,
                                              "dingtalk_sync_operator_id": "op-test"})
 
@@ -148,6 +151,38 @@ def test_robot_uploads_never_enter_review_queue(settings):
     cycle(robot_settings)
     with SessionLocal() as db:
         assert jobs_for(db, "watch-robot-doc2") == []  # robot upload: mirrored but never reviewed
+
+
+def test_interrupted_seed_stays_seed_and_absorbs_stock(settings):
+    """半途而废的补种：镜像非空但 watch_seeded 未置位 → 下一轮仍是 seed，
+    存量不得灌入评审；完整走完才置位（codex 2026-08-13 阻断项）。"""
+    FakeClient.nodes = {"A": node("watch-A"), "B": node("watch-B")}
+    with SessionLocal() as db:
+        db.merge(Document(node_id="watch-A", workspace_id=WS, name="文件watch-A.docx", extension="docx"))
+        db.commit()  # 模拟上一轮补种被重启打断：镜像已有 A，标记未置位
+    result = cycle(settings)
+    assert result["runs"][0]["mode"] == "watch_seed"
+    with SessionLocal() as db:
+        assert jobs_for(db, "watch-A") == [] and jobs_for(db, "watch-B") == []
+        assert db.get(Workspace, WS).watch_seeded
+    FakeClient.nodes["C"] = node("watch-C")
+    second = cycle(settings)
+    assert second["runs"][0]["mode"] == "watch"
+    with SessionLocal() as db:
+        assert [job.trigger for job in jobs_for(db, "watch-C")] == ["watch"]
+
+
+def test_seed_reviews_files_created_after_go_live(settings):
+    """KG_REVIEW_SINCE：补种期间创建时间在上线日之后的文件也要评审——
+    上线后传进未补种库的文档不能被静默吸收（codex 阻断项 2）。"""
+    live = settings.model_copy(update={"review_since": "2026-08-10"})
+    FakeClient.nodes = {"S": node("watch-stock", created_at="2026-08-07T09:00:00"),
+                        "N": node("watch-fresh", created_at="2026-08-12T09:00:00")}
+    result = cycle(live)
+    assert result["runs"][0]["mode"] == "watch_seed"
+    with SessionLocal() as db:
+        assert jobs_for(db, "watch-stock") == []
+        assert [job.trigger for job in jobs_for(db, "watch-fresh")] == ["watch"]
 
 
 def test_watch_skips_unreviewable_file_classes(settings):

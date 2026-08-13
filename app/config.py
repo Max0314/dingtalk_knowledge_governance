@@ -36,8 +36,14 @@ class Settings(BaseSettings):
     watch_interval_seconds: int = 300
     # Workspaces walked per worker slice; between slices the loop drains
     # review jobs / notifications / audit pull, so a 140-workspace cycle
-    # cannot starve them (2026-08-13 finding).
-    watch_slice_size: int = 2
+    # cannot starve them (2026-08-13 finding). One at a time: a single big
+    # library can already take tens of minutes.
+    watch_slice_size: int = 1
+    # Seed walks absorb stock silently EXCEPT files created on/after this date
+    # (YYYY-MM-DD, go-live day): an upload into a not-yet-seeded workspace must
+    # still get its review — the audit bridge consumes such events without
+    # walking ungoverned spaces (codex 2026-08-13 blocker #2).
+    review_since: str = ""
     # A document is soft-deleted after this many consecutive complete walks
     # without seeing it (recycle-bin restores clear the flag again).
     watch_delete_misses: int = 2

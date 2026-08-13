@@ -44,6 +44,9 @@ def main() -> None:
         open_jobs = [job for job in (db.scalars(select(ReviewJob).where(ReviewJob.status.in_(("pending", "running")))).all())
                      if (doc := db.get(Document, job.node_id)) is not None
                      and is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)]
+        # 已完成 job 指向将被删除的实例：引用置空，避免悬空 result id
+        done_jobs = db.scalars(select(ReviewJob)
+                               .where(ReviewJob.result_review_instance_id.in_(instance_ids))).all() if instance_ids else []
         print(json.dumps({
             "mode": "APPLIED" if apply_changes else "DRY-RUN（加 --apply 执行）",
             "robot_documents_reviewed": len(robot_nodes),
@@ -51,6 +54,7 @@ def main() -> None:
             "decisions_to_delete": len(decisions),
             "notifications_to_delete": len(notifications),
             "open_jobs_to_cancel": len(open_jobs),
+            "done_jobs_result_ref_to_clear": len(done_jobs),
         }, ensure_ascii=False, indent=1))
         for item in robot_nodes[:50]:
             print(f"[机器人文档] {item['name']}（上传人 {item['uploader']}）")
@@ -64,6 +68,8 @@ def main() -> None:
             db.delete(row)
         for job in open_jobs:
             job.status, job.error_code, job.finished_at = "skipped", "robot_uploader", utcnow()
+        for job in done_jobs:
+            job.result_review_instance_id = ""
         db.commit()
         print("done")
 

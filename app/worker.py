@@ -20,14 +20,31 @@ def main() -> None:
         swept = sweep_stale_runs(db)
         if swept:
             logger.info("swept %s stale running sync runs", swept)
-    # First watch tick shortly after boot so a fresh deploy proves itself
-    # without waiting a full interval; later ticks follow the configured pace.
-    next_watch_at = time.time() + 5 if settings.watch_workspaces else None
-    next_audit_at = time.time() + 10 if settings.audit_pull_enabled else None
+    # Audit gets the earlier boot tick and runs FIRST in the loop: it is the
+    # storage-key and change-signal source, and must not queue behind a long
+    # walk or a batch of model reviews (codex 2026-08-13 finding).
+    next_watch_at = time.time() + 10 if settings.watch_workspaces else None
+    next_audit_at = time.time() + 5 if settings.audit_pull_enabled else None
     while True:
+        if next_audit_at is not None and time.time() >= next_audit_at:
+            try:
+                with SessionLocal() as db:
+                    audit = run_audit_pull(db, settings)
+                logger.info("audit pull: %s", audit)
+            except Exception:
+                logger.exception("audit pull failed")
+            if settings.bridge_enabled:
+                try:
+                    with SessionLocal() as db:
+                        bridge = process_audit_events(db, settings)
+                    if bridge["wiki_events"] or bridge["walks"]:
+                        logger.info("audit bridge: %s", bridge)
+                except Exception:
+                    logger.exception("audit bridge failed")
+            next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
         with SessionLocal() as db:
             processed = 0
-            for _ in range(20):  # drain a batch between watch slices
+            for _ in range(3):  # 小额度：模型评审单笔可达 2 分钟，不许垄断循环
                 if not process_next_job(db, settings):
                     break
                 processed += 1
@@ -52,22 +69,6 @@ def main() -> None:
             except Exception:
                 logger.exception("watch slice failed")
                 next_watch_at = time.time() + 60
-        if next_audit_at is not None and time.time() >= next_audit_at:
-            try:
-                with SessionLocal() as db:
-                    audit = run_audit_pull(db, settings)
-                logger.info("audit pull: %s", audit)
-            except Exception:
-                logger.exception("audit pull failed")
-            if settings.bridge_enabled:
-                try:
-                    with SessionLocal() as db:
-                        bridge = process_audit_events(db, settings)
-                    if bridge["wiki_events"] or bridge["walks"]:
-                        logger.info("audit bridge: %s", bridge)
-                except Exception:
-                    logger.exception("audit bridge failed")
-            next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
         time.sleep(0.5 if processed or notified else 3)
 
 

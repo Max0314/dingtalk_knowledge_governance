@@ -910,8 +910,18 @@ async def connectivity(db: Session = Depends(db_session)):
 
 
 @app.get("/api/v1/diagnostics/sync-runs", dependencies=[Depends(require_admin)])
-def sync_runs(db: Session = Depends(db_session)):
-    return {"items": [{"run_id": x.run_id, "status": x.status, "mode": x.mode, "workspaces_seen": x.workspaces_seen, "documents_seen": x.documents_seen, "documents_new": x.documents_new, "documents_changed": x.documents_changed, "error_code": x.error_code, "created_at": x.created_at.isoformat(), "finished_at": x.finished_at.isoformat() if x.finished_at else None} for x in db.scalars(select(SyncRun).order_by(SyncRun.created_at.desc()).limit(30)).all()]}
+def sync_runs(status: str = "", db: Session = Depends(db_session)):
+    stmt = select(SyncRun).order_by(SyncRun.created_at.desc()).limit(30)
+    if status:
+        stmt = stmt.where(SyncRun.status == status)
+    return {"items": [{"run_id": x.run_id, "status": x.status, "mode": x.mode,
+                       "workspace_id": x.workspace_id, "workspace_name": x.workspace_name,
+                       "workspaces_seen": x.workspaces_seen, "documents_seen": x.documents_seen,
+                       "documents_new": x.documents_new, "documents_changed": x.documents_changed,
+                       "error_code": x.error_code, "error_detail": x.error_detail,
+                       "created_at": x.created_at.isoformat(),
+                       "finished_at": x.finished_at.isoformat() if x.finished_at else None}
+                      for x in db.scalars(stmt).all()]}
 
 
 @app.post("/api/v1/sync-runs", status_code=202, dependencies=[Depends(require_admin)])
