@@ -197,8 +197,12 @@ def process_next_job(db: Session, settings: Settings) -> bool:
 
 
 async def _upsert_document(db: Session, settings: Settings, run: SyncRun, workspace_id: str, item: dict,
-                           enqueue: bool, trigger_new: str, trigger_change: str) -> None:
-    """Persist one listed node and, when appropriate, queue a review.
+                           enqueue: bool, trigger_new: str, trigger_change: str,
+                           parent_node_id: str = "") -> None:
+    """Persist one listed node. Walks are mirror-only (2026-08-14 流程定稿)：
+    评审只由审计事件链触发；全量核对发现的新增/变化只更新镜像与目录，
+    绝不补评审（审计漏捕另行观测）。``enqueue`` 参数保留签名兼容，恒不
+    入队。
 
     ``item`` is a ``normalize_node`` dict — the source timestamps live under
     ``created_at``/``updated_at`` (mapping them onto ``source_*`` columns here
@@ -221,6 +225,11 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     doc.source_updated_at = item.get("updated_at") or ""
     doc.is_folder = item["has_children"]
     doc.file_class = classify(doc.extension, doc.is_folder)
+    if parent_node_id or is_new:
+        # 遍历路径天然知道父节点：写入并清掉"目录待定"（审计直建的文档
+        # 在此被每月核对补准归属）。
+        doc.parent_node_id = parent_node_id or doc.parent_node_id or ""
+        doc.directory_pending = False
     if doc.is_deleted:  # seen again — a recycle-bin restore, not a new document
         doc.is_deleted = False
     doc.watch_misses = 0
@@ -242,32 +251,9 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    uploaded_by_robot = is_robot_uploader(settings, doc.uploader_key, item.get("creator_id", ""), doc.uploader_name)
-    allow_enqueue = enqueue
-    if not allow_enqueue and settings.review_since:
-        # 补种轮吸收存量，但上线时刻之后"创建或修改"的都是真实增量：不能被
-        # 静默吞掉（审计桥消费 ungoverned 事件后不会再评）。精确到时刻，
-        # 部署当天早晨传的文件仍算存量（codex 2026-08-13 阻断项1）。
-        if (_at_or_after(item.get("created_at") or "", settings.review_since)
-                or _at_or_after(item.get("updated_at") or "", settings.review_since)):
-            allow_enqueue = True
-    if (allow_enqueue and (is_new or changed) and not doc.is_folder and not uploaded_by_robot
-            and doc.file_class in review_classes(settings.review_classes)):
-        if not doc.storage_dentry_id:
-            # 事件先到、文档后入镜像：桥接当时挂不上的数字下载键在此找回，
-            # 否则补建的评审只能 metadata_only。只认 locator 确认的匹配——
-            # 名称联结是 provisional，同名新文件的键绝不能挂旧节点。
-            event = db.scalar(select(FileAuditEvent)
-                              .where(FileAuditEvent.matched_node_id == doc.node_id,
-                                     FileAuditEvent.match_status == "confirmed")
-                              .order_by(FileAuditEvent.gmt_create.desc()).limit(1))
-            if event and (event.biz_id or "").isdigit():
-                doc.storage_dentry_id = event.biz_id
-        db.flush()
-        pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id, ReviewJob.status.in_(("pending", "running"))))
-        if not pending:
-            db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
-                             trigger=trigger_new if is_new else trigger_change, requested_by="system"))
+    # 2026-08-14 流程定稿：全量/增量遍历一律不触发评审——评审唯一入口是
+    # 审计事件链（桥接确认后直建/更新文档并入队）。月度核对发现的上线后
+    # 新增视为"审计漏捕"，只观测不补评（status_brief 有对应口径）。
 
 
 async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incremental") -> SyncRun:
@@ -281,7 +267,8 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
                 page = await client.list_nodes(workspace_id, settings.dingtalk_sync_operator_id, parent_node_id, next_token)
                 for item in page["items"]:
                     await _upsert_document(db, settings, run, workspace_id, item, enqueue=True,
-                                           trigger_new="sync", trigger_change="sync_change")
+                                           trigger_new="sync", trigger_change="sync_change",
+                                           parent_node_id=parent_node_id)
                     if item["has_children"]:
                         await walk(workspace_id, item["node_id"])
                 next_token = page.get("next_token", "")
@@ -436,7 +423,8 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
                         continue
                     seen.add(item["node_id"])
                     await _upsert_document(db, settings, run, workspace_id, item, enqueue=not seeding,
-                                           trigger_new="watch", trigger_change="watch_change")
+                                           trigger_new="watch", trigger_change="watch_change",
+                                           parent_node_id=parent_node_id)
                     if item["has_children"]:
                         await walk(item["node_id"])
                 next_token = page.get("next_token", "")

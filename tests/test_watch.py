@@ -89,20 +89,22 @@ def test_watch_full_lifecycle(settings):
         for node_id in ("watch-A", "watch-B", "watch-D"):
             assert jobs_for(db, node_id) == []  # seeding must not flood the queue
 
-    # New file after the seed -> review job with trigger "watch".
+    # New file after the seed: mirrored with parent, NO review — 评审唯一
+    # 入口是审计事件链（2026-08-14 流程定稿），巡走只维护镜像与目录。
     FakeClient.nodes["C"] = node("watch-C")
     added = cycle(settings)
     assert added["runs"][0]["mode"] == "watch" and added["runs"][0]["documents_new"] == 1
     with SessionLocal() as db:
-        triggers = [job.trigger for job in jobs_for(db, "watch-C")]
-        assert triggers == ["watch"]
+        assert jobs_for(db, "watch-C") == []
+        assert db.get(Document, "watch-C").parent_node_id == "root"
+        assert db.get(Document, "watch-B").parent_node_id == "watch-D"  # 遍历补准目录
 
-    # Source update -> review job with trigger "watch_change".
+    # Source update -> mirror refresh only, still no review job.
     FakeClient.nodes["B"]["updated_at"] = "2026-08-07T10:30:00"
     changed = cycle(settings)
     assert changed["runs"][0]["documents_changed"] == 1
     with SessionLocal() as db:
-        assert [job.trigger for job in jobs_for(db, "watch-B")] == ["watch_change"]
+        assert jobs_for(db, "watch-B") == []
         assert db.get(Document, "watch-B").source_updated_at == "2026-08-07T10:30:00"
 
     # Disappearance: soft delete only after two consecutive complete misses.
@@ -170,12 +172,12 @@ def test_interrupted_seed_stays_seed_and_absorbs_stock(settings):
     second = cycle(settings)
     assert second["runs"][0]["mode"] == "watch"
     with SessionLocal() as db:
-        assert [job.trigger for job in jobs_for(db, "watch-C")] == ["watch"]
+        assert jobs_for(db, "watch-C") == []  # 巡走不评审（审计链专责）
 
 
-def test_seed_reviews_files_created_after_go_live(settings):
-    """KG_REVIEW_SINCE：补种期间创建时间在上线日之后的文件也要评审——
-    上线后传进未补种库的文档不能被静默吸收（codex 阻断项 2）。"""
+def test_walks_never_enqueue_reviews_even_past_cutoff(settings):
+    """2026-08-14 流程定稿：巡走（含补种）对任何文件都不触发评审——上线后
+    新增由审计事件链直建并评审；巡走发现的只算"审计漏捕"，只观测不补评。"""
     live = settings.model_copy(update={"review_since": "2026-08-10"})
     FakeClient.nodes = {"S": node("watch-stock", created_at="2026-08-07T09:00:00"),
                         "N": node("watch-fresh", created_at="2026-08-12T09:00:00")}
@@ -183,18 +185,13 @@ def test_seed_reviews_files_created_after_go_live(settings):
     assert result["runs"][0]["mode"] == "watch_seed"
     with SessionLocal() as db:
         assert jobs_for(db, "watch-stock") == []
-        assert [job.trigger for job in jobs_for(db, "watch-fresh")] == ["watch"]
+        assert jobs_for(db, "watch-fresh") == []
 
 
-def test_review_since_precise_moment_updated_at_and_key_recovery(settings):
-    """codex 阻断项1/2：上线时刻精确到分钟——当天更早上传的仍是存量；
-    存量在上线后被修改也要评审；桥接先消费的下载键在入队时找回。"""
+def test_walks_stay_mirror_only_across_cutoff_boundaries(settings):
+    """2026-08-14 流程定稿回归：无论创建/修改时间落在上线时刻前后，
+    巡走都只维护镜像，绝不入队评审（评审专属审计链）。"""
     live = settings.model_copy(update={"review_since": "2026-08-12T08:00:00Z"})
-    with SessionLocal() as db:
-        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id == "987654321").delete(synchronize_session=False)
-        db.add(FileAuditEvent(biz_id="987654321", gmt_create=1755000000000,
-                              matched_node_id="watch-after", match_status="confirmed", processed=True))
-        db.commit()
     FakeClient.nodes = {
         "E": node("watch-early", created_at="2026-08-12T07:59:00"),
         "A": node("watch-after", created_at="2026-08-12T08:30:00"),
@@ -204,12 +201,8 @@ def test_review_since_precise_moment_updated_at_and_key_recovery(settings):
     result = cycle(live)
     assert result["runs"][0]["mode"] == "watch_seed"
     with SessionLocal() as db:
-        assert jobs_for(db, "watch-early") == []                                   # 上线前 1 分钟 → 存量
-        assert [j.trigger for j in jobs_for(db, "watch-after")] == ["watch"]       # 上线后创建 → 评审
-        assert [j.trigger for j in jobs_for(db, "watch-modified")] == ["watch"]    # 存量上线后被改 → 评审
-        assert db.get(Document, "watch-after").storage_dentry_id == "987654321"    # 下载键找回
-        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id == "987654321").delete(synchronize_session=False)
-        db.commit()
+        for node_id in ("watch-early", "watch-after", "watch-modified"):
+            assert jobs_for(db, node_id) == []
 
 
 def test_walk_survives_nodes_without_creator(settings):
@@ -270,5 +263,5 @@ def test_watch_skips_unreviewable_file_classes(settings):
     with SessionLocal() as db:
         assert db.get(Document, "watch-pic").file_class == "image"
         assert db.get(Document, "watch-log").file_class == "engineering"
-        assert jobs_for(db, "watch-pic") == [] and jobs_for(db, "watch-log") == []
-        assert [job.trigger for job in jobs_for(db, "watch-doc2")] == ["watch"]
+        # 巡走一律不评审：文件类别仅供审计链入队时判断
+        assert jobs_for(db, "watch-pic") == [] and jobs_for(db, "watch-doc2") == []

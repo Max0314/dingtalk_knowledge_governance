@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from app import audit_bridge
 from app.config import get_settings
-from app.db import Document, FileAuditEvent, ReviewJob, SessionLocal, SpaceMap, Workspace, init_db
+from app.db import Document, FileAuditEvent, ReviewInstance, ReviewJob, SessionLocal, SpaceMap, Workspace, init_db
 from app.fileclass import classify, review_classes
 
 WS = "bridge-ws"
@@ -44,13 +44,16 @@ def env(monkeypatch):
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
         # 上一次失败运行可能留下测试文档（各测试的收尾清理没跑到），开场兜底
         stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
-                     "late-cp-doc"]
+                     "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
             leftover = db.get(Document, node_id)
             if leftover:
+                # 其他测试沥干任务队列时可能执行过这些文档的评审——实例
+                # 不清会让 ORM 删除时置空外键而炸 NOT NULL
                 db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+                db.query(ReviewInstance).filter(ReviewInstance.node_id == node_id).delete(synchronize_session=False)
                 db.delete(leftover)
         if not db.get(Workspace, WS):
             db.add(Workspace(workspace_id=WS, name="桥接测试库"))
@@ -167,10 +170,11 @@ def test_locator_routes_precisely(env, monkeypatch):
     add_event("99900000001", "桥接测试文档.docx", "99009")  # digit bizId == numeric dentry id
     summary = run_bridge(locator_settings(settings))
     assert summary["unlocated"] == 0
-    assert [walk["workspace_id"] for walk in summary["walks"]] == [WS]  # only the located workspace
+    assert summary["walks"] == [] and summary.get("direct_upserts") == 1  # 直建取代整库巡走
     with SessionLocal() as db:
         doc = db.get(Document, "bridge-A")
         assert doc.storage_dentry_id == "99900000001"  # numeric download key attached from the event
+        db.query(ReviewJob).filter(ReviewJob.node_id == "bridge-A").delete(synchronize_session=False)
         doc.storage_dentry_id = ""
         db.commit()
 
@@ -253,7 +257,7 @@ def test_unlocated_event_stays_pending_until_locator_confirms(env, monkeypatch):
         doc = db.get(Document, "bridge-late-doc")
         assert doc.storage_dentry_id == "99920000001"
         jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "bridge-late-doc")).all()
-        assert [job.trigger for job in jobs] == ["content_key"]
+        assert [job.trigger for job in jobs] == ["audit"]  # 直建路径的评审触发标记
         for job in jobs:
             db.delete(job)
         db.delete(doc)
@@ -357,30 +361,20 @@ def test_search_hit_on_old_same_name_doc_is_not_confirmed(env, monkeypatch):
         db.commit()
 
 
-def test_same_workspace_double_enqueue_no_conflict(env, monkeypatch):
-    """codex 第五轮 P0：同一库连续多条事件同一事务内排队巡走，不得撞
-    bridge_walk_queue 主键。"""
-    import time as time_module
+def test_same_workspace_double_enqueue_no_conflict(env):
+    """codex 第五轮 P0 回归（机制级）：同一事务内对同一库排队两次不得撞
+    bridge_walk_queue 主键——autoflush 关闭时 db.get 看不到刚 add 的行。"""
+    from app.db import BridgeWalk
 
     settings, walks, _ = env
-    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
-    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
     with SessionLocal() as db:
-        db.merge(Document(node_id="dup-a", workspace_id=WS, name="同库文件A.docx",
-                          extension="docx", file_class="document"))
-        db.merge(Document(node_id="dup-b", workspace_id=WS, name="同库文件B.docx",
-                          extension="docx", file_class="document"))
+        queued: set = set()
+        audit_bridge._enqueue_walk(db, WS, queued)
+        audit_bridge._enqueue_walk(db, WS, queued)  # 修复前：IntegrityError
         db.commit()
-    now_ms = int(time_module.time() * 1000)
-    add_event("99960000001", "同库文件A", "99070", gmt=now_ms)
-    add_event("99960000002", "同库文件B", "99070", gmt=now_ms + 1)
-    summary = run_bridge(org)  # 修复前：IntegrityError 使整轮回滚
-    assert any(walk["workspace_id"] == WS for walk in summary["walks"])
-    with SessionLocal() as db:
-        for node_id in ("dup-a", "dup-b"):
-            doc = db.get(Document, node_id)
-            if doc:
-                db.delete(doc)
+        rows = db.scalars(select(BridgeWalk).where(BridgeWalk.workspace_id == WS)).all()
+        assert len(rows) == 1
+        db.delete(rows[0])
         db.commit()
 
 
@@ -468,6 +462,12 @@ def test_unknown_node_corroborates_by_payload_not_by_ignorance(env, monkeypatch)
     monkeypatch.setattr(audit_bridge, "DingtalkClient", UnknownFreshSearch)
     second = run_bridge(org)
     assert second["confirmed"] == 1  # 载荷时间与事件吻合的全新节点才是本事件的节点
+    with SessionLocal() as db:  # 新语义：确认即直建文档——必须清理，否则毒化下次运行
+        doc = db.get(Document, "unknown-old")
+        assert doc is not None and doc.storage_dentry_id == "99980000001"
+        db.query(ReviewJob).filter(ReviewJob.node_id == "unknown-old").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
 
 
 def test_pre_cutoff_event_attaches_key_without_review(env, monkeypatch):
@@ -687,6 +687,88 @@ def test_confirmed_finish_budget_rotates(env, monkeypatch):
         doc = db.get(Document, "late-cp-doc")
         assert doc.storage_dentry_id == "9991310002"
         db.query(ReviewJob).filter(ReviewJob.node_id == "late-cp-doc").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+
+
+def test_audit_event_direct_upserts_new_document(env, monkeypatch):
+    """2026-08-14 流程定稿：事件确认后直接建档——新库自动注册占位
+    （不拉回连续轮巡）、path 落库、目录待定、键挂上、评审入队，
+    全程零整库巡走。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class NewDocSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "fresh-node-1", "name": "全新直建.docx",
+                     "path": "/新库/子目录/全新直建.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "全新直建.docx", "workspace_id": "brand-new-ws", "node_id": "fresh-node-1",
+                     "extension": "docx", "size": 10, "created_at": gmt_iso(now_ms), "creator_id": "tester"}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", NewDocSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99941000001", "全新直建", "99160", gmt=now_ms)
+    summary = run_bridge(org)
+    assert summary.get("direct_upserts") == 1 and summary["walks"] == []
+    with SessionLocal() as db:
+        from app.db import Workspace
+
+        doc = db.get(Document, "fresh-node-1")
+        assert doc is not None and doc.storage_dentry_id == "99941000001"
+        assert doc.path == "/新库/子目录/全新直建.docx" and doc.directory_pending is True
+        workspace = db.get(Workspace, "brand-new-ws")
+        assert workspace is not None and workspace.watch_seeded  # 不拉回连续轮巡
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "fresh-node-1")).all()
+        assert [job.trigger for job in jobs] == ["audit"]
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99941000001"))
+        assert event.processed is True and event.resolution == "done"
+        for job in jobs:
+            db.delete(job)
+        db.delete(doc)
+        db.delete(workspace)
+        db.commit()
+
+
+def test_rename_event_updates_metadata_without_review(env, monkeypatch):
+    """重命名/移动只动元数据与路径，不触发质量评审（2026-08-14 流程定稿）。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+    old_iso = "2026-08-01T09:00:00+00:00"
+    with SessionLocal() as db:
+        db.merge(Document(node_id="rn-doc-1", workspace_id=WS, name="旧名字.docx", extension="docx",
+                          file_class="document", storage_dentry_id="",
+                          source_created_at=old_iso, source_updated_at=old_iso))
+        db.commit()
+
+    class RenameSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "rn-doc-1", "name": "新名字.docx", "path": "/桥接测试库/新名字.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "新名字.docx", "workspace_id": WS, "node_id": "rn-doc-1",
+                     "extension": "docx", "created_at": old_iso, "updated_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", RenameSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99942000001", "新名字", "99170", gmt=now_ms, action_view="知识库重命名文件")
+    summary = run_bridge(org)
+    assert summary.get("direct_upserts") == 1
+    with SessionLocal() as db:
+        doc = db.get(Document, "rn-doc-1")
+        assert doc.name == "新名字.docx" and doc.path == "/桥接测试库/新名字.docx"
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "rn-doc-1")).all() == []
         db.delete(doc)
         db.commit()
 

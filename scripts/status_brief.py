@@ -87,6 +87,24 @@ def main() -> None:
             "reviewable_new_docs_without_key_7d": db.scalar(
                 select(func.count()).select_from(Document).where(*no_key_conds)) or 0,
         }
+        if settings.review_since:
+            # 审计漏捕嫌疑：上线后创建/修改、可评审、非机器人，却从未有过
+            # 评审实例也没有排队任务——按 2026-08-14 决策只观测不补评。
+            robot_conds = []
+            for prefix in (p.strip() for p in settings.robot_name_prefixes.split(",") if p.strip()):
+                robot_conds.append(~Document.uploader_name.like(f"{prefix}%"))
+            if robot_ids:
+                robot_conds.append(Document.uploader_key.not_in(robot_ids))
+            out["bridge"]["suspected_audit_missed"] = db.scalar(
+                select(func.count()).select_from(Document).where(
+                    Document.is_folder.is_(False), Document.is_deleted.is_(False),
+                    Document.file_class.in_(sorted(review_classes(settings.review_classes))),
+                    sa_or(Document.source_created_at >= settings.review_since,
+                          Document.source_updated_at >= settings.review_since),
+                    Document.node_id.not_in(select(ReviewInstance.node_id).distinct()),
+                    Document.node_id.not_in(select(ReviewJob.node_id)
+                                            .where(ReviewJob.status.in_(("pending", "running")))),
+                    *robot_conds)) or 0
         latest_audit_ms = db.scalar(select(func.max(FileAuditEvent.gmt_create)))
         audit_state = db.scalars(select(AuditState)).first()
         out["audit"] = {

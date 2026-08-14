@@ -36,9 +36,9 @@ from datetime import datetime, timezone
 
 from .config import Settings
 from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewInstance,
-                 ReviewJob, SpaceMap, utcnow)
-from .fileclass import review_classes
-from .integrations import DingtalkClient, IntegrationError
+                 ReviewJob, SpaceMap, Workspace, utcnow)
+from .fileclass import classify, review_classes
+from .integrations import BiCenterClient, DingtalkClient, IntegrationError
 from .service import watch_workspace
 
 logger = logging.getLogger("kg.bridge")
@@ -132,6 +132,88 @@ def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -
                          trigger="content_key", requested_by="system"))
 
 
+def _action_kind(event: FileAuditEvent) -> str:
+    """重命名/移动只动元数据不评审；其余写操作（上传/新建/修改等）参与评审
+    （2026-08-14 流程定稿）。"""
+    view = event.action_view or ""
+    return "metadata" if any(keyword in view for keyword in ("重命名", "移动")) else "mutate"
+
+
+def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEvent,
+                           node: dict, path: str) -> Document:
+    """审计事件确认后的直接建档/更新：一个事件只动一个节点，绝不整库遍历
+    （2026-08-14 流程定稿，取代早期"门铃+整库确认"）。batchQuery 不返回
+    父节点——先记存储搜索给的 path、置 directory_pending，父节点关系由
+    每月 10/24 全量核对补准。"""
+    from .service import is_robot_uploader
+    workspace_id = node.get("workspace_id") or ""
+    if workspace_id and db.get(Workspace, workspace_id) is None:
+        # 未补种的新库连注册行都没有：建占位（名称由月度核对刷新）。标记
+        # watch_seeded=True 以免把 worker 拉回连续轮巡——其存量本就交给
+        # 月度核对。
+        db.add(Workspace(workspace_id=workspace_id, name=workspace_id, watch_seeded=True))
+        db.flush()
+    doc = db.get(Document, node["node_id"])
+    is_new = doc is None
+    changed = (not is_new) and doc.source_updated_at != (node.get("updated_at") or "")
+    if doc is None:
+        doc = Document(node_id=node["node_id"], workspace_id=workspace_id, name=node.get("name") or "")
+        db.add(doc)
+    for field in ("name", "category", "extension", "url"):
+        if node.get(field):
+            setattr(doc, field, node[field])
+    doc.size = node.get("size") or doc.size or 0
+    doc.source_created_at = node.get("created_at") or doc.source_created_at or ""
+    doc.source_updated_at = node.get("updated_at") or doc.source_updated_at or ""
+    if node.get("has_children") is not None:
+        doc.is_folder = bool(node.get("has_children"))
+    doc.file_class = classify(doc.extension, doc.is_folder)
+    if path:
+        doc.path = path
+    if is_new and not doc.parent_node_id:
+        doc.directory_pending = True
+    if doc.is_deleted:
+        doc.is_deleted = False
+    doc.watch_misses = 0
+    if is_new or changed:
+        creator = node.get("creator_id") or event.operator_user_id or ""
+        doc.uploader_key = creator or doc.uploader_key or ""
+        identity: dict = {}
+        if doc.uploader_key:
+            identity_input = ({"userId": doc.uploader_key} if doc.uploader_key.isdigit()
+                              else {"unionId": doc.uploader_key})
+            try:
+                resolved = asyncio.run(BiCenterClient(settings).resolve_batch(
+                    [identity_input], datetime.now(timezone.utc).strftime("%Y-%m")))
+                identity = resolved[0] if resolved else {}
+            except (IntegrationError, RuntimeError):
+                identity = {}
+        if identity.get("matched") and identity.get("includeInOfficialStats"):
+            doc.uploader_key = identity.get("employeeKey", doc.uploader_key)
+            doc.uploader_name = identity.get("employeeName", "")
+            doc.department_name = identity.get("departmentName", "")
+            doc.biz_group_name = identity.get("bizGroupName", "")
+            doc.org_matched = True
+        elif is_new:
+            doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
+    key_attached = False
+    if not doc.storage_dentry_id and (event.biz_id or "").isdigit():
+        doc.storage_dentry_id = event.biz_id
+        key_attached = True
+    db.flush()
+    if (_action_kind(event) == "mutate" and (is_new or changed or key_attached)
+            and not doc.is_folder
+            and not is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)
+            and doc.file_class in review_classes(settings.review_classes)
+            and _should_auto_review(db, settings, doc, event)):
+        pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
+                                                    ReviewJob.status.in_(("pending", "running"))))
+        if not pending:
+            db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
+                             trigger="audit", requested_by="system"))
+    return doc
+
+
 def _enqueue_walk(db: Session, workspace_id: str, queued: set[str]) -> None:
     """queued 是本轮事务内的去重集合：autoflush 关闭时 db.get 看不到同事务
     刚 add 的行，同一库两条事件会撞主键炸掉整轮（codex 第五轮 P0）。"""
@@ -159,7 +241,6 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
     doc = db.get(Document, event.matched_node_id)
     if doc is None:
         return False
-    _enqueue_walk(db, doc.workspace_id, queued)  # 事件说这个库有写操作：欠一次快巡走
     if doc.storage_dentry_id:
         _finish(db, event, "done")
         return True
@@ -294,11 +375,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             continue
         summary["wiki_events"] += 1
         wiki_events.append(event)
-        _provisional_match(db, event, snapshot_id, summary)
-        if event.match_status == "provisional" and event.matched_node_id:
-            doc = db.get(Document, event.matched_node_id)
-            if doc is not None:
-                _enqueue_walk(db, doc.workspace_id, queued)  # 门铃提示：该库可能有写操作
+        _provisional_match(db, event, snapshot_id, summary)  # 仅诊断参考，不再触发整库门铃
         _try_finish_confirmed(db, event, settings, summary, queued)
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
@@ -341,11 +418,13 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         started = time.monotonic()
 
         async def _locate(names: list[str]):
-            # Storage search returns dentryUuids (== wiki nodeIds); the wiki
-            # batch query then names the workspace each hit lives in.
+            # Storage search returns dentryUuids (== wiki nodeIds) plus the
+            # directory path; the wiki batch query then names the workspace
+            # each hit lives in. 两者都要带回：path 是目录归属的线索。
             dentries = await client.search_dentries(names[0], operator, [settings.wiki_storage_space_id])
             exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
-            return await client.batch_query_wiki_nodes(exact_ids, operator) if exact_ids else []
+            nodes = await client.batch_query_wiki_nodes(exact_ids, operator) if exact_ids else []
+            return dentries, nodes
 
         for event in candidates:
             remaining = LOCATE_TIME_BUDGET_SECONDS - (time.monotonic() - started)
@@ -356,7 +435,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             try:
                 # 硬时间预算：整组请求包在剩余时间内，40s 的一对外呼不能把
                 # 30s 预算撑到 70s（codex 第五轮 P1）。
-                nodes = asyncio.run(asyncio.wait_for(_locate(names), timeout=remaining))
+                dentries, nodes = asyncio.run(asyncio.wait_for(_locate(names), timeout=remaining))
             except (IntegrationError, RuntimeError, TimeoutError):
                 unlocated += 1  # 网络失败/超时：事件保持 pending，下一轮重试
                 continue
@@ -365,11 +444,6 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if not workspaces:
                 unlocated += 1  # 尚未进搜索索引：保持 pending，下一轮重试
                 continue
-            for workspace_id in workspaces:
-                if workspace_id in governed or settings.bridge_scope == "mapped":
-                    _enqueue_walk(db, workspace_id, queued)
-                else:
-                    located_ungoverned.add(workspace_id)
             node_ids = {node["node_id"] for node in hits if node.get("node_id")}
             if len(node_ids) == 1:
                 confirmed_id = next(iter(node_ids))
@@ -382,9 +456,17 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                     event.matched_node_id = confirmed_id
                     event.match_status = "confirmed"
                     summary["confirmed"] += 1
+                    # 直接建档/更新——不再把整个知识库放进巡走队列
+                    # （2026-08-14 流程定稿：一个事件只动一个节点）。
+                    hit_path = next((d.get("path") or "" for d in dentries
+                                     if d.get("dentry_uuid") == confirmed_id), "")
+                    _upsert_audit_document(db, settings, event, hit, hit_path)
+                    _finish(db, event, "done")
+                    summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
                 else:
                     summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
-            _try_finish_confirmed(db, event, settings, summary, queued)
+            if not event.processed:
+                _try_finish_confirmed(db, event, settings, summary, queued)
     elif candidates:
         unlocated = len(candidates)
     if unlocated:

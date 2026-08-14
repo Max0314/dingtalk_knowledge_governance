@@ -59,6 +59,11 @@ class Document(Base):
     __tablename__ = "documents"
     node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
+    # 目录架构：walk 遍历时可直接得到父节点；审计直建的文档先记 path、
+    # 置 directory_pending，父节点由每月 10/24 全量核对补准。
+    parent_node_id: Mapped[str] = mapped_column(id_string(), default="")
+    path: Mapped[str] = mapped_column(String(1024), default="")
+    directory_pending: Mapped[bool] = mapped_column(Boolean, default=False)
     name: Mapped[str] = mapped_column(String(512))
     category: Mapped[str] = mapped_column(String(64), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
@@ -484,6 +489,9 @@ EXTRA_COLUMNS = {
                           "retry_started_at": "DATETIME NULL"},
     "bridge_walk_queue": {"last_attempt_at": "DATETIME NULL",
                           "failures": "INTEGER NOT NULL DEFAULT 0"},
+    "documents": {"parent_node_id": "VARCHAR(128) NOT NULL DEFAULT ''",
+                  "path": "VARCHAR(1024) NOT NULL DEFAULT ''",
+                  "directory_pending": "TINYINT(1) NOT NULL DEFAULT 0"},
 }
 
 
