@@ -182,15 +182,25 @@ def _near_event(iso_value: str, gmt_ms: int, tolerance_seconds: int = 900) -> bo
         return False
 
 
+def _is_upload_event(event: FileAuditEvent) -> bool:
+    view = event.action_view or ""
+    return any(keyword in view for keyword in ("上传", "新建", "创建"))
+
+
 def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
     """搜索命中唯一 ≠ 就是本事件的节点（同名新文件未进索引时，搜索只会返回
     旧节点）。互证优先用 locator 节点载荷自带的时间/扩展名，载荷没有才退回
-    镜像文档；仍证实不了一律拒绝——"系统不认识"绝不是确认依据：快照之后
-    创建、事件之前的旧节点，系统同样不认识（codex 第六轮 P0）。"""
+    镜像文档；仍证实不了一律拒绝——"系统不认识"绝不是确认依据。
+
+    上传/新建事件只认 created_at 互证（codex 第七轮 P0）：上传产生新节点，
+    其创建时间必然贴近事件；旧同名节点哪怕刚被人修改过（updated_at 落在
+    窗口内）也不是这次上传的节点。修改类事件才允许 updated_at 互证。"""
+    allow_updated = not _is_upload_event(event)
     if event.extension and node.get("extension") and event.extension.lower() != str(node["extension"]).lower():
         return False
-    if (_near_event(node.get("created_at") or "", event.gmt_create)
-            or _near_event(node.get("updated_at") or "", event.gmt_create)):
+    if _near_event(node.get("created_at") or "", event.gmt_create):
+        return True
+    if allow_updated and _near_event(node.get("updated_at") or "", event.gmt_create):
         return True
     doc = db.get(Document, node.get("node_id") or "")
     if doc is not None:
@@ -198,8 +208,9 @@ def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
             return True
         if event.extension and doc.extension and event.extension.lower() != doc.extension.lower():
             return False
-        return (_near_event(doc.source_created_at, event.gmt_create)
-                or _near_event(doc.source_updated_at, event.gmt_create))
+        if _near_event(doc.source_created_at, event.gmt_create):
+            return True
+        return allow_updated and _near_event(doc.source_updated_at, event.gmt_create)
     return False
 
 
@@ -287,12 +298,19 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     pending_wiki = [event for event in wiki_events if not event.processed]
 
     # confirmed-pending 全局收尾（codex 第六轮 P0）：等文档入镜像的已确认
-    # 事件不能只靠 BATCH 窗口推进——纯 DB 操作按全局取额完成。
+    # 事件不能只靠 BATCH 窗口推进——纯 DB 操作按全局取额完成。取额按
+    # 最久未尝试轮转（codex 第七轮 P0）：50 个"文档迟迟不来"的老事件
+    # 不得堵死后来者，每次尝试盖 last_attempt_at 章自然转到队尾。
     confirmed_pending = db.scalars(
         select(FileAuditEvent)
         .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed")
-        .order_by(FileAuditEvent.gmt_create.asc()).limit(CONFIRM_FINISH_BUDGET)).all()
+        .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
+                  FileAuditEvent.last_attempt_at.asc(),
+                  FileAuditEvent.gmt_create.asc())
+        .limit(CONFIRM_FINISH_BUDGET)).all()
+    finish_stamp = utcnow()
     for event in confirmed_pending:
+        event.last_attempt_at = finish_stamp
         _try_finish_confirmed(db, event, settings, summary, queued)
 
     # Locator: a wiki-search by file name gives the doorbell an address, and

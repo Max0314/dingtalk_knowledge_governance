@@ -43,7 +43,8 @@ def env(monkeypatch):
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("999%")).delete(synchronize_session=False)
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
         # 上一次失败运行可能留下测试文档（各测试的收尾清理没跑到），开场兜底
-        stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1"]
+        stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
+                     "late-cp-doc"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
@@ -592,6 +593,82 @@ def test_expired_treats_naive_datetimes_as_utc():
     assert audit_bridge._expired(NS(retry_started_at=None, received_at=naive_utc(49), gmt_create=0), now_ms) is True
     # retry_started_at 优先于 received_at：重开后的新窗口生效
     assert audit_bridge._expired(NS(retry_started_at=naive_utc(1), received_at=naive_utc(100), gmt_create=0), now_ms) is False
+
+
+def test_upload_event_ignores_recent_update_on_old_node(env, monkeypatch):
+    """codex 第七轮 P0：上传事件只认 created_at 互证——旧同名节点刚被人
+    修改（updated_at 落在 ±15 分钟窗口）也不是这次上传的节点；修改类
+    事件才允许 updated_at 互证。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class RecentlyTouchedOldSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "old-touched", "name": "刚被改过的旧文件.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "刚被改过的旧文件.docx", "workspace_id": WS, "node_id": "old-touched",
+                     "extension": "docx", "created_at": "2026-08-01T09:00:00Z",
+                     "updated_at": gmt_iso(now_ms)}]  # 旧节点，但刚被修改过
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", RecentlyTouchedOldSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99912000001", "刚被改过的旧文件", "99140", gmt=now_ms)  # 默认动作=上传
+    first = run_bridge(org)
+    assert first.get("uncorroborated") == 1 and first["confirmed"] == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99912000001"))
+        assert event.processed is False and event.match_status != "confirmed"
+
+    # 修改类事件对同样的载荷：updated_at 互证成立
+    add_event("99912000002", "刚被改过的旧文件", "99140", gmt=now_ms + 1, action_view="知识库修改文件")
+    second = run_bridge(org)
+    assert second["confirmed"] == 1
+
+
+def test_confirmed_finish_budget_rotates(env, monkeypatch):
+    """codex 第七轮 P0：confirmed 收尾额度按最久未尝试轮转——文档迟迟
+    不来的老事件不得堵死后来者。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "CONFIRM_FINISH_BUDGET", 2)
+    monkeypatch.setattr(audit_bridge, "BATCH", 0)  # 隔离批处理通道，只看全局收尾的轮转
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    now_ms = int(time_module.time() * 1000)
+    now_iso = gmt_iso(now_ms)
+    with SessionLocal() as db:
+        for index in (0, 1):  # 两个"文档永不入镜像"的老 confirmed
+            db.add(FileAuditEvent(biz_id=f"999131000{index}", gmt_create=now_ms + index,
+                                  action_view="知识库上传文件", module_view="团队空间",
+                                  resource=f"永不入镜像{index}", extension="docx", target_space_id="99150",
+                                  matched_node_id=f"ghost-doc-{index}", match_status="confirmed"))
+        db.merge(Document(node_id="late-cp-doc", workspace_id=WS, name="轮转收尾.docx", extension="docx",
+                          file_class="document", storage_dentry_id="",
+                          source_created_at=now_iso, source_updated_at=now_iso))
+        db.add(FileAuditEvent(biz_id="9991310002", gmt_create=now_ms + 2, action_view="知识库上传文件",
+                              module_view="团队空间", resource="轮转收尾", extension="docx",
+                              target_space_id="99150", matched_node_id="late-cp-doc", match_status="confirmed"))
+        db.commit()
+    run_bridge(org)  # 额度 2：本轮只尝试两个 ghost
+    with SessionLocal() as db:
+        third = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "9991310002"))
+        assert third.processed is False
+    run_bridge(org)  # ghost 已盖章转到队尾 → 第三条获得额度并完成
+    with SessionLocal() as db:
+        third = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "9991310002"))
+        assert third.processed is True and third.resolution == "done"
+        doc = db.get(Document, "late-cp-doc")
+        assert doc.storage_dentry_id == "9991310002"
+        db.query(ReviewJob).filter(ReviewJob.node_id == "late-cp-doc").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
 
 
 def test_walk_queue_continues_next_pass(env):
