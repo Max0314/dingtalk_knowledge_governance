@@ -43,7 +43,10 @@ def env(monkeypatch):
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("999%")).delete(synchronize_session=False)
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
         # 上一次失败运行可能留下测试文档（各测试的收尾清理没跑到），开场兜底
-        for node_id in ("bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b"):
+        stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1"]
+        stale_ids += [row[0] for row in db.execute(select(Document.node_id)
+                                                   .where(Document.node_id.like("cp-doc-%")))]
+        for node_id in stale_ids:
             leftover = db.get(Document, node_id)
             if leftover:
                 db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
@@ -418,13 +421,177 @@ def test_reopened_dead_letter_gets_fresh_retry_window(env, monkeypatch):
     with SessionLocal() as db:  # 与 reopen_dead_letters.py 相同的重开语义
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99970000001"))
         event.processed, event.resolution, event.last_attempt_at = False, "", None
-        event.received_at = db_utcnow()
+        event.retry_started_at = db_utcnow()  # received_at 是入库审计字段，不动
         db.commit()
     second = run_bridge(org)
     assert second.get("dead_letter", 0) == 0 and second.get("pending_retry") == 1
     with SessionLocal() as db:
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99970000001"))
         assert event.processed is False and event.last_attempt_at is not None
+
+
+def test_unknown_node_corroborates_by_payload_not_by_ignorance(env, monkeypatch):
+    """codex 第六轮 P0：镜像/快照都不认识 ≠ 新建。互证依据是 locator 载荷
+    自带的时间——旧载荷拒确认，时间吻合的载荷才确认。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class UnknownOldSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "unknown-old", "name": "未知旧节点.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "未知旧节点.docx", "workspace_id": WS, "node_id": "unknown-old",
+                     "extension": "docx", "created_at": "2026-08-07T09:00:00Z",
+                     "updated_at": "2026-08-07T09:00:00Z"}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", UnknownOldSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99980000001", "未知旧节点", "99110", gmt=now_ms)
+    first = run_bridge(org)
+    assert first.get("uncorroborated") == 1 and first["confirmed"] == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99980000001"))
+        assert event.processed is False and event.match_status != "confirmed"
+
+    class UnknownFreshSearch(UnknownOldSearch):
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "未知旧节点.docx", "workspace_id": WS, "node_id": "unknown-old",
+                     "extension": "docx", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", UnknownFreshSearch)
+    second = run_bridge(org)
+    assert second["confirmed"] == 1  # 载荷时间与事件吻合的全新节点才是本事件的节点
+
+
+def test_pre_cutoff_event_attaches_key_without_review(env, monkeypatch):
+    """codex 第六轮 P0：审计游标重叠重放的截止前事件——键照挂，但绝不生成
+    content_key 评审任务（存量忽略、不补评分）。"""
+    from datetime import datetime as dt, timezone as tz
+
+    settings, walks, _ = env
+    old_iso = "2026-08-01T09:00:00+00:00"
+    old_ms = int(dt.fromisoformat(old_iso).timestamp() * 1000)
+    with SessionLocal() as db:
+        db.merge(Document(node_id="stock-doc-1", workspace_id=WS, name="截止前存量.docx",
+                          extension="docx", file_class="document", storage_dentry_id="",
+                          source_created_at=old_iso, source_updated_at=old_iso))
+        db.commit()
+
+    class StockSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "stock-doc-1", "name": "截止前存量.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "截止前存量.docx", "workspace_id": WS, "node_id": "stock-doc-1",
+                     "extension": "docx", "created_at": old_iso}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", StockSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0,
+                                                        "review_since": "2026-08-10T00:00:00Z"})
+    add_event("99990000001", "截止前存量", "99120", gmt=old_ms)
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 1
+    with SessionLocal() as db:
+        doc = db.get(Document, "stock-doc-1")
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99990000001"))
+        assert doc.storage_dentry_id == "99990000001"  # 键挂上（allowed）
+        assert event.processed is True and event.resolution == "done"
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "stock-doc-1")).all() == []
+        db.delete(doc)
+        db.commit()
+
+
+def test_confirmed_pending_finishes_beyond_batch(env, monkeypatch):
+    """codex 第六轮 P0：confirmed 待完成事件的收尾走全局取额，不被 BATCH
+    窗口截断——批外的第 11、12 条同轮完成、键挂上。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "BATCH", 10)
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _EmptySearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    now_ms = int(time_module.time() * 1000)
+    now_iso = gmt_iso(now_ms)
+    with SessionLocal() as db:
+        for index in range(12):
+            db.merge(Document(node_id=f"cp-doc-{index}", workspace_id=WS, name=f"批外完成{index}.docx",
+                              extension="docx", file_class="document", storage_dentry_id="",
+                              source_created_at=now_iso, source_updated_at=now_iso))
+            db.add(FileAuditEvent(biz_id=f"99911100{index:02d}", gmt_create=now_ms + index,
+                                  action_view="知识库上传文件", module_view="团队空间",
+                                  resource=f"批外完成{index}", extension="docx", target_space_id="99130",
+                                  matched_node_id=f"cp-doc-{index}", match_status="confirmed"))
+        db.commit()
+    run_bridge(org)
+    with SessionLocal() as db:
+        remaining = db.scalars(select(FileAuditEvent)
+                               .where(FileAuditEvent.biz_id.like("999111%"),
+                                      FileAuditEvent.processed.is_(False))).all()
+        assert remaining == []
+        for index in range(12):
+            doc = db.get(Document, f"cp-doc-{index}")
+            assert doc.storage_dentry_id == f"99911100{index:02d}"
+            db.query(ReviewJob).filter(ReviewJob.node_id == doc.node_id).delete(synchronize_session=False)
+            db.delete(doc)
+        db.commit()
+
+
+def test_failing_walk_rows_rotate_not_starve(env, monkeypatch):
+    """codex 第六轮 P0：持续失败的前 5 库按 last_attempt_at 轮转让位，
+    第 6 库第二轮就被走到；成功出队、失败计数。"""
+    from types import SimpleNamespace as NS
+
+    from app.db import BridgeWalk
+
+    settings, walks, _ = env
+
+    async def picky_walk(db, settings_, workspace_id, space=None, mode="watch"):
+        ok = workspace_id == "rot-ok"
+        return NS(run_id="r-" + workspace_id, mode=mode, status="succeeded" if ok else "failed",
+                  documents_seen=0, documents_new=0, documents_changed=0,
+                  error_code="" if ok else "boom")
+
+    monkeypatch.setattr(audit_bridge, "watch_workspace", picky_walk)
+    with SessionLocal() as db:
+        for index in range(5):
+            db.add(BridgeWalk(workspace_id=f"rot-f{index}"))
+        db.add(BridgeWalk(workspace_id="rot-ok"))
+        db.commit()
+    first = run_bridge(settings)
+    assert all(walk["workspace_id"].startswith("rot-f") for walk in first["walks"])  # 预算被失败库占满
+    second = run_bridge(settings)
+    assert "rot-ok" in [walk["workspace_id"] for walk in second["walks"]]
+    with SessionLocal() as db:
+        assert db.get(BridgeWalk, "rot-ok") is None  # 成功出队
+        rows = db.scalars(select(BridgeWalk).where(BridgeWalk.workspace_id.like("rot-%"))).all()
+        assert {row.workspace_id for row in rows} == {f"rot-f{index}" for index in range(5)}
+        assert all(row.failures >= 1 for row in rows)
+        db.query(BridgeWalk).filter(BridgeWalk.workspace_id.like("rot-%")).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_expired_treats_naive_datetimes_as_utc():
+    """codex 第六轮 P1：MySQL 回读的 naive datetime 是 UTC 值——按本地时区
+    （Asia/Shanghai）解释会让 48h 窗口缩成 40h。41h 不得过期，49h 过期。"""
+    import time as time_module
+    from datetime import datetime as dt, timedelta, timezone as tz
+    from types import SimpleNamespace as NS
+
+    now_ms = int(time_module.time() * 1000)
+    naive_utc = lambda hours: dt.now(tz.utc).replace(tzinfo=None) - timedelta(hours=hours)
+    assert audit_bridge._expired(NS(retry_started_at=None, received_at=naive_utc(41), gmt_create=0), now_ms) is False
+    assert audit_bridge._expired(NS(retry_started_at=None, received_at=naive_utc(49), gmt_create=0), now_ms) is True
+    # retry_started_at 优先于 received_at：重开后的新窗口生效
+    assert audit_bridge._expired(NS(retry_started_at=naive_utc(1), received_at=naive_utc(100), gmt_create=0), now_ms) is False
 
 
 def test_walk_queue_continues_next_pass(env):

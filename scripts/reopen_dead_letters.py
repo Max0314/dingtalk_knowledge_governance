@@ -41,7 +41,8 @@ def main() -> None:
             event.processed = False
             event.resolution = ""
             event.last_attempt_at = None
-            event.received_at = now  # 重试窗口基准重置：获得完整的 48h 新生命周期
+            # 重试窗口基准用独立列重置；received_at 是原始入库审计字段，不动
+            event.retry_started_at = now
         db.commit()
         print("done")
 

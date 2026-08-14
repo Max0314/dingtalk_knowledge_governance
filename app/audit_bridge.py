@@ -35,7 +35,8 @@ from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 
 from .config import Settings
-from .db import BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewJob, SpaceMap, utcnow
+from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewInstance,
+                 ReviewJob, SpaceMap, utcnow)
 from .fileclass import review_classes
 from .integrations import DingtalkClient, IntegrationError
 from .service import watch_workspace
@@ -49,6 +50,8 @@ WIKI_LOCATE_BUDGET = 5
 LOCATE_TIME_BUDGET_SECONDS = 30
 # 每轮桥接巡走的库数上限；没走到的库留在持久化队列里下一轮续走。
 WALK_BUDGET = 5
+# confirmed 待完成事件的全局收尾额度（纯 DB 操作，不外呼，可以宽松）。
+CONFIRM_FINISH_BUDGET = 50
 # 未能确认匹配的事件转入死信的时限：终态带 dead_letter_* 原因可观测，
 # 不伪装成功（发现与评审由 watcher 轮巡 + KG_REVIEW_SINCE 兜底）。
 GIVE_UP_AFTER_MS = 48 * 3600 * 1000
@@ -120,6 +123,8 @@ def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -
     doc.storage_dentry_id = event.biz_id
     if doc.is_folder or doc.file_class not in review_classes(settings.review_classes):
         return
+    if not _should_auto_review(db, settings, doc, event):
+        return  # 截止前存量：键已挂上，但不违背「存量忽略」补评审
     pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
                                                 ReviewJob.status.in_(("pending", "running"))))
     if not pending:
@@ -177,14 +182,17 @@ def _near_event(iso_value: str, gmt_ms: int, tolerance_seconds: int = 900) -> bo
         return False
 
 
-def _event_matches_node(db: Session, event: FileAuditEvent, node_id: str, snapshot_id: str) -> bool:
-    """搜索命中唯一 ≠ 就是本事件的节点：同名新文件未进索引时，搜索只会返回
-    旧节点（codex 第五轮 P0）。互证规则——
-    * 节点在镜像：键已相等 → 是；扩展名冲突 → 否；否则创建/修改时间须与
-      审计时间接近（±15 分钟）；
-    * 镜像没有但快照认识 → 旧存量，时间无法互证 → 否（等镜像跟上再确认）；
-    * 镜像与快照都不认识 → 全新节点，与"新上传"事件自洽 → 是。"""
-    doc = db.get(Document, node_id)
+def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
+    """搜索命中唯一 ≠ 就是本事件的节点（同名新文件未进索引时，搜索只会返回
+    旧节点）。互证优先用 locator 节点载荷自带的时间/扩展名，载荷没有才退回
+    镜像文档；仍证实不了一律拒绝——"系统不认识"绝不是确认依据：快照之后
+    创建、事件之前的旧节点，系统同样不认识（codex 第六轮 P0）。"""
+    if event.extension and node.get("extension") and event.extension.lower() != str(node["extension"]).lower():
+        return False
+    if (_near_event(node.get("created_at") or "", event.gmt_create)
+            or _near_event(node.get("updated_at") or "", event.gmt_create)):
+        return True
+    doc = db.get(Document, node.get("node_id") or "")
     if doc is not None:
         if doc.storage_dentry_id and doc.storage_dentry_id == (event.biz_id or ""):
             return True
@@ -192,22 +200,52 @@ def _event_matches_node(db: Session, event: FileAuditEvent, node_id: str, snapsh
             return False
         return (_near_event(doc.source_created_at, event.gmt_create)
                 or _near_event(doc.source_updated_at, event.gmt_create))
-    if snapshot_id and db.scalar(select(HistoricalFileNode.id)
-                                 .where(HistoricalFileNode.snapshot_id == snapshot_id,
-                                        HistoricalFileNode.node_id == node_id).limit(1)):
-        return False
-    return True
+    return False
+
+
+def _as_utc_ms(moment) -> float:
+    """DB 存的就是 UTC；naive 只是驱动丢了时区标记，绝不能按服务器本地时区
+    （Asia/Shanghai）解释——否则 48h 窗口实际缩水成 40h（codex 第六轮 P1）。"""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp() * 1000
 
 
 def _expired(event: FileAuditEvent, now_ms: int) -> bool:
-    """重试窗口基准是入库时间 received_at（死信重开后重置它即获得完整新窗口，
-    审计回填的历史事件也各有 48h 处理机会），无 received_at 才退回事件时间。"""
-    moment = event.received_at
-    if moment is not None:
-        if moment.tzinfo is not None:
-            moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
-        return (now_ms - moment.timestamp() * 1000) > GIVE_UP_AFTER_MS
+    """重试窗口基准：retry_started_at（死信重开时设置，received_at 作为原始
+    入库审计字段保持不动）→ received_at → 事件时间。"""
+    basis = event.retry_started_at or event.received_at
+    if basis is not None:
+        return (now_ms - _as_utc_ms(basis)) > GIVE_UP_AFTER_MS
     return bool(event.gmt_create) and (now_ms - event.gmt_create) > GIVE_UP_AFTER_MS
+
+
+def _cutoff_ms(cutoff: str) -> int | None:
+    try:
+        edge = datetime.fromisoformat(cutoff.replace("Z", "+00:00"))
+        if edge.tzinfo is None:
+            edge = edge.replace(tzinfo=timezone.utc)
+        return int(edge.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _should_auto_review(db: Session, settings: Settings, doc: Document, event: FileAuditEvent) -> bool:
+    """存量豁免门禁（codex 第六轮 P0）：审计拉取的游标重叠会重放截止前的旧
+    事件——挂键无妨，自动评审必须满足 KG_REVIEW_SINCE（文档或事件时间在
+    上线时刻之后），或该文档已有 metadata_only 评审等待正文补评。"""
+    cutoff = settings.review_since
+    if not cutoff:
+        return True
+    from .service import _at_or_after
+    if _at_or_after(doc.source_created_at or "", cutoff) or _at_or_after(doc.source_updated_at or "", cutoff):
+        return True
+    edge_ms = _cutoff_ms(cutoff)
+    if edge_ms is not None and event.gmt_create and event.gmt_create >= edge_ms:
+        return True
+    latest = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)
+                       .order_by(ReviewInstance.created_at.desc()).limit(1))
+    return latest is not None and latest.review_scope == "metadata_only"
 
 
 def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, summary: dict) -> None:
@@ -247,6 +285,15 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         _try_finish_confirmed(db, event, settings, summary, queued)
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
+
+    # confirmed-pending 全局收尾（codex 第六轮 P0）：等文档入镜像的已确认
+    # 事件不能只靠 BATCH 窗口推进——纯 DB 操作按全局取额完成。
+    confirmed_pending = db.scalars(
+        select(FileAuditEvent)
+        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed")
+        .order_by(FileAuditEvent.gmt_create.asc()).limit(CONFIRM_FINISH_BUDGET)).all()
+    for event in confirmed_pending:
+        _try_finish_confirmed(db, event, settings, summary, queued)
 
     # Locator: a wiki-search by file name gives the doorbell an address, and
     # its exact, corroborated node id is the ONLY authoritative match.
@@ -302,9 +349,10 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             node_ids = {node["node_id"] for node in hits if node.get("node_id")}
             if len(node_ids) == 1:
                 confirmed_id = next(iter(node_ids))
-                # 搜索唯一还不够：须与镜像/快照互证（同名新文件未入索引时，
-                # 唯一命中的很可能是旧节点）。互证失败保持 pending。
-                if _event_matches_node(db, event, confirmed_id, snapshot_id):
+                hit = next(node for node in hits if node.get("node_id") == confirmed_id)
+                # 搜索唯一还不够：须与节点载荷/镜像互证（同名新文件未入索引
+                # 时，唯一命中的很可能是旧节点）。互证失败保持 pending。
+                if _event_matches_node(db, event, hit):
                     if event.matched_node_id != confirmed_id:
                         summary["matched"] += 1
                     event.matched_node_id = confirmed_id
@@ -327,15 +375,18 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
 
     # 死信裁决：到期仍未完成的事件带原因归档，绝不伪装成功。窗口基准是
-    # received_at——死信重开重置它即获得完整新窗口。
-    for event in pending_wiki:
+    # retry_started_at（重开）→ received_at；池子含批外的 confirmed-pending。
+    expiry_pool = {event.id: event for event in pending_wiki}
+    for event in confirmed_pending:
+        expiry_pool.setdefault(event.id, event)
+    for event in expiry_pool.values():
         if event.processed:
             continue
         if _expired(event, now_ms):
             reason = "dead_letter_no_doc" if event.match_status == "confirmed" else "dead_letter_unmatched"
             _finish(db, event, reason)
             summary["dead_letter"] = summary.get("dead_letter", 0) + 1
-    summary["pending_retry"] = sum(1 for event in pending_wiki if not event.processed)
+    summary["pending_retry"] = sum(1 for event in expiry_pool.values() if not event.processed)
     db.commit()
     _drain_walk_queue(db, settings, summary)
     db.commit()
@@ -343,10 +394,14 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
 
 
 def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
-    """持久化巡走队列：成功才出队，失败/超预算/去抖中的行留队续走——
-    "下一轮续走"是表结构保证，不是内存愿望（codex 第四轮 P1）。"""
+    """持久化巡走队列：成功才出队；失败行记 last_attempt_at/failures 后
+    自然轮转到队尾——五个持续失败的库不能永久占据预算饿死其余
+    （codex 第六轮 P0）。"""
     debounce = max(60, settings.bridge_debounce_seconds)
-    rows = db.scalars(select(BridgeWalk).order_by(BridgeWalk.requested_at)).all()
+    rows = db.scalars(select(BridgeWalk)
+                      .order_by(BridgeWalk.last_attempt_at.is_(None).desc(),
+                                BridgeWalk.last_attempt_at.asc(),
+                                BridgeWalk.requested_at.asc())).all()
     for row in rows:
         if len(summary["walks"]) >= WALK_BUDGET:
             summary["walks_deferred"] = summary.get("walks_deferred", 0) + 1
@@ -354,11 +409,13 @@ def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
         if time.time() - _last_walk.get(row.workspace_id, 0) < debounce:
             continue  # 去抖窗口内：行留队，窗口过后自然续走
         _last_walk[row.workspace_id] = time.time()
+        row.last_attempt_at = utcnow()
         run = asyncio.run(watch_workspace(db, settings, row.workspace_id, mode="bridge"))
         if run.status == "succeeded":
             db.delete(row)
         else:
-            _last_walk.pop(row.workspace_id, None)  # let the next pass retry at once
+            row.failures += 1
+            _last_walk.pop(row.workspace_id, None)  # 内存去抖立即让路，轮转由 last_attempt_at 保证
         summary["walks"].append({"workspace_id": row.workspace_id, "run_id": run.run_id, "mode": run.mode,
                                  "status": run.status, "new": run.documents_new,
                                  "changed": run.documents_changed, "error_code": run.error_code})

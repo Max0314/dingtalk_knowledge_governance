@@ -342,6 +342,9 @@ class FileAuditEvent(Base):
     resolution: Mapped[str] = mapped_column(String(32), default="")
     # Fair retry rotation: locator picks the least-recently attempted first.
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Retry-window base for dead-letter reopens; received_at stays untouched
+    # as the immutable ingestion audit field.
+    retry_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -349,10 +352,14 @@ class FileAuditEvent(Base):
 class BridgeWalk(Base):
     """Persistent bridge-walk queue: workspaces the audit bridge owes a fast
     targeted walk. Rows survive restarts and per-pass walk budgets — the
-    sixth workspace of a burst is walked next pass, not forgotten."""
+    sixth workspace of a burst is walked next pass, not forgotten. Attempted
+    rows rotate to the back (least-recently-attempted first), so five
+    persistently failing libraries cannot starve the rest."""
     __tablename__ = "bridge_walk_queue"
     workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    failures: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AuditDailyAgg(Base):
@@ -461,7 +468,10 @@ EXTRA_COLUMNS = {
     "workspaces": {"watch_seeded": "TINYINT(1) NOT NULL DEFAULT 0"},
     "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
                           "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
-                          "last_attempt_at": "DATETIME NULL"},
+                          "last_attempt_at": "DATETIME NULL",
+                          "retry_started_at": "DATETIME NULL"},
+    "bridge_walk_queue": {"last_attempt_at": "DATETIME NULL",
+                          "failures": "INTEGER NOT NULL DEFAULT 0"},
 }
 
 
