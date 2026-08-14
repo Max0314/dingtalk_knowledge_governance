@@ -631,6 +631,26 @@ def test_upload_event_ignores_recent_update_on_old_node(env, monkeypatch):
     assert second["confirmed"] == 1
 
 
+@pytest.mark.parametrize("action_view", (
+    "知识库上传文件", "创建文档", "创建副本", "复制或转发文件", "文档导入 ",
+))
+def test_all_production_creation_actions_ignore_updated_at(action_view):
+    """生产审计中所有会创建节点的动作都必须走 created_at 互证。"""
+    event = SimpleNamespace(action_view=action_view)
+    assert audit_bridge._is_creation_event(event) is True
+
+
+def test_creation_event_rejects_payload_size_conflict(env):
+    """两个同名节点即使都在 15 分钟窗口内创建，大小冲突也不能确认。"""
+    settings, walks, _ = env
+    event = SimpleNamespace(action_view="知识库上传文件", extension="docx", size=123,
+                            gmt_create=DEFAULT_GMT, biz_id="99914000001")
+    node = {"node_id": "same-name-recent", "extension": "docx", "size": 456,
+            "created_at": gmt_iso(DEFAULT_GMT), "updated_at": gmt_iso(DEFAULT_GMT)}
+    with SessionLocal() as db:
+        assert audit_bridge._event_matches_node(db, event, node) is False
+
+
 def test_confirmed_finish_budget_rotates(env, monkeypatch):
     """codex 第七轮 P0：confirmed 收尾额度按最久未尝试轮转——文档迟迟
     不来的老事件不得堵死后来者。"""

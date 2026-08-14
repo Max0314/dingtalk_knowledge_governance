@@ -182,9 +182,11 @@ def _near_event(iso_value: str, gmt_ms: int, tolerance_seconds: int = 900) -> bo
         return False
 
 
-def _is_upload_event(event: FileAuditEvent) -> bool:
+def _is_creation_event(event: FileAuditEvent) -> bool:
     view = event.action_view or ""
-    return any(keyword in view for keyword in ("上传", "新建", "创建"))
+    # 生产审计还会用“复制或转发文件”“文档导入”等名称表示新节点；
+    # 这些事件和上传一样，绝不能拿旧节点的 updated_at 做互证。
+    return any(keyword in view for keyword in ("上传", "新建", "创建", "复制", "转发", "导入", "副本"))
 
 
 def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
@@ -195,8 +197,10 @@ def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
     上传/新建事件只认 created_at 互证（codex 第七轮 P0）：上传产生新节点，
     其创建时间必然贴近事件；旧同名节点哪怕刚被人修改过（updated_at 落在
     窗口内）也不是这次上传的节点。修改类事件才允许 updated_at 互证。"""
-    allow_updated = not _is_upload_event(event)
+    allow_updated = not _is_creation_event(event)
     if event.extension and node.get("extension") and event.extension.lower() != str(node["extension"]).lower():
+        return False
+    if event.size and node.get("size") and int(event.size) != int(node["size"]):
         return False
     if _near_event(node.get("created_at") or "", event.gmt_create):
         return True
@@ -207,6 +211,8 @@ def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
         if doc.storage_dentry_id and doc.storage_dentry_id == (event.biz_id or ""):
             return True
         if event.extension and doc.extension and event.extension.lower() != doc.extension.lower():
+            return False
+        if event.size and doc.size and int(event.size) != int(doc.size):
             return False
         if _near_event(doc.source_created_at, event.gmt_create):
             return True
