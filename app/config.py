@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     # cannot starve them (2026-08-13 finding). One at a time: a single big
     # library can already take tens of minutes.
     watch_slice_size: int = 1
+    # Org-wide full-scan days of month (Asia/Shanghai). Continuous rotation is
+    # only for the initial seeding; afterwards scans run on these days, change
+    # detection in between comes from the 10-minute audit-event pull + bridge
+    # (2026-08-14 user decision: full scans twice a month, days 10 and 24).
+    scan_days: str = "10,24"
     # Go-live cutoff, ISO time with timezone (e.g. 2026-08-13T18:30+08:00; a
     # bare date = that day 00:00 UTC). Seed walks absorb stock silently EXCEPT
     # files created OR updated at/after this moment: an upload into a

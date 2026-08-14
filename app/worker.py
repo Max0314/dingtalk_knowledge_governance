@@ -5,8 +5,11 @@ from .audit_pull import run_audit_pull
 from .config import get_settings
 from .db import SessionLocal, init_db
 from .notify import process_pending_notifications
-from .service import process_next_job, run_watch_slice, seed_demo, sweep_stale_runs
+from .service import (mark_scan_cycle_complete, process_next_job, run_watch_slice, seed_demo, sweep_stale_runs,
+                      watch_scan_decision)
 from .stream import start_stream_consumer
+
+IDLE_CHECK_SECONDS = 600  # 非扫描期：十分钟看一眼日历，零外部调用
 
 logger = logging.getLogger("kg.worker")
 
@@ -50,22 +53,30 @@ def main() -> None:
                 processed += 1
             notified = process_pending_notifications(db, settings)
         if next_watch_at is not None and time.time() >= next_watch_at:
-            # Slices, not full cycles: a few workspaces per pass, with review
-            # jobs / notifications / audit drained in between — an org-wide
-            # walk must not monopolize the loop for hours.
+            # 巡走只在两种情况推进：首轮补种未完成（连续切片），或到达
+            # 每月计划扫描日（默认 10/24，Asia/Shanghai）。其余时间空转看
+            # 日历——日常变化发现由审计增量拉取 + 桥接定向巡走负责
+            # （2026-08-14 决策：全量扫描一个月两次足够）。
             try:
                 with SessionLocal() as db:
-                    sl = run_watch_slice(db, settings, batch=max(1, settings.watch_slice_size))
-                if sl["walked"]:
-                    logger.info("watch slice: %s (remaining %s/%s)",
-                                [(r["name"], r["mode"], r["status"], r["documents_seen"], r["documents_new"],
-                                  r["documents_changed"]) for r in sl["walked"]], sl["remaining"], sl["total"])
-                if sl["cycle_completed"]:
-                    if sl["unresolved"]:
-                        logger.info("watch cycle complete, unresolved: %s", sl["unresolved"])
-                    next_watch_at = time.time() + max(60, settings.watch_interval_seconds)
+                    decision = watch_scan_decision(db, settings)
+                if decision == "idle":
+                    next_watch_at = time.time() + IDLE_CHECK_SECONDS
                 else:
-                    next_watch_at = time.time()  # continue after draining jobs and pushes
+                    with SessionLocal() as db:
+                        sl = run_watch_slice(db, settings, batch=max(1, settings.watch_slice_size))
+                    if sl["walked"]:
+                        logger.info("watch slice: %s (remaining %s/%s)",
+                                    [(r["name"], r["mode"], r["status"], r["documents_seen"], r["documents_new"],
+                                      r["documents_changed"]) for r in sl["walked"]], sl["remaining"], sl["total"])
+                    if sl["cycle_completed"]:
+                        if sl["unresolved"]:
+                            logger.info("watch cycle complete, unresolved: %s", sl["unresolved"])
+                        with SessionLocal() as db:
+                            mark_scan_cycle_complete(db, settings)
+                        next_watch_at = time.time() + max(60, settings.watch_interval_seconds)
+                    else:
+                        next_watch_at = time.time()  # continue after draining jobs and pushes
             except Exception:
                 logger.exception("watch slice failed")
                 next_watch_at = time.time() + 60

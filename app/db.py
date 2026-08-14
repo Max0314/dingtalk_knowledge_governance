@@ -351,6 +351,16 @@ class FileAuditEvent(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class WatchPlan(Base):
+    """Singleton schedule cursor for org-wide scans. `completed_for` names the
+    scan-day (YYYY-MM-DD) whose full walk finished — persisted so a container
+    restart during the idle period never re-triggers a whole-org scan."""
+    __tablename__ = "watch_plan"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    completed_for: Mapped[str] = mapped_column(String(10), default="")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class BridgeWalk(Base):
     """Persistent bridge-walk queue: workspaces the audit bridge owes a fast
     targeted walk. Rows survive restarts and per-pass walk budgets — the

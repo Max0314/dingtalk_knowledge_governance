@@ -45,30 +45,38 @@ def _doc_link(base_url: str, node_id: str) -> str:
 
 def build_message(doc: Document, instance: ReviewInstance, base_url: str = "") -> tuple[str, str]:
     """单条推送：通过 = 正反馈；低分 = 说明语气 + 分析页链接（试点期无退回流程）。
-    状态用彩色文字呈现（钉钉里 emoji 图标观感差）。"""
+    metadata_only 一律称"初检"并注明正文评审待补做——不能让上传人误以为
+    正文已审（codex 2026-08-14 口径风险）。状态用彩色文字呈现。"""
+    partial = instance.review_scope != "full_content"
+    stage = "初检" if partial else "评审"
     score = f'<font color="{_score_color(instance.ai_score, instance.verdict)}">**{instance.ai_score:.0f} / 100**</font>'
     if instance.verdict == "pass":
         lines = [
-            "### 文档评审：通过",
+            f"### 文档{stage}：通过",
             f"**{doc.name}**",
             "",
-            f"{score} · 文档质量达标，感谢维护。",
+            f"{score} · " + ("元数据合规初检通过。" if partial else "文档质量达标，感谢维护。"),
         ]
-        title = f"文档评审通过：{doc.name}"[:60]
+        if partial:
+            lines.append("正文质量评审将在获取到文档正文后自动补做，届时再次推送结果。")
+        title = f"文档{stage}通过：{doc.name}"[:60]
     else:
         findings = [f.get("message", "") for f in (instance.findings or [])[:3] if isinstance(f, dict)]
         lines = [
-            "### 文档评审：低分说明",
+            f"### 文档{stage}：低分说明",
             f"**{doc.name}**",
             "",
             f"{score}，主要扣分点：",
         ]
         lines.extend(f"{index}. {message}" for index, message in enumerate(findings, 1))
         lines.append("")
-        lines.append("以上仅为质量提示，修改后会自动重新评审。")
+        closing = "以上仅为质量提示，修改后会自动重新评审。"
+        if partial:
+            closing += "本次为元数据初检；正文评审将自动补做。"
+        lines.append(closing)
         if base_url and getattr(doc, "node_id", ""):
             lines.append(f"[查看完整评审分析 →]({_doc_link(base_url, doc.node_id)})")
-        title = f"文档评审低分说明：{doc.name}"[:60]
+        title = f"文档{stage}低分说明：{doc.name}"[:60]
     return title, "\n".join(lines) + PILOT_FOOTER
 
 
@@ -123,7 +131,8 @@ def digest_message(entries: list[dict], base_url: str = "") -> tuple[str, str]:
             score_part = f' — <font color="{_score_color(score, verdict)}">**{score:.0f} 分**</font>'
         else:
             score_part = ""
-        lines.append(f"- **{name}**{score_part}")
+        stage_part = " · 初检" if entry.get("scope") == "metadata_only" else ""
+        lines.append(f"- **{name}**{score_part}{stage_part}")
     if len(entries) > 10:
         lines.append(f"- ……其余 {len(entries) - 10} 份")
     if low:
@@ -139,7 +148,8 @@ def _digest_message(db: Session, rows: list[Notification], base_url: str = "") -
         instance = db.get(ReviewInstance, row.review_instance_id) if row.review_instance_id else None
         entries.append({"name": row.title.split("：", 1)[-1],
                         "score": instance.ai_score if instance else None,
-                        "verdict": instance.verdict if instance else ""})
+                        "verdict": instance.verdict if instance else "",
+                        "scope": instance.review_scope if instance else ""})
     return digest_message(entries, base_url)
 
 

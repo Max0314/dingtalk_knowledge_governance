@@ -2,11 +2,11 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import Settings
-from .db import Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, Workspace, WorkspaceRole, utcnow
+from .db import Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, WatchPlan, Workspace, WorkspaceRole, utcnow
 from .fileclass import classify, review_classes
 from .integrations import ADVISORY_GENRES, BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
@@ -225,7 +225,9 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
         doc.is_deleted = False
     doc.watch_misses = 0
     if is_new or changed:
-        doc.uploader_key = item.get("creator_id", "") or doc.uploader_key
+        # 个别节点没有创建人 id（2026-08-14 生产实测三个库因此整轮回滚）：
+        # None 必须钳成空串，后续 .isdigit()/机器人判定才不炸。
+        doc.uploader_key = item.get("creator_id") or doc.uploader_key or ""
         # bi_center is the single source of organization truth. Never infer a
         # department locally. The old wiki namespace reports creators as
         # UnionIDs, the new one as numeric userIds — send the matching key.
@@ -518,6 +520,62 @@ async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2)
 
 def run_watch_slice(db: Session, settings: Settings, batch: int = 2) -> dict:
     return asyncio.run(run_watch_slice_async(db, settings, batch))
+
+
+CN_TZ = timezone(timedelta(hours=8))  # 业务时区（中国无夏令时，固定偏移即可）
+
+
+def _scan_days(settings: Settings) -> list[int]:
+    days = sorted({int(token) for token in settings.scan_days.split(",")
+                   if token.strip().isdigit() and 1 <= int(token) <= 28})
+    return days or [10, 24]
+
+
+def current_scan_due(settings: Settings, today: date | None = None) -> str:
+    """最近一个已到达的计划扫描日（YYYY-MM-DD，Asia/Shanghai 口径）。"""
+    today = today or datetime.now(CN_TZ).date()
+    candidates: list[date] = []
+    for delta in (0, -1):
+        year, month = today.year, today.month + delta
+        if month == 0:
+            year, month = year - 1, 12
+        for day in _scan_days(settings):
+            candidate = date(year, month, day)
+            if candidate <= today:
+                candidates.append(candidate)
+    return max(candidates).isoformat() if candidates else today.isoformat()
+
+
+def _watch_plan(db: Session) -> WatchPlan:
+    plan = db.get(WatchPlan, 1)
+    if plan is None:
+        plan = WatchPlan(id=1)
+        db.add(plan)
+        db.commit()
+    return plan
+
+
+def watch_scan_decision(db: Session, settings: Settings) -> str:
+    """"scan" = 需要推进全量巡走；"idle" = 本期计划已完成，只等下个计划日。
+    首轮补种未完成时始终 scan（2026-08-14 决策：补种完成后停止连续轮巡，
+    全量扫描固定每月 10/24 日；期间的变化发现交给审计增量拉取 + 桥接）。"""
+    seeding_pending = db.scalar(select(func.count()).select_from(Workspace)
+                                .where(Workspace.watch_seeded.is_(False))) or 0
+    if seeding_pending:
+        return "scan"
+    return "idle" if _watch_plan(db).completed_for == current_scan_due(settings) else "scan"
+
+
+def mark_scan_cycle_complete(db: Session, settings: Settings) -> None:
+    """整轮走完时结账：补种全清后才消费计划日（首轮本身就是一次全量）。"""
+    seeding_pending = db.scalar(select(func.count()).select_from(Workspace)
+                                .where(Workspace.watch_seeded.is_(False))) or 0
+    if seeding_pending:
+        return
+    plan = _watch_plan(db)
+    plan.completed_for = current_scan_due(settings)
+    plan.completed_at = utcnow()
+    db.commit()
 
 
 def sweep_stale_runs(db: Session) -> int:

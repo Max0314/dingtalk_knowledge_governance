@@ -35,7 +35,8 @@ class FakeClient:
                 continue
             items.append({"node_id": node["node_id"], "name": node["name"], "category": "file",
                           "extension": node.get("extension", "docx"), "url": "", "size": 10, "word_count": 0,
-                          "has_children": node.get("has_children", False), "creator_id": "tester",
+                          "has_children": node.get("has_children", False),
+                          "creator_id": node.get("creator", "tester"),  # None = 无创建人节点
                           "created_at": node.get("created_at", "2026-08-07T09:00:00"),
                           "updated_at": node.get("updated_at", "2026-08-07T09:00:00")})
         # The real listing re-emits nodes (observed ~2x on a personal space);
@@ -208,6 +209,53 @@ def test_review_since_precise_moment_updated_at_and_key_recovery(settings):
         assert [j.trigger for j in jobs_for(db, "watch-modified")] == ["watch"]    # 存量上线后被改 → 评审
         assert db.get(Document, "watch-after").storage_dentry_id == "987654321"    # 下载键找回
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id == "987654321").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_walk_survives_nodes_without_creator(settings):
+    """2026-08-14 生产实测：个别节点没有创建人 id，None.isdigit() 曾令
+    三个库整轮回滚、镜像永远为 0。"""
+    FakeClient.nodes = {"N": node("watch-nocreator", creator=None)}
+    result = cycle(settings)
+    assert result["runs"][0]["status"] == "succeeded" and result["runs"][0]["documents_seen"] == 1
+    with SessionLocal() as db:
+        doc = db.get(Document, "watch-nocreator")
+        assert doc is not None and doc.uploader_key == "" and doc.uploader_name == "未映射"
+
+
+def test_scan_calendar_and_decision(settings):
+    """全量扫描改为每月计划日（默认 10/24）：补种未清恒 scan；结账后 idle；
+    新计划日到达自动回到 scan。日期计算含跨月/跨年。"""
+    from datetime import date
+
+    from app.db import Workspace
+
+    assert service.current_scan_due(settings, date(2026, 8, 14)) == "2026-08-10"
+    assert service.current_scan_due(settings, date(2026, 8, 24)) == "2026-08-24"
+    assert service.current_scan_due(settings, date(2026, 8, 5)) == "2026-07-24"
+    assert service.current_scan_due(settings, date(2026, 1, 3)) == "2025-12-24"
+
+    with SessionLocal() as db:
+        pending = db.scalars(select(Workspace.workspace_id).where(Workspace.watch_seeded.is_(False))).all()
+        db.query(Workspace).filter(Workspace.workspace_id.in_(pending)).update(
+            {"watch_seeded": True}, synchronize_session=False) if pending else None
+        db.commit()
+        plan = service._watch_plan(db)
+        old_completed = plan.completed_for
+        plan.completed_for = ""
+        db.commit()
+        assert service.watch_scan_decision(db, settings) == "scan"   # 本期计划未完成
+        service.mark_scan_cycle_complete(db, settings)
+        assert service.watch_scan_decision(db, settings) == "idle"   # 结账后空闲
+        ws0 = db.scalars(select(Workspace)).first()
+        ws0.watch_seeded = False
+        db.commit()
+        assert service.watch_scan_decision(db, settings) == "scan"   # 补种未清恒 scan
+        ws0.watch_seeded = True
+        if pending:
+            db.query(Workspace).filter(Workspace.workspace_id.in_(pending)).update(
+                {"watch_seeded": False}, synchronize_session=False)
+        plan.completed_for = old_completed
         db.commit()
 
 

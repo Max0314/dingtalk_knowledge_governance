@@ -847,6 +847,33 @@ def test_notify_pass_gate_copy_and_pilot_footer():
         db.rollback()
 
 
+def test_metadata_only_push_labeled_as_precheck():
+    """codex 2026-08-14：metadata_only 不得自称"评审通过/质量达标"——
+    称"初检"并注明正文评审待补做，汇总行带初检标记。"""
+    from types import SimpleNamespace
+
+    from app import notify as notify_module
+
+    doc = SimpleNamespace(name="口径样例.docx", node_id="pre-1")
+    partial = SimpleNamespace(ai_score=88.0, verdict="pass", review_scope="metadata_only",
+                              rule_version="V1.1", findings=[])
+    title, body = notify_module.build_message(doc, partial, "https://kg.example.com")
+    assert "初检通过" in title and "自动补做" in body and "质量达标" not in body
+    full = SimpleNamespace(ai_score=88.0, verdict="pass", review_scope="full_content",
+                           rule_version="V1.1", findings=[])
+    title_full, body_full = notify_module.build_message(doc, full)
+    assert "评审通过" in title_full and "初检" not in body_full and "质量达标" in body_full
+    low_partial = SimpleNamespace(ai_score=54.0, verdict="return", review_scope="metadata_only",
+                                  rule_version="V1.1", findings=[{"message": "标题未标注版本号"}])
+    title_low, body_low = notify_module.build_message(doc, low_partial)
+    assert "初检低分说明" in title_low and "正文评审将自动补做" in body_low
+    digest_title, digest_body = notify_module.digest_message([
+        {"name": "a.docx", "score": 88, "verdict": "pass", "scope": "metadata_only"},
+        {"name": "b.docx", "score": 90, "verdict": "pass", "scope": "full_content"},
+    ])
+    assert "· 初检" in digest_body and digest_body.count("· 初检") == 1
+
+
 def test_notify_department_allowlist():
     from types import SimpleNamespace
 

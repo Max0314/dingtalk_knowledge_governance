@@ -16,7 +16,8 @@ from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.db import (AuditState, BridgeWalk, Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob,
-                    SessionLocal, SyncRun, Workspace, init_db, utcnow)
+                    SessionLocal, SyncRun, WatchPlan, Workspace, init_db, utcnow)
+from app.service import current_scan_due
 
 
 def main() -> None:
@@ -52,6 +53,14 @@ def main() -> None:
             "registered_workspaces": db.scalar(select(func.count()).select_from(Workspace)) or 0,
             "seeded": db.scalar(select(func.count()).select_from(Workspace)
                                 .where(Workspace.watch_seeded.is_(True))) or 0}
+        plan = db.get(WatchPlan, 1)
+        out["scan_plan"] = {
+            "due": current_scan_due(settings),
+            "completed_for": plan.completed_for if plan else "",
+            "mode": "seeding" if (db.scalar(select(func.count()).select_from(Workspace)
+                                            .where(Workspace.watch_seeded.is_(False))) or 0)
+                    else ("idle" if plan and plan.completed_for == current_scan_due(settings) else "scanning"),
+        }
         week_ago = utcnow() - timedelta(days=7)
         from sqlalchemy import or_ as sa_or
 
