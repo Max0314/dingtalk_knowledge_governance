@@ -241,7 +241,9 @@ class HistoricalFileNode(Base):
     __table_args__ = (UniqueConstraint("snapshot_id", "workspace_id", "node_id", name="uq_history_snapshot_node"),
                       Index("ix_hfn_snapshot_creator", "snapshot_id", "creator_user_id"),
                       # newest-first paging of the merged document list
-                      Index("ix_hfn_snapshot_created", "snapshot_id", "source_created_at"))
+                      Index("ix_hfn_snapshot_created", "snapshot_id", "source_created_at"),
+                      # anti-join for baseline∪live dedup (metrics aggregation, /api/v1/files)
+                      Index("ix_hfn_snapshot_node", "snapshot_id", "node_id"))
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
@@ -475,6 +477,13 @@ EXTRA_COLUMNS = {
 }
 
 
+EXTRA_INDEXES = {
+    "historical_file_nodes": {
+        "ix_hfn_snapshot_node": "CREATE INDEX ix_hfn_snapshot_node ON historical_file_nodes (snapshot_id, node_id)",
+    },
+}
+
+
 def _ensure_columns() -> None:
     from sqlalchemy import inspect, text
     inspector = inspect(engine)
@@ -486,3 +495,13 @@ def _ensure_columns() -> None:
             if column not in existing:
                 with engine.begin() as conn:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+    # create_all only builds indexes for NEW tables; existing tables get
+    # model-declared indexes here (idempotent by name).
+    for table, indexes in EXTRA_INDEXES.items():
+        if not inspector.has_table(table):
+            continue
+        existing_indexes = {idx["name"] for idx in inspector.get_indexes(table)}
+        for name, ddl in indexes.items():
+            if name not in existing_indexes:
+                with engine.begin() as conn:
+                    conn.execute(text(ddl))

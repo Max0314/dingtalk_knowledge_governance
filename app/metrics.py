@@ -13,10 +13,11 @@ total and never subtracts from it.
 from __future__ import annotations
 
 import collections
+import threading
 import time
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
@@ -60,43 +61,74 @@ def primary_snapshot_id(db: Session) -> str:
 
 
 def _collect(db: Session) -> dict[str, Any]:
-    """One pass over both sources, deduplicated by node_id.
+    """One merged view over both sources, deduplicated by node_id — computed
+    as SQL GROUP BYs. The request path must never load whole tables into
+    Python: the org-wide mirror (~280k merged rows) froze the overview page
+    when this was a full-table loop (2026-08-14).
+
+    Dedup semantics (unchanged): baseline wins for a node_id present in both;
+    live rows count only when absent from the baseline snapshot; a confirmed
+    soft-delete hides the baseline row.
 
     Bulk classification (2026-08-12 rework, no more "bulk day"):
       * every file created by a robot account counts as bulk import;
       * a person creating >= PERSON_DAY_BULK_MIN files on one day makes that
         whole person-day bulk (the migration signature);
-      * everything else is routine — a colleague's 15 normal uploads on a
-        migration day stay routine.
+      * everything else is routine.
     """
     baseline = primary_snapshot_id(db)
-    files: dict[str, tuple[str, str, str]] = {}  # node_id -> (workspace_id, created_at, creator)
-    for workspace_id, node_id, created, creator in db.execute(
-            select(HistoricalFileNode.workspace_id, HistoricalFileNode.node_id,
-                   HistoricalFileNode.source_created_at, HistoricalFileNode.creator_user_id)
-            .where(HistoricalFileNode.snapshot_id == baseline,
-                   HistoricalFileNode.node_type != "folder")):  # the 135-lib scan stores folders too
-        files[node_id] = (workspace_id, created or "", creator or "")
-    for workspace_id, node_id, created, creator in db.execute(
-            select(Document.workspace_id, Document.node_id, Document.source_created_at, Document.uploader_key)
-            .where(Document.is_folder.is_(False), Document.is_deleted.is_(False))):
-        files.setdefault(node_id, (workspace_id, created or "", creator or ""))
-    # A confirmed deletion (watcher/reconciliation soft-delete) overrides the
-    # frozen baseline row — totals go down the moment the mirror knows.
-    for (node_id,) in db.execute(select(Document.node_id).where(Document.is_deleted.is_(True))):
-        files.pop(node_id, None)
+    deleted_ids = select(Document.node_id).where(Document.is_deleted.is_(True))
+    base_where = (HistoricalFileNode.snapshot_id == baseline,
+                  HistoricalFileNode.node_type != "folder",  # the 135-lib scan stores folders too
+                  HistoricalFileNode.node_id.not_in(deleted_ids))
+    # live arm: mirror rows whose node_id the baseline does not know (anti-join
+    # rides ix_hfn_snapshot_node).
+    live_join = and_(HistoricalFileNode.snapshot_id == baseline,
+                     HistoricalFileNode.node_id == Document.node_id)
+    live_where = (Document.is_folder.is_(False), Document.is_deleted.is_(False),
+                  HistoricalFileNode.id.is_(None))
+
+    def live_agg(*columns):
+        return (select(*columns, func.count()).select_from(Document)
+                .outerjoin(HistoricalFileNode, live_join).where(*live_where))
+
+    space_totals = collections.Counter()
+    for workspace_id, count in db.execute(
+            select(HistoricalFileNode.workspace_id, func.count()).where(*base_where)
+            .group_by(HistoricalFileNode.workspace_id)):
+        space_totals[workspace_id] += count
+    for workspace_id, count in db.execute(live_agg(Document.workspace_id)
+                                          .group_by(Document.workspace_id)):
+        space_totals[workspace_id] += count
+
+    base_month = func.substr(HistoricalFileNode.source_created_at, 1, 7)
+    base_day = func.substr(HistoricalFileNode.source_created_at, 1, 10)
+    live_month = func.substr(Document.source_created_at, 1, 7)
+    live_day = func.substr(Document.source_created_at, 1, 10)
+    dated_base = base_where + (func.length(HistoricalFileNode.source_created_at) >= 10,)
+    dated_live = (func.length(Document.source_created_at) >= 10,)
+
+    space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
+    for workspace_id, month, count in db.execute(
+            select(HistoricalFileNode.workspace_id, base_month, func.count()).where(*dated_base)
+            .group_by(HistoricalFileNode.workspace_id, base_month)):
+        space_months[workspace_id][month] += count
+    for workspace_id, month, count in db.execute(
+            live_agg(Document.workspace_id, live_month).where(*dated_live)
+            .group_by(Document.workspace_id, live_month)):
+        space_months[workspace_id][month] += count
+
+    creator_day = collections.Counter()  # (creator, YYYY-MM-DD) -> files
+    for creator, day, count in db.execute(
+            select(HistoricalFileNode.creator_user_id, base_day, func.count()).where(*dated_base)
+            .group_by(HistoricalFileNode.creator_user_id, base_day)):
+        creator_day[(creator or "", day)] += count
+    for creator, day, count in db.execute(
+            live_agg(Document.uploader_key, live_day).where(*dated_live)
+            .group_by(Document.uploader_key, live_day)):
+        creator_day[(creator or "", day)] += count
 
     robots = robot_ids()
-    creator_day = collections.Counter()  # (creator, YYYY-MM-DD) -> files
-    space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
-    space_totals = collections.Counter()
-    for workspace_id, created, creator in files.values():
-        space_totals[workspace_id] += 1
-        if len(created) < 10:
-            continue
-        space_months[workspace_id][created[:7]] += 1
-        creator_day[(creator, created[:10])] += 1
-
     monthly = collections.Counter()
     bulk_by_month = collections.Counter()
     for (creator, day), count in creator_day.items():
@@ -106,7 +138,7 @@ def _collect(db: Session) -> dict[str, Any]:
             bulk_by_month[month] += count
 
     return {
-        "total_files": len(files),
+        "total_files": sum(space_totals.values()),
         "monthly": dict(monthly),
         "bulk_by_month": dict(bulk_by_month),
         "creator_day": dict(creator_day),
@@ -116,10 +148,38 @@ def _collect(db: Session) -> dict[str, Any]:
     }
 
 
+def invalidate_cache() -> None:
+    """Drop the cached aggregate INCLUDING the stale-serve value — tests and
+    admin actions that must observe fresh numbers call this; a bare stamp
+    reset would still serve the stale value under stale-while-revalidate."""
+    _cache.update(stamp=None, at=0.0, value=None)
+
+
+_refresh_lock = threading.Lock()
+
+
+def _refresh_in_background() -> None:
+    from .db import SessionLocal
+    try:
+        with SessionLocal() as db:
+            stamp = _change_stamp(db)
+            value = _collect(db)
+        _cache.update(stamp=stamp, at=time.monotonic(), value=value)
+    finally:
+        _refresh_lock.release()
+
+
 def collected(db: Session) -> dict[str, Any]:
+    """Stale-while-revalidate：请求路径只读缓存，过期时返回旧值并由后台线程
+    刷新——任何页面都不因指标重算而卡住。冷启动的第一次同步计算（SQL 聚合
+    后为亚秒级）。"""
     stamp = _change_stamp(db)
     now = time.monotonic()
-    if _cache["stamp"] == stamp and now - _cache["at"] < CACHE_TTL_SECONDS:
+    if _cache["value"] is not None and _cache["stamp"] == stamp and now - _cache["at"] < CACHE_TTL_SECONDS:
+        return _cache["value"]
+    if _cache["value"] is not None:
+        if _refresh_lock.acquire(blocking=False):
+            threading.Thread(target=_refresh_in_background, daemon=True).start()
         return _cache["value"]
     value = _collect(db)
     _cache.update(stamp=stamp, at=now, value=value)

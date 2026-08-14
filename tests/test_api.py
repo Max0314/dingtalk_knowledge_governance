@@ -137,7 +137,7 @@ def test_bulk_classification_and_increments_tree(monkeypatch):
                 rows.append(Document(node_id="bulk-t-n", workspace_id="demo-workspace", name="正常上传.docx",
                                      uploader_key="h-normal", source_created_at="2030-05-11", file_class="document"))
                 db.add_all(rows); db.commit()
-                metrics._cache.update(stamp=None, at=0)
+                metrics.invalidate_cache()
             months = client.get("/api/v1/metrics/increments/tree", params={"year": "2030"}).json()
             row = next(r for r in months["rows"] if r["key"] == "2030-05")
             # robot(1) + mover person-day of 3 = bulk 4; the single normal upload stays routine
@@ -149,7 +149,7 @@ def test_bulk_classification_and_increments_tree(monkeypatch):
             with SessionLocal() as db:
                 db.query(Document).filter(Document.node_id.like("bulk-t-%")).delete(synchronize_session=False)
                 db.commit()
-                metrics._cache.update(stamp=None, at=0)
+                metrics.invalidate_cache()
     finally:
         os.environ.pop("KG_ROBOT_USER_IDS", None)
         get_settings.cache_clear()
@@ -161,6 +161,13 @@ def test_soft_deleted_document_leaves_the_headline_total():
 
     with TestClient(app) as client:
         with SessionLocal() as db:
+            # 自愈：上一次失败会把 hist-A 留在已删除状态（断言中止在恢复之前），
+            # 先复位再测量，否则前后都是"已删"基线，永远差不出 1。
+            stale = db.get(Document, "hist-A")
+            if stale is not None and stale.is_deleted:
+                stale.is_deleted = False
+                db.commit()
+            metrics.invalidate_cache()
             baseline_total = metrics.monthly_increments(db)["total_files"]
             # hist-A exists in the primary baseline snapshot; a mirrored soft
             # delete must remove it from the merged headline count.
@@ -171,12 +178,12 @@ def test_soft_deleted_document_leaves_the_headline_total():
                 db.add(doc)
             doc.is_deleted = True
             db.commit()
-            metrics._cache.update(stamp=None, at=0)  # bust the metrics cache
+            metrics.invalidate_cache()  # bust the metrics cache
             after = metrics.monthly_increments(db)["total_files"]
             assert after == baseline_total - 1
             doc.is_deleted = False
             db.commit()
-            metrics._cache.update(stamp=None, at=0)
+            metrics.invalidate_cache()
 
 
 def test_admin_guard_gates_model_configs():
