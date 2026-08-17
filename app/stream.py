@@ -50,6 +50,9 @@ def _run_client(settings: Settings) -> None:
     credential = dingtalk_stream.Credential(settings.dingtalk_app_key, settings.dingtalk_app_secret)
     client = dingtalk_stream.DingTalkStreamClient(credential)
     client.register_all_event_handler(AllEventsHandler())
+    # DingTalkStreamClient resets this logger during construction. Disable it
+    # only after construction so start_forever cannot print the connection ticket.
+    logging.getLogger("dingtalk_stream.client").disabled = True
     logger.info("stream consumer connecting")
     client.start_forever()
 

@@ -439,3 +439,17 @@ def test_unknown_action_reopen_is_exact_and_requires_current_whitelist(monkeypat
     monkeypatch.setattr(sys, "argv", ["reopen_dead_letters.py", "--unknown-action", "仍未识别的动作"])
     with pytest.raises(SystemExit, match="仍未进入白名单"):
         reopen_dead_letters.main()
+
+
+def test_dependency_credential_log_filter_blocks_info_only():
+    import logging
+
+    from app.worker import _DependencyCredentialFilter
+
+    guard = _DependencyCredentialFilter()
+    http_info = logging.LogRecord("httpx", logging.INFO, __file__, 1, "signed url", (), None)
+    stream_info = logging.LogRecord("dingtalk_stream.client", logging.INFO, __file__, 1, "ticket", (), None)
+    http_warning = logging.LogRecord("httpx", logging.WARNING, __file__, 1, "failed", (), None)
+    app_info = logging.LogRecord("kg.worker", logging.INFO, __file__, 1, "summary", (), None)
+    assert guard.filter(http_info) is False and guard.filter(stream_info) is False
+    assert guard.filter(http_warning) is True and guard.filter(app_info) is True

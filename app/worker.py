@@ -14,6 +14,15 @@ IDLE_CHECK_SECONDS = 600  # 非扫描期：十分钟看一眼日历，零外部�
 logger = logging.getLogger("kg.worker")
 
 
+class _DependencyCredentialFilter(logging.Filter):
+    """Drop dependency INFO records that can contain signed URLs/tickets."""
+
+    SENSITIVE_LOGGERS = {"httpx", "dingtalk_stream.client"}
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.WARNING or record.name not in self.SENSITIVE_LOGGERS
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     # httpx INFO includes full URLs (the .adoc export URL carries a temporary
@@ -21,6 +30,8 @@ def main() -> None:
     # application summaries at INFO, but never persist those credentials.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("dingtalk_stream.client").setLevel(logging.WARNING)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(_DependencyCredentialFilter())
     settings = get_settings(); init_db()
     start_stream_consumer(settings)
     with SessionLocal() as db:
