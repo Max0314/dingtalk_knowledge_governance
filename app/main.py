@@ -281,13 +281,16 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     ordered streams are merged in Python — page one costs ~2×(offset+limit)
     indexed rows instead of a 140k-row temp-table sort."""
     snapshot = metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    # 不可见库（连续缺席/404 自动标记）双臂都不进当前检索——基线臂也要滤
+    # （codex 第九轮 P1）；历史数据仍可走基线专用接口查询。
+    inactive_ws = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
     base = select(
         HistoricalFileNode.node_id, HistoricalFileNode.workspace_id, HistoricalFileNode.name,
         HistoricalFileNode.extension, HistoricalFileNode.url,
         HistoricalFileNode.source_created_at.label("created_at"),
         HistoricalFileNode.creator_user_id.label("creator"),
-    ).where(HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type != "folder")
-    inactive_ws = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
+    ).where(HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type != "folder",
+            HistoricalFileNode.workspace_id.not_in(inactive_ws))
     live = select(
         Document.node_id, Document.workspace_id, Document.name,
         Document.extension, Document.url,

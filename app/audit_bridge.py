@@ -54,16 +54,31 @@ CONFIRM_FINISH_BUDGET = 50
 # 不伪装成功（发现与评审由 watcher 轮巡 + KG_REVIEW_SINCE 兜底）。
 GIVE_UP_AFTER_MS = 48 * 3600 * 1000
 
-# 操作类型白名单（codex P0-1 + 2026-08-14 拍板）。匹配顺序即语义优先级：
-# "从回收站恢复"先于"删除"，"移除成员"先于"移除"。修改类同样是显式白名单
-# ——未命中任何名单的动作绝不评审（codex 第八轮 P0：默认评审违反白名单
-# 原则），带 ignored_unknown_action 终态进诊断，观察到新动作再扩名单。
+# 操作类型白名单（codex P0-1 + 2026-08-14 拍板）。分两档：
+#
+# 评审触发类（review/modify）**整名精确匹配**（codex 第九轮 P0：裸子串会把
+# "修改文档标题""更新知识库描述"这类非正文操作放进评审）。名单以生产流水
+# 实际观察到的动作名为主（知识库上传文件/知识库修改文件/复制或转发文件/
+# 文档导入/创建文档/创建副本），补少量无歧义的"动词+文件/文档"完整名；
+# 名单外一律 unknown 终态计数，人工确认后再扩。
+#
+# 非评审类（ignore/restore/delete/metadata）保持子串匹配——分错档也不会
+# 触发评审，宽召回换取删除/协同动作的覆盖。匹配顺序即语义优先级：
+# "从回收站恢复"先于"删除"，"移除成员"先于"移除"。
 IGNORE_ACTIONS = ("协作", "成员", "分享", "公开", "外链", "权限", "评论", "链接", "收藏", "浏览", "预览", "下载")
 RESTORE_ACTIONS = ("恢复", "还原")
 DELETE_ACTIONS = ("删除", "撤回", "移除", "回收站")
 METADATA_ACTIONS = ("重命名", "移动")
-REVIEW_ACTIONS = ("上传", "新建", "创建", "复制", "转发", "导入", "副本", "覆盖")
-MODIFY_ACTIONS = ("修改", "编辑", "更新")
+REVIEW_ACTIONS_EXACT = frozenset({
+    "知识库上传文件", "上传文件", "新建文件", "新建文档", "创建文件", "创建文档",
+    "创建副本", "复制或转发文件", "文档导入", "覆盖上传",
+})
+MODIFY_ACTIONS_EXACT = frozenset({
+    "知识库修改文件", "修改文件", "修改文档", "修改文件正文",
+    "编辑文件", "编辑文档", "更新文件", "更新文档",
+})
+# 覆盖上传复用旧节点，created_at 不会贴近事件——互证时不算"创建"。
+CREATION_ACTIONS_EXACT = REVIEW_ACTIONS_EXACT - {"覆盖上传"}
 
 # In-memory debounce: workspace_id -> monotonic seconds of the last bridge
 # walk. Worker restarts forget it; one extra walk is harmless. Failed walks
@@ -152,13 +167,17 @@ def _awaiting_content_upgrade(db: Session, node_id: str) -> bool:
 def _action_kind(event: FileAuditEvent) -> str:
     """审计动作分类：review（立即评审）/ modify（合并窗评审）/ metadata
     （只更新镜像）/ delete、restore（软删/恢复，绝不评审）/ ignore（纯协同
-    动作，直接终态）/ unknown（不在任何白名单：绝不评审，终态可观测）。"""
-    view = event.action_view or ""
+    动作，直接终态）/ unknown（不在任何白名单：绝不评审，终态可观测）。
+    评审触发类整名精确匹配，非评审类子串匹配（见名单注释）。"""
+    view = (event.action_view or "").strip()
     for keywords, kind in ((IGNORE_ACTIONS, "ignore"), (RESTORE_ACTIONS, "restore"),
-                           (DELETE_ACTIONS, "delete"), (METADATA_ACTIONS, "metadata"),
-                           (REVIEW_ACTIONS, "review"), (MODIFY_ACTIONS, "modify")):
+                           (DELETE_ACTIONS, "delete"), (METADATA_ACTIONS, "metadata")):
         if any(keyword in view for keyword in keywords):
             return kind
+    if view in REVIEW_ACTIONS_EXACT:
+        return "review"
+    if view in MODIFY_ACTIONS_EXACT:
+        return "modify"
     return "unknown"
 
 
@@ -391,10 +410,9 @@ def _near_event(iso_value: str, gmt_ms: int, tolerance_seconds: int = 900) -> bo
 
 
 def _is_creation_event(event: FileAuditEvent) -> bool:
-    view = event.action_view or ""
-    # 生产审计还会用“复制或转发文件”“文档导入”等名称表示新节点；
-    # 这些事件和上传一样，绝不能拿旧节点的 updated_at 做互证。
-    return any(keyword in view for keyword in ("上传", "新建", "创建", "复制", "转发", "导入", "副本"))
+    # 生产审计用“复制或转发文件”“文档导入”等名称表示新节点；这些事件和
+    # 上传一样，绝不能拿旧节点的 updated_at 做互证。与分类同源的精确名单。
+    return (event.action_view or "").strip() in CREATION_ACTIONS_EXACT
 
 
 def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:

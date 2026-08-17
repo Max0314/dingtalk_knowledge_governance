@@ -668,18 +668,25 @@ def mark_scan_cycle_complete(db: Session, settings: Settings,
 
 
 def sweep_stale_runs(db: Session) -> int:
-    """Mark runs a dead process left in "running" as interrupted. Called once
-    at worker boot — with a single worker, anything still "running" then is a
-    leftover, not live work (7 such rows accumulated by 2026-08-13)。同时清空
-    巡走残留队列：直建流程下走整库只剩试点级兜底，跨重启的旧行（如已删库
-    P-06）只会反复 404 烧预算，一次性出清。"""
+    """Boot-time zombie sweep (single worker: anything still "running" at boot
+    is a leftover, not live work). Three kinds:
+
+    - SyncRun running -> failed/interrupted_by_restart（2026-08-13 起）；
+    - ReviewJob running -> 重新置 pending（codex 第九轮 P0：部署/崩溃打断
+      模型评审会让任务永久 running，合并窗也被它卡住永不补评。重新排队
+      即便上次已出过实例，正文指纹去重也不会重复出分）；
+    - BridgeWalk 残留队列出清：直建流程下走整库只剩试点级兜底，跨重启的
+      旧行（如已删库 P-06）只会反复 404 烧预算。"""
     stale = db.scalars(select(SyncRun).where(SyncRun.status == "running")).all()
     for run in stale:
         run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
+    zombie_jobs = db.scalars(select(ReviewJob).where(ReviewJob.status == "running")).all()
+    for job in zombie_jobs:
+        job.status = "pending"
     for row in db.scalars(select(BridgeWalk)).all():
         db.delete(row)
     db.commit()
-    return len(stale)
+    return len(stale) + len(zombie_jobs)
 
 
 def seed_demo(db: Session) -> None:

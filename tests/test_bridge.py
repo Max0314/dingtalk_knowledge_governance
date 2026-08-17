@@ -1047,6 +1047,13 @@ def test_action_kind_whitelist_classification():
     # 白名单外一律 unknown——绝不默认评审（codex 第八轮 P0）
     assert audit_bridge._action_kind(ns("某未知写操作")) == "unknown"
     assert audit_bridge._action_kind(ns("")) == "unknown"
+    # 评审触发类整名精确匹配（codex 第九轮 P0）：带宾语后缀的非正文操作
+    # 不得因裸子串"修改/更新/编辑"进入评审
+    assert audit_bridge._action_kind(ns("修改文档标题")) == "unknown"
+    assert audit_bridge._action_kind(ns("更新知识库描述")) == "unknown"
+    assert audit_bridge._action_kind(ns("修改")) == "unknown"
+    assert audit_bridge._action_kind(ns("上传头像")) == "unknown"
+    assert audit_bridge._action_kind(ns(" 知识库上传文件 ")) == "review"  # 前后空白归一
 
 
 def test_unknown_action_terminal_never_reviews(env, monkeypatch):

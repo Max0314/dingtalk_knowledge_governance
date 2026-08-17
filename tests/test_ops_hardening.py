@@ -120,20 +120,32 @@ def test_dashboard_average_uses_latest_instance_per_doc():
 
 
 def test_sweep_stale_runs():
-    from app.db import BridgeWalk
+    from app.db import BridgeWalk, ReviewJob
     from app.service import sweep_stale_runs
 
     init_db()
     with SessionLocal() as db:
+        _ensure_demo_workspace(db)
         db.merge(SyncRun(run_id="stale-1", status="running", mode="watch", workspace_id="ws-z"))
         db.merge(BridgeWalk(workspace_id="stale-walk-ws"))  # 跨重启残留的巡走队列行
+        db.query(ReviewJob).filter(ReviewJob.job_id == "stale-review-1").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "stale-review-doc").delete(synchronize_session=False)
+        db.add(Document(node_id="stale-review-doc", workspace_id="demo-workspace",
+                        name="被打断的评审.docx", extension="docx", file_class="document"))
+        db.add(ReviewJob(job_id="stale-review-1", node_id="stale-review-doc",
+                         trigger="audit", status="running"))
         db.commit()
-        assert sweep_stale_runs(db) >= 1
+        assert sweep_stale_runs(db) >= 2
         row = db.get(SyncRun, "stale-1")
         assert row.status == "failed" and row.error_code == "interrupted_by_restart" and row.finished_at
         from sqlalchemy import select as sa_select
         assert db.scalars(sa_select(BridgeWalk)).all() == []  # 启动清空，避免反复 404 烧预算
-        db.delete(row)
+        # codex 第九轮 P0：被重启打断的模型评审重新排队（指纹去重防重复出分），
+        # 不许永久卡 running 拖死合并窗
+        job = db.get(ReviewJob, "stale-review-1")
+        assert job.status == "pending"
+        db.delete(row); db.delete(job)
+        db.query(Document).filter(Document.node_id == "stale-review-doc").delete(synchronize_session=False)
         db.commit()
 
 
@@ -254,6 +266,46 @@ def test_harvest_keeps_window_while_job_running():
         assert doc.review_due_at is None and doc.dirty_since is None
         db.query(ReviewJob).filter(ReviewJob.node_id == "hrun-1").delete(synchronize_session=False)
         db.query(Document).filter(Document.node_id == "hrun-1").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_inactive_workspace_baseline_hidden_from_search_and_metrics():
+    """codex 第九轮 P1：不可见库的**基线**文件同样退出当前检索与总览统计
+    （此前只滤了实时臂）；恢复可见即回归。"""
+    from app import metrics as metrics_module
+    from app.db import HistoricalFileNode, HistoricalSnapshot
+
+    init_db()
+    with SessionLocal() as db:
+        primary = metrics_module.primary_snapshot_id(db)
+        if not primary:
+            db.add(HistoricalSnapshot(snapshot_id="wiki-baseline-2026-08-05"))
+            db.commit()
+            primary = metrics_module.primary_snapshot_id(db)
+        files_snap = metrics_module.uploader_snapshot_id(db) or primary
+        db.query(HistoricalFileNode).filter(
+            HistoricalFileNode.node_id.in_(("inact-base-1", "inact-base-2"))).delete(synchronize_session=False)
+        db.merge(Workspace(workspace_id="inactive-base-ws", name="X-基线不可见库",
+                           watch_seeded=True, is_active=False))
+        db.add(HistoricalFileNode(snapshot_id=primary, workspace_id="inactive-base-ws",
+                                  node_id="inact-base-1", name="基线残留文件.docx", extension="docx",
+                                  node_type="file", source_created_at="2026-05-01T09:00:00"))
+        if files_snap != primary:
+            db.add(HistoricalFileNode(snapshot_id=files_snap, workspace_id="inactive-base-ws",
+                                      node_id="inact-base-2", name="基线残留文件.docx", extension="docx",
+                                      node_type="file", source_created_at="2026-05-01T09:00:00"))
+        db.commit()
+        assert "inactive-base-ws" not in metrics_module._collect(db)["space_totals"]
+    with TestClient(app) as client:
+        items = client.get("/api/v1/files", params={"query": "基线残留文件"}).json()["items"]
+        assert all(item["workspace_id"] != "inactive-base-ws" for item in items)
+    with SessionLocal() as db:
+        db.get(Workspace, "inactive-base-ws").is_active = True
+        db.commit()
+        assert metrics_module._collect(db)["space_totals"].get("inactive-base-ws") == 1
+        db.query(HistoricalFileNode).filter(
+            HistoricalFileNode.node_id.in_(("inact-base-1", "inact-base-2"))).delete(synchronize_session=False)
+        db.query(Workspace).filter(Workspace.workspace_id == "inactive-base-ws").delete(synchronize_session=False)
         db.commit()
 
 

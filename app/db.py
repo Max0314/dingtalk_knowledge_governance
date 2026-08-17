@@ -487,17 +487,19 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
     if engine.dialect.name == "mysql":
         # api 与 worker 同时启动会并发跑 ALTER/CREATE INDEX（曾出现重复索引
         # 竞争反复重启，codex 第八轮 P1）。MySQL 命名锁串行化迁移段：后到者
-        # 等前者做完再进（届时重新 inspect 一切已就位、全部跳过）。锁超时
-        # （返回 0）按无锁继续——迁移本身幂等，退化等价于旧行为。
+        # 等前者做完再进（届时重新 inspect 一切已就位、全部跳过）。拿不到锁
+        # （0/NULL）必须报错退出交给容器重启重试——无锁继续就是重新暴露
+        # 并发 DDL 竞争（codex 第九轮 P1）。
         from sqlalchemy import text
         with engine.connect() as lock_conn:
             got = lock_conn.execute(text("SELECT GET_LOCK('kg_schema_migration', 60)")).scalar()
+            if not got:
+                raise RuntimeError("未取得迁移锁 kg_schema_migration（60 秒超时）：疑似另一进程迁移中，退出等容器重试。")
             try:
                 Base.metadata.create_all(engine)
                 _ensure_columns()
             finally:
-                if got:
-                    lock_conn.execute(text("SELECT RELEASE_LOCK('kg_schema_migration')"))
+                lock_conn.execute(text("SELECT RELEASE_LOCK('kg_schema_migration')"))
     else:
         Base.metadata.create_all(engine)
         _ensure_columns()
