@@ -115,8 +115,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     格式化重存等假修改不重复出分/推送）；手动重评永不跳过。
 
     拿不到正文抛 ContentUnavailableError（2026-08-17 拍板：初检分数只反映
-    命名不反映内容，宁缺毋滥）；手动重评/演示种子是明确的人为意图，保留
-    元数据评审能力。"""
+    命名不反映内容，宁缺毋滥）；手动重评同样执行正文门禁。只有本地演示
+    数据允许生成占位评分，生产数据无任何例外。"""
     from .content import fetch_document_content
 
     doc = db.get(Document, node_id)
@@ -141,7 +141,14 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
         scope = "full_content" if content else "metadata_only"
         if content:
             content_note = ""  # 正文拿到了，原因字段只服务于 metadata_only 的可观测性
-    if not doc.is_folder and not content and trigger not in ("manual_rerun", "demo_seed"):
+    demo_placeholder = bool(
+        settings.demo_mode
+        and doc.workspace_id == "demo-workspace"
+        and doc.node_id.startswith("demo-")
+    )
+    if doc.is_folder:
+        raise ContentUnavailableError("unsupported")
+    if not content and not demo_placeholder:
         raise ContentUnavailableError(content_note or "empty")
     if content and trigger != "manual_rerun":
         fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()

@@ -50,6 +50,15 @@ def test_plain_text_and_fallbacks():
     assert extract_text("docx", b"not a zip at all") == ""  # malformed archive degrades
 
 
+def test_office_extraction_rejects_oversized_uncompressed_xml(monkeypatch):
+    import app.content as content_module
+
+    monkeypatch.setattr(content_module, "MAX_OFFICE_MEMBER_BYTES", 100)
+    monkeypatch.setattr(content_module, "MAX_OFFICE_XML_BYTES", 100)
+    data = zip_bytes({"word/document.xml": "<w:document>" + ("x" * 200) + "</w:document>"})
+    assert extract_text("docx", data) == ""
+
+
 def test_sheet_class_uses_reduced_rule_subset():
     from app.scoring import score_document
 
@@ -73,6 +82,160 @@ def test_fetch_degrades_without_numeric_id():
                    extension="docx", file_class="document", storage_dentry_id="")
     text, source = asyncio.run(fetch_document_content(settings, doc))
     assert text == "" and source == "no_numeric_id"
+
+
+def test_adoc_fetch_exports_docx_without_storage_mapping(monkeypatch):
+    """Native DingTalk documents use the official export task and do not need
+    the numeric storage key required by uploaded files."""
+    import asyncio
+
+    from app.content import fetch_document_content
+    from app.integrations import DingtalkClient
+
+    exported = zip_bytes({
+        "word/document.xml":
+            "<w:document xmlns:w='ns'><w:body><w:p><w:r>"
+            "<w:t>钉钉在线文档正文</w:t></w:r></w:p></w:body></w:document>",
+    })
+    calls: list[tuple[str, int]] = []
+
+    async def fake_export(self, dentry_uuid, max_bytes):
+        calls.append((dentry_uuid, max_bytes))
+        return exported
+
+    monkeypatch.setattr(DingtalkClient, "export_native_document_docx", fake_export)
+    settings = get_settings().model_copy(update={
+        "content_extract_enabled": True,
+        "wiki_storage_space_id": "",
+        "content_max_bytes": 1024 * 1024,
+    })
+    doc = Document(node_id="native-adoc-1", workspace_id="content-ws", name="在线文档.adoc",
+                   extension="adoc", file_class="document", storage_dentry_id="")
+    text, source = asyncio.run(fetch_document_content(settings, doc))
+    assert text == "钉钉在线文档正文"
+    assert source == "dingtalk_adoc_export"
+    assert calls == [("native-adoc-1", 1024 * 1024)]
+
+
+def test_uploaded_fetch_passes_configured_download_limit(monkeypatch):
+    import asyncio
+
+    from app.content import fetch_document_content
+    from app.integrations import DingtalkClient
+
+    downloaded = "正文内容".encode("utf-8")
+    calls: list[tuple[str, str, int]] = []
+
+    async def fake_download(self, space_id, dentry_id, max_bytes):
+        calls.append((space_id, dentry_id, max_bytes))
+        return downloaded
+
+    monkeypatch.setattr(DingtalkClient, "download_file_bytes", fake_download)
+    settings = get_settings().model_copy(update={
+        "content_extract_enabled": True,
+        "wiki_storage_space_id": "storage-space",
+        "content_max_bytes": 12345,
+    })
+    doc = Document(node_id="uploaded-text-1", workspace_id="content-ws", name="说明.txt",
+                   extension="txt", file_class="text", storage_dentry_id="123456")
+    text, source = asyncio.run(fetch_document_content(settings, doc))
+    assert text == "正文内容" and source == "storage_download"
+    assert calls == [("storage-space", "123456", 12345)]
+
+
+def test_adoc_official_export_flow_keeps_bytes_in_memory(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from app import integrations
+    from app.integrations import DingtalkClient
+
+    exported = zip_bytes({
+        "word/document.xml":
+            "<w:document xmlns:w='ns'><w:body><w:p><w:r>"
+            "<w:t>导出正文</w:t></w:r></w:p></w:body></w:document>",
+    })
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/v2.0/doc/me/export/submit":
+            return httpx.Response(200, json={"taskId": "task-1"})
+        if request.url.path == "/v2.0/doc/me/export/task/query":
+            return httpx.Response(200, json={
+                "status": "success",
+                "downloadUrl": "https://alidocs-body.oss-cn-zhangjiakou.aliyuncs.com/export.docx?sig=secret",
+            })
+        if request.url.host == "alidocs-body.oss-cn-zhangjiakou.aliyuncs.com":
+            return httpx.Response(200, headers={"content-length": str(len(exported))}, content=exported)
+        return httpx.Response(404)
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        integrations.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: real_async_client(transport=transport, follow_redirects=False),
+    )
+    settings = get_settings().model_copy(update={
+        "dingtalk_sync_operator_id": "operator-union-id",
+        "adoc_export_poll_interval_seconds": 0,
+        "adoc_export_timeout_seconds": 2,
+    })
+    client = DingtalkClient(settings)
+
+    async def fake_token():
+        return "masked-test-token"
+
+    monkeypatch.setattr(client, "_token_value", fake_token)
+    data = asyncio.run(client.export_native_document_docx("native-adoc-2", max_bytes=len(exported) + 1))
+    assert data == exported
+    assert requests == [
+        ("POST", "/v2.0/doc/me/export/submit"),
+        ("GET", "/v2.0/doc/me/export/task/query"),
+        ("GET", "/export.docx"),
+    ]
+
+
+def test_adoc_export_rejects_untrusted_download_url(monkeypatch):
+    import asyncio
+
+    import httpx
+    import pytest
+
+    from app import integrations
+    from app.integrations import DingtalkClient, IntegrationError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v2.0/doc/me/export/submit":
+            return httpx.Response(200, json={"taskId": "task-2"})
+        return httpx.Response(200, json={
+            "status": "success",
+            "downloadUrl": "https://attacker.example/export.docx",
+        })
+
+    real_async_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        integrations.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: real_async_client(transport=transport, follow_redirects=False),
+    )
+    settings = get_settings().model_copy(update={
+        "dingtalk_sync_operator_id": "operator-union-id",
+        "adoc_export_poll_interval_seconds": 0,
+        "adoc_export_timeout_seconds": 2,
+    })
+    client = DingtalkClient(settings)
+
+    async def fake_token():
+        return "masked-test-token"
+
+    monkeypatch.setattr(client, "_token_value", fake_token)
+    with pytest.raises(IntegrationError) as error:
+        asyncio.run(client.export_native_document_docx("native-adoc-3"))
+    assert error.value.code == "dingtalk_adoc_export_url_invalid"
 
 
 def test_model_score_recomputes_verdict(monkeypatch):

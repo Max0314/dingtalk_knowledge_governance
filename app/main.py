@@ -66,7 +66,9 @@ class GovernancePatch(BaseModel):
 
 
 class ReviewRequest(BaseModel):
-    trigger: str = "manual"
+    # Public callers can only request a manual rerun. Internal audit/watch
+    # triggers are assigned server-side and must not be spoofable via the API.
+    trigger: str = Field(default="manual_rerun", pattern="^manual_rerun$")
 
 
 class DecisionRequest(BaseModel):

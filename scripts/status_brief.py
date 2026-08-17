@@ -145,7 +145,7 @@ def main() -> None:
                 select(func.count()).select_from(ReviewJob)
                 .where(ReviewJob.status == "skipped",
                        ReviewJob.error_code.like("content_unavailable%"),
-                       ReviewJob.created_at >= day_ago)) or 0,
+                       ReviewJob.finished_at >= day_ago)) or 0,
             "latest": [{"score": r.ai_score, "verdict": r.verdict, "scope": r.review_scope,
                         "at": r.created_at.isoformat(timespec="seconds")}
                        for r in db.scalars(select(ReviewInstance)

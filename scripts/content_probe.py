@@ -31,12 +31,18 @@ def main() -> None:
             return
         out["extension"] = doc.extension
         out["size"] = doc.size
-        try:
-            data = asyncio.run(DingtalkClient(settings).download_file_bytes(settings.wiki_storage_space_id, node_id))
-            out["downloaded_bytes"] = len(data)
-            out["extracted_chars"] = len(extract_text(doc.extension, data))
-        except IntegrationError as exc:
-            out["download_error"] = {"code": exc.code, "status": exc.status_code, "message": str(exc)}
+        # Uploaded files and native .adoc documents deliberately use different
+        # APIs.  Probe the low-level storage route only where a numeric storage
+        # key exists; fetch_document_content covers both paths below.
+        if doc.extension != "adoc" and doc.storage_dentry_id:
+            try:
+                data = asyncio.run(DingtalkClient(settings).download_file_bytes(
+                    settings.wiki_storage_space_id, doc.storage_dentry_id, settings.content_max_bytes
+                ))
+                out["downloaded_bytes"] = len(data)
+                out["extracted_chars"] = len(extract_text(doc.extension, data))
+            except IntegrationError as exc:
+                out["download_error"] = {"code": exc.code, "status": exc.status_code}
         try:
             text, source = asyncio.run(fetch_document_content(settings, doc))
             out["fetch"] = {"chars": len(text), "source": source}

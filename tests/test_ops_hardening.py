@@ -334,8 +334,7 @@ def test_workspaces_api_hides_inactive():
 
 def test_no_content_review_skips_with_reason():
     """2026-08-17 拍板：拿不到正文不评审、不推送——任务 skipped 带
-    content_unavailable:* 原因落日志；手动重评是明确人为意图，保留
-    元数据评审能力（但仍不推送）。"""
+    content_unavailable:* 原因落日志；手动重评也必须经过正文门禁。"""
     import pytest
 
     from app import service
@@ -362,10 +361,16 @@ def test_no_content_review_skips_with_reason():
                 break
         job = db.get(ReviewJob, "nc-job-1")
         assert job.status == "skipped" and job.error_code.startswith("content_unavailable")
-        # 手动重评：出元数据实例（原因照记），但不会推送
-        manual = service.run_review(db, get_settings(), "note-doc", trigger="manual_rerun")
-        assert manual is not None and manual.review_scope == "metadata_only"
-        assert manual.content_note in {"disabled", "no_numeric_id", "unsupported"}
+        # 手动重评同样不能在无正文时生成一个貌似完整的分数。
+        with pytest.raises(service.ContentUnavailableError):
+            service.run_review(db, get_settings(), "note-doc", trigger="manual_rerun")
+        assert db.scalars(select(ReviewInstance).where(ReviewInstance.node_id == "note-doc")).all() == []
+        db.merge(Document(node_id="note-folder", workspace_id="demo-workspace", name="目录",
+                          is_folder=True, file_class="folder"))
+        db.commit()
+        with pytest.raises(service.ContentUnavailableError, match="unsupported"):
+            service.run_review(db, get_settings(), "note-folder", trigger="manual_rerun")
+        db.query(Document).filter(Document.node_id == "note-folder").delete(synchronize_session=False)
         db.query(ReviewJob).filter(ReviewJob.node_id == "note-doc").delete(synchronize_session=False)
         db.query(ReviewInstance).filter(ReviewInstance.node_id == "note-doc").delete(synchronize_session=False)
         db.query(Document).filter(Document.node_id == "note-doc").delete(synchronize_session=False)
@@ -389,3 +394,48 @@ def test_metadata_only_instance_never_pushes():
         db.flush()
         assert row is not None and row.status == "skipped" and row.error_code == "no_content_not_pushed"
         db.rollback()
+
+
+def test_unknown_action_reopen_is_exact_and_requires_current_whitelist(monkeypatch):
+    import sys
+    import time
+
+    import pytest
+
+    from app.db import FileAuditEvent
+    from scripts import reopen_dead_letters
+
+    init_db()
+    target_id = "reopen-unknown-target"
+    other_id = "reopen-unknown-other"
+    now_ms = int(time.time() * 1000)
+    with SessionLocal() as db:
+        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.in_((target_id, other_id))).delete(
+            synchronize_session=False
+        )
+        db.add_all([
+            FileAuditEvent(biz_id=target_id, gmt_create=now_ms, action_view="覆盖文件",
+                           module_view="团队空间", processed=True,
+                           resolution="ignored_unknown_action"),
+            FileAuditEvent(biz_id=other_id, gmt_create=now_ms, action_view="别的动作",
+                           module_view="团队空间", processed=True,
+                           resolution="ignored_unknown_action"),
+        ])
+        db.commit()
+
+    monkeypatch.setattr(sys, "argv", ["reopen_dead_letters.py", "--unknown-action", "覆盖文件",
+                                       "--days", "1", "--apply"])
+    reopen_dead_letters.main()
+    with SessionLocal() as db:
+        target = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == target_id))
+        other = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == other_id))
+        assert target.processed is False and target.resolution == "" and target.retry_started_at is not None
+        assert other.processed is True and other.resolution == "ignored_unknown_action"
+        db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.in_((target_id, other_id))).delete(
+            synchronize_session=False
+        )
+        db.commit()
+
+    monkeypatch.setattr(sys, "argv", ["reopen_dead_letters.py", "--unknown-action", "仍未识别的动作"])
+    with pytest.raises(SystemExit, match="仍未进入白名单"):
+        reopen_dead_letters.main()

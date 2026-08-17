@@ -46,7 +46,7 @@ def env(monkeypatch):
         stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
                      "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1", "old-touched",
                      "del-doc-1", "same-name-del", "rest-doc-1", "mod-doc-1", "own-doc-1", "nd-doc-1",
-                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1"]
+                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1", "adoc-native-1"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
@@ -487,6 +487,9 @@ def test_pre_cutoff_event_attaches_key_without_review(env, monkeypatch):
         db.merge(Document(node_id="stock-doc-1", workspace_id=WS, name="截止前存量.docx",
                           extension="docx", file_class="document", storage_dentry_id="",
                           source_created_at=old_iso, source_updated_at=old_iso))
+        db.merge(ReviewInstance(review_instance_id="stock-meta-old", node_id="stock-doc-1",
+                                ai_score=80, verdict="pass", review_scope="metadata_only",
+                                rule_version="V1.1", trigger="legacy_precheck"))
         db.commit()
 
     class StockSearch:
@@ -512,6 +515,7 @@ def test_pre_cutoff_event_attaches_key_without_review(env, monkeypatch):
         assert doc.storage_dentry_id == "99990000001"  # 键挂上（allowed）
         assert event.processed is True and event.resolution == "done"
         assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "stock-doc-1")).all() == []
+        db.query(ReviewInstance).filter(ReviewInstance.node_id == "stock-doc-1").delete(synchronize_session=False)
         db.delete(doc)
         db.commit()
 
@@ -959,7 +963,7 @@ def test_notify_pass_gate_copy_and_pilot_footer():
     ok = SimpleNamespace(review_instance_id="ri-ok", ai_score=88.0, verdict="pass",
                          review_scope="full_content", rule_version="V1.1", findings=[])
     low = SimpleNamespace(review_instance_id="ri-low", ai_score=54.0, verdict="return",
-                          review_scope="metadata_only", rule_version="V1.1",
+                          review_scope="full_content", rule_version="V1.1",
                           findings=[{"message": "标题未标注版本号"}])
     t_ok, b_ok = notify_module.build_message(doc, ok, "https://kg.example.com/prefix")
     t_low, b_low = notify_module.build_message(doc, low, "https://kg.example.com/prefix")
@@ -980,8 +984,8 @@ def test_notify_pass_gate_copy_and_pilot_footer():
 
 
 def test_metadata_only_push_labeled_as_precheck():
-    """codex 2026-08-14：metadata_only 不得自称"评审通过/质量达标"——
-    称"初检"并注明正文评审待补做，汇总行带初检标记。"""
+    """历史 metadata_only 文案不得承诺自动补评；当前门禁不会再创建或
+    推送这种实例，但渲染兼容仍须明确其已停用。"""
     from types import SimpleNamespace
 
     from app import notify as notify_module
@@ -990,7 +994,7 @@ def test_metadata_only_push_labeled_as_precheck():
     partial = SimpleNamespace(ai_score=88.0, verdict="pass", review_scope="metadata_only",
                               rule_version="V1.1", findings=[])
     title, body = notify_module.build_message(doc, partial, "https://kg.example.com")
-    assert "初检通过" in title and "自动补做" in body and "质量达标" not in body
+    assert "初检通过" in title and "已停用" in body and "不会自动补评" in body and "质量达标" not in body
     full = SimpleNamespace(ai_score=88.0, verdict="pass", review_scope="full_content",
                            rule_version="V1.1", findings=[])
     title_full, body_full = notify_module.build_message(doc, full)
@@ -998,12 +1002,12 @@ def test_metadata_only_push_labeled_as_precheck():
     low_partial = SimpleNamespace(ai_score=54.0, verdict="return", review_scope="metadata_only",
                                   rule_version="V1.1", findings=[{"message": "标题未标注版本号"}])
     title_low, body_low = notify_module.build_message(doc, low_partial)
-    assert "初检低分说明" in title_low and "正文评审将自动补做" in body_low
+    assert "初检低分说明" in title_low and "不会自动补评" in body_low
     digest_title, digest_body = notify_module.digest_message([
         {"name": "a.docx", "score": 88, "verdict": "pass", "scope": "metadata_only"},
         {"name": "b.docx", "score": 90, "verdict": "pass", "scope": "full_content"},
     ])
-    assert "· 初检" in digest_body and digest_body.count("· 初检") == 1
+    assert "历史初检（已停用）" in digest_body and digest_body.count("历史初检（已停用）") == 1
 
 
 def test_notify_department_allowlist():
@@ -1302,6 +1306,44 @@ def test_confirmed_non_digit_biz_becomes_dead_letter_not_done(env, monkeypatch):
         doc = db.get(Document, "nd-doc-1")
         assert doc is not None and doc.storage_dentry_id == ""  # 镜像照建，键决不造假
         db.query(ReviewJob).filter(ReviewJob.node_id == "nd-doc-1").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+
+
+def test_native_adoc_needs_no_numeric_key_and_enters_review(env, monkeypatch):
+    """Native DingTalk documents are body-ready by node id: a non-numeric audit
+    bizId must not turn a valid .adoc event into a storage-key dead letter."""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class NativeDocSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "adoc-native-1", "name": "在线方案.adoc"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "在线方案.adoc", "workspace_id": WS, "node_id": "adoc-native-1",
+                     "extension": "adoc", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", NativeDocSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("tb-native-adoc-1", "在线方案", "99265", extension="adoc", gmt=now_ms,
+              action_view="创建文档")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 1 and summary.get("dead_letter", 0) == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-adoc-1"))
+        assert event.processed is True and event.resolution == "done"
+        doc = db.get(Document, "adoc-native-1")
+        assert doc is not None and doc.file_class == "native_doc" and doc.storage_dentry_id == ""
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "adoc-native-1")).all()
+        assert [job.trigger for job in jobs] == ["audit"]
+        for job in jobs:
+            db.delete(job)
         db.delete(doc)
         db.commit()
 

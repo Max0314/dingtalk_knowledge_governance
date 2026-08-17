@@ -23,8 +23,12 @@ def test_dashboard_and_document_endpoints():
         assert docs
         detail = client.get(f"/api/v1/documents/{docs[0]['node_id']}")
         assert detail.status_code == 200
-        queued = client.post(f"/api/v1/documents/{docs[0]['node_id']}/reviews", json={"trigger": "test"})
+        queued = client.post(f"/api/v1/documents/{docs[0]['node_id']}/reviews",
+                             json={"trigger": "manual_rerun"})
         assert queued.status_code == 202
+        spoofed = client.post(f"/api/v1/documents/{docs[0]['node_id']}/reviews",
+                              json={"trigger": "demo_seed"})
+        assert spoofed.status_code == 422
 
 
 def test_baseline_endpoints_and_notification_outbox():

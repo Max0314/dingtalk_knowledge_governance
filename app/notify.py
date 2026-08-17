@@ -49,8 +49,8 @@ def _doc_link(base_url: str, node_id: str) -> str:
 def build_message(doc: Document, instance: ReviewInstance, base_url: str = "",
                   mode: str = "", prev_score: float | None = None) -> tuple[str, str]:
     """单条推送：通过 = 正反馈；低分 = 说明语气 + 分析页链接（试点期无退回流程）。
-    metadata_only 一律称"初检"并注明正文评审待补做——不能让上传人误以为
-    正文已审（codex 2026-08-14 口径风险）。状态用彩色文字呈现。
+    metadata_only 仅保留历史兼容文案；当前门禁不会为无正文创建新实例，
+    enqueue_review_notification 也不会推送历史初检。状态用彩色文字呈现。
 
     重评降噪矩阵（2026-08-14 拍板）的两种专属文案：``mode="improved"``
     低分修改后达标的一次性正反馈；``mode="drop"`` 同结论但明显下降的提醒。"""
@@ -82,7 +82,7 @@ def build_message(doc: Document, instance: ReviewInstance, base_url: str = "",
         if drop_line:
             lines.append(drop_line + "结论仍为通过，供维护参考。")
         if partial:
-            lines.append("正文质量评审将在获取到文档正文后自动补做，届时再次推送结果。")
+            lines.append("这是历史元数据初检记录（现已停用），不代表正文质量，也不会自动补评或推送。")
         title = (f"文档{stage}通过：{doc.name}" if mode != "drop" else f"文档评分下降提醒：{doc.name}")[:60]
     else:
         findings = [f.get("message", "") for f in (instance.findings or [])[:3] if isinstance(f, dict)]
@@ -98,7 +98,7 @@ def build_message(doc: Document, instance: ReviewInstance, base_url: str = "",
         lines.append("")
         closing = "以上仅为质量提示，修改后会自动重新评审。"
         if partial:
-            closing += "本次为元数据初检；正文评审将自动补做。"
+            closing = "这是历史元数据初检记录（现已停用），不代表正文质量，也不会自动补评或推送。"
         lines.append(closing)
         if base_url and getattr(doc, "node_id", ""):
             lines.append(f"[查看完整评审分析 →]({_doc_link(base_url, doc.node_id)})")
@@ -225,7 +225,7 @@ def digest_message(entries: list[dict], base_url: str = "") -> tuple[str, str]:
             score_part = f' — <font color="{_score_color(score, verdict)}">**{score:.0f} 分**</font>'
         else:
             score_part = ""
-        stage_part = " · 初检" if entry.get("scope") == "metadata_only" else ""
+        stage_part = " · 历史初检（已停用）" if entry.get("scope") == "metadata_only" else ""
         lines.append(f"- **{name}**{score_part}{stage_part}")
     if len(entries) > 10:
         lines.append(f"- ……其余 {len(entries) - 10} 份")

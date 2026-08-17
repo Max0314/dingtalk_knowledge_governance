@@ -1,10 +1,12 @@
 """External read-only adapters. No adapter writes into DingTalk or bi_center."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
 from typing import Any
+from urllib.parse import urlsplit
 import httpx
 
 from .config import Settings
@@ -182,28 +184,228 @@ class DingtalkClient:
         the audit trail's bizId (cross-verified 2026-08-12). Bytes live only
         in the caller's memory for the duration of one review."""
         operator = self.settings.dingtalk_sync_operator_id
+        if not operator:
+            raise IntegrationError("dingtalk_operator_missing", "缺少钉钉 operatorId（UnionID），不能下载文件。", 400)
+        max_bytes = max(1, int(max_bytes))
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"https://api.dingtalk.com/v1.0/storage/spaces/{space_id}/dentries/{numeric_dentry_id}/downloadInfos/query",
-                params={"unionId": operator},
-                headers={"x-acs-dingtalk-access-token": token},
-                json={"option": {}},
-            )
+            try:
+                response = await client.post(
+                    f"https://api.dingtalk.com/v1.0/storage/spaces/{space_id}/dentries/{numeric_dentry_id}/downloadInfos/query",
+                    params={"unionId": operator},
+                    headers={"x-acs-dingtalk-access-token": token},
+                    json={"option": {}},
+                )
+            except httpx.RequestError as exc:
+                raise IntegrationError("dingtalk_download_info_network_failed", "获取文件下载信息时网络异常。") from exc
         if response.is_error:
             raise IntegrationError("dingtalk_download_info_failed", f"下载信息获取失败（HTTP {response.status_code}）。", response.status_code)
-        info = response.json().get("headerSignatureInfo") or {}
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise IntegrationError("dingtalk_download_info_invalid", "下载信息响应格式无效。") from exc
+        if not isinstance(payload, dict):
+            raise IntegrationError("dingtalk_download_info_invalid", "下载信息响应格式无效。")
+        info = payload.get("headerSignatureInfo") or {}
+        if not isinstance(info, dict):
+            raise IntegrationError("dingtalk_download_info_invalid", "下载信息响应格式无效。")
         urls = info.get("resourceUrls") or []
         headers = info.get("headers") or {}
-        if not urls:
+        if not isinstance(urls, list) or not urls or not isinstance(urls[0], str):
             raise IntegrationError("dingtalk_download_url_missing", "下载信息响应缺少资源地址。")
+        if not isinstance(headers, dict):
+            raise IntegrationError("dingtalk_download_info_invalid", "下载信息响应格式无效。")
+        data = bytearray()
         async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
-            response = await client.get(urls[0], headers=headers)
-        if response.is_error:
-            raise IntegrationError("dingtalk_download_failed", f"文件下载失败（HTTP {response.status_code}）。", response.status_code)
-        if len(response.content) > max_bytes:
-            raise IntegrationError("dingtalk_download_too_large", "文件超出下载上限。")
-        return response.content
+            try:
+                async with client.stream("GET", urls[0], headers=headers) as download:
+                    if download.is_error:
+                        raise IntegrationError(
+                            "dingtalk_download_failed",
+                            f"文件下载失败（HTTP {download.status_code}）。",
+                            download.status_code,
+                        )
+                    try:
+                        declared_size = int(download.headers.get("content-length") or 0)
+                    except ValueError:
+                        declared_size = 0
+                    if declared_size > max_bytes:
+                        raise IntegrationError("dingtalk_download_too_large", "文件超出下载上限。")
+                    async for chunk in download.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > max_bytes:
+                            raise IntegrationError("dingtalk_download_too_large", "文件超出下载上限。")
+            except httpx.RequestError as exc:
+                raise IntegrationError("dingtalk_download_network_failed", "文件下载时网络异常。") from exc
+        return bytes(data)
+
+    def _trusted_adoc_download_url(self, url: str) -> bool:
+        """Accept only HTTPS URLs on explicitly configured DingTalk/OSS hosts.
+
+        The export API returns a short-lived signed OSS URL.  It is upstream
+        data, not a URL supplied by our caller, but it is still validated to
+        keep the worker from becoming an SSRF client if that response is ever
+        malformed or compromised.
+        """
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").lower().rstrip(".")
+        suffixes = {
+            value.strip().lower().lstrip(".")
+            for value in self.settings.adoc_export_download_host_suffixes.split(",")
+            if value.strip()
+        }
+        return bool(
+            parsed.scheme == "https"
+            and host
+            and not parsed.username
+            and not parsed.password
+            and port in (None, 443)
+            and any(host == suffix or host.endswith(f".{suffix}") for suffix in suffixes)
+        )
+
+    async def export_native_document_docx(self, dentry_uuid: str, max_bytes: int = 20_000_000) -> bytes:
+        """Export one DingTalk native document as DOCX, entirely in memory.
+
+        Official ``doc_2.0`` flow:
+        POST ``/v2.0/doc/me/export/submit`` -> taskId, then poll
+        GET ``/v2.0/doc/me/export/task/query`` -> signed downloadUrl.
+        Neither the URL nor the downloaded bytes are persisted or logged.
+        """
+        operator = self.settings.dingtalk_sync_operator_id
+        if not operator:
+            raise IntegrationError(
+                "dingtalk_operator_missing",
+                "缺少钉钉 operatorId（UnionID），不能获取原生文档正文。",
+                400,
+            )
+        if not dentry_uuid:
+            raise IntegrationError("dingtalk_adoc_node_missing", "原生文档缺少节点标识。", 400)
+
+        max_bytes = max(1, int(max_bytes))
+        token = await self._token_value()
+        headers = {"x-acs-dingtalk-access-token": token}
+        timeout_seconds = max(1.0, float(self.settings.adoc_export_timeout_seconds))
+        poll_interval = max(0.0, float(self.settings.adoc_export_poll_interval_seconds))
+        deadline = time.monotonic() + timeout_seconds
+
+        async with httpx.AsyncClient(timeout=min(timeout_seconds, 60.0), follow_redirects=False) as client:
+            try:
+                response = await client.post(
+                    "https://api.dingtalk.com/v2.0/doc/me/export/submit",
+                    headers=headers,
+                    json={"dentryUuid": dentry_uuid, "operatorId": operator, "targetFormat": "docx"},
+                )
+            except httpx.RequestError as exc:
+                raise IntegrationError(
+                    "dingtalk_adoc_export_network_failed",
+                    "原生文档导出任务提交时网络异常。",
+                ) from exc
+            if response.status_code == 403:
+                raise IntegrationError(
+                    "dingtalk_adoc_export_permission_denied",
+                    "原生文档导出权限不足，请确认数字员工拥有该文档的下载权限。",
+                    403,
+                )
+            if response.is_error:
+                raise IntegrationError(
+                    "dingtalk_adoc_export_submit_failed",
+                    f"原生文档导出任务提交失败（HTTP {response.status_code}）。",
+                    response.status_code,
+                )
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            task_id = str(payload.get("taskId") or "")
+            download_url = str(payload.get("downloadUrl") or "")
+            if not task_id and not download_url:
+                raise IntegrationError("dingtalk_adoc_export_task_missing", "原生文档导出响应缺少任务标识。")
+
+            failure_statuses = {"failed", "failure", "error", "cancelled", "canceled"}
+            while not download_url and time.monotonic() < deadline:
+                if poll_interval:
+                    await asyncio.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    response = await client.get(
+                        "https://api.dingtalk.com/v2.0/doc/me/export/task/query",
+                        headers=headers,
+                        params={"operatorId": operator, "taskId": task_id},
+                    )
+                except httpx.RequestError as exc:
+                    raise IntegrationError(
+                        "dingtalk_adoc_export_network_failed",
+                        "查询原生文档导出任务时网络异常。",
+                    ) from exc
+                if response.status_code == 403:
+                    raise IntegrationError(
+                        "dingtalk_adoc_export_permission_denied",
+                        "原生文档导出权限不足，请确认数字员工拥有该文档的下载权限。",
+                        403,
+                    )
+                if response.is_error:
+                    raise IntegrationError(
+                        "dingtalk_adoc_export_poll_failed",
+                        f"原生文档导出任务查询失败（HTTP {response.status_code}）。",
+                        response.status_code,
+                    )
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                status = str(payload.get("status") or "").strip().lower()
+                download_url = str(payload.get("downloadUrl") or "")
+                if status in failure_statuses:
+                    raise IntegrationError("dingtalk_adoc_export_failed", "钉钉未能完成原生文档导出。")
+
+            if not download_url:
+                raise IntegrationError(
+                    "dingtalk_adoc_export_timeout",
+                    "原生文档导出等待超时。",
+                    504,
+                )
+            if not self._trusted_adoc_download_url(download_url):
+                raise IntegrationError(
+                    "dingtalk_adoc_export_url_invalid",
+                    "原生文档导出返回了不受信任的下载地址。",
+                )
+
+            data = bytearray()
+            try:
+                async with client.stream("GET", download_url) as download:
+                    if 300 <= download.status_code < 400:
+                        raise IntegrationError("dingtalk_adoc_export_redirected", "原生文档下载发生了未允许的重定向。")
+                    if download.is_error:
+                        raise IntegrationError(
+                            "dingtalk_adoc_download_failed",
+                            f"原生文档下载失败（HTTP {download.status_code}）。",
+                            download.status_code,
+                        )
+                    try:
+                        declared_size = int(download.headers.get("content-length") or 0)
+                    except ValueError:
+                        declared_size = 0
+                    if declared_size > max_bytes:
+                        raise IntegrationError("dingtalk_adoc_export_too_large", "原生文档导出文件超出大小上限。")
+                    async for chunk in download.aiter_bytes():
+                        data.extend(chunk)
+                        if len(data) > max_bytes:
+                            raise IntegrationError("dingtalk_adoc_export_too_large", "原生文档导出文件超出大小上限。")
+            except httpx.RequestError as exc:
+                raise IntegrationError(
+                    "dingtalk_adoc_download_network_failed",
+                    "下载原生文档导出文件时网络异常。",
+                ) from exc
+            return bytes(data)
 
     async def fetch_ephemeral_content(self, node_id: str) -> str:
         """Fetches text only when an explicitly verified content gateway is configured.

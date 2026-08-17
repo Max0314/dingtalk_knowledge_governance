@@ -92,10 +92,17 @@ class Settings(BaseSettings):
     notify_digest_max_delay_seconds: int = 1800
     # Ephemeral body extraction for reviews. The wiki storage space id is the
     # org-wide pool behind knowledge bases (learned from an upload response);
-    # empty disables downloads and reviews stay metadata_only.
+    # empty disables uploaded-file downloads. Native .adoc uses the export API
+    # and does not depend on this id. No body means skip, not metadata scoring.
     content_extract_enabled: bool = True
     wiki_storage_space_id: str = ""
     content_max_bytes: int = 20_000_000
+    # DingTalk native .adoc documents are exported to DOCX asynchronously,
+    # downloaded into worker memory, extracted, then released.  The signed
+    # download URL is accepted only from these DingTalk/Alibaba OSS suffixes.
+    adoc_export_timeout_seconds: float = 45.0
+    adoc_export_poll_interval_seconds: float = 1.0
+    adoc_export_download_host_suffixes: str = ".aliyuncs.com,.dingtalk.com"
     # Bridge locator: resolve wiki write events to workspaces via node search
     # before falling back to the governed-set sweep.
     bridge_locator_enabled: bool = True

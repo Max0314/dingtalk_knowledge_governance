@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 
 from .config import Settings
 from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, Notification,
-                 ReviewInstance, ReviewJob, SpaceMap, Workspace, utcnow)
+                 ReviewJob, SpaceMap, Workspace, utcnow)
 from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError
 from .service import MODIFY_MERGE_WINDOW_SECONDS, watch_workspace
@@ -135,34 +135,26 @@ def _governed_workspaces(db: Session) -> list[str]:
     return [row[0] for row in db.execute(select(Document.workspace_id).distinct()).all() if row[0]]
 
 
-def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -> None:
+def _attach_numeric_id(db: Session, event: FileAuditEvent, doc: Document | None = None) -> bool:
     """The event's bizId IS the file's numeric storage dentry id (verified by
-    cross-download); hand it to the mirrored document so reviews can fetch
-    the body through the numeric-only download API. A document whose review
-    ran before its key arrived gets an automatic content-scope re-review."""
+    cross-download); hand it to uploaded files so reviews can fetch the body.
+
+    Native .adoc nodes use the official document export API and must never be
+    given a synthetic storage key. Attaching a key is metadata enrichment only:
+    the event's explicit review/modify action decides whether a review is due.
+    Historical no-body records are deliberately not backfilled (2026-08-17)."""
     if not event.matched_node_id or not (event.biz_id or "").isdigit():
-        return
-    doc = db.get(Document, event.matched_node_id)
-    if not doc or doc.storage_dentry_id:
-        return
+        return False
+    doc = doc or db.get(Document, event.matched_node_id)
+    if not doc or doc.storage_dentry_id or (doc.extension or "").lower() == "adoc":
+        return False
     doc.storage_dentry_id = event.biz_id
-    if doc.is_folder or doc.file_class not in review_classes(settings.review_classes):
-        return
-    if not _should_auto_review(db, settings, doc, event):
-        return  # 截止前存量：键已挂上，但不违背「存量忽略」补评审
-    pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
-                                                ReviewJob.status.in_(("pending", "running"))))
-    if not pending:
-        db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
-                         trigger="content_key", requested_by="system"))
+    return True
 
 
-def _awaiting_content_upgrade(db: Session, node_id: str) -> bool:
-    """初检承诺的正文补评：最近一次评审是 metadata_only（当时拿不到正文）
-    才成立。"""
-    latest = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == node_id)
-                       .order_by(ReviewInstance.created_at.desc()).limit(1))
-    return latest is not None and latest.review_scope == "metadata_only"
+def _body_fetch_ready(doc: Document) -> bool:
+    """Whether this node has the locator needed by its body adapter."""
+    return (doc.extension or "").lower() == "adoc" or bool(doc.storage_dentry_id)
 
 
 def _action_kind(event: FileAuditEvent) -> str:
@@ -182,13 +174,57 @@ def _action_kind(event: FileAuditEvent) -> str:
     return "unknown"
 
 
+def _route_review_event(db: Session, settings: Settings, doc: Document,
+                        event: FileAuditEvent) -> None:
+    """Apply the event's explicit review semantics once body fetching is ready.
+
+    A storage key arriving by itself is never a review reason. This keeps old
+    no-body debt quiet while ensuring a real upload/overwrite is immediate and
+    an online edit still uses the merge window.
+    """
+    from .service import is_robot_uploader
+
+    kind = _action_kind(event)
+    if kind not in ("review", "modify") or not _body_fetch_ready(doc):
+        return
+    eligible = (not doc.is_folder
+                and not is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)
+                and doc.file_class in review_classes(settings.review_classes)
+                and _should_auto_review(db, settings, doc, event))
+    if not eligible:
+        return
+    if kind == "review":
+        # 上传/新建/覆盖立即评审。pending 任务执行时会读取最新正文；running
+        # 任务可能已读完正文，因此留下立即到期标记，由收割器补一次。
+        active = db.scalar(select(ReviewJob).where(
+            ReviewJob.node_id == doc.node_id,
+            ReviewJob.status.in_(("pending", "running"))).limit(1))
+        if active is None or active.status == "pending":
+            if active is None:
+                db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
+                                 trigger="audit", requested_by="system"))
+            doc.review_due_at = None
+            doc.dirty_since = None
+        else:
+            stamp = utcnow()
+            if doc.review_due_at is None:
+                doc.dirty_since = stamp
+            doc.review_due_at = stamp
+        return
+
+    # 正文修改进合并窗：30 分钟无后续修改评一次，持续编辑 6 小时封顶。
+    stamp = utcnow()
+    if doc.review_due_at is None:
+        doc.dirty_since = stamp
+    doc.review_due_at = stamp + timedelta(seconds=MODIFY_MERGE_WINDOW_SECONDS)
+
+
 def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEvent,
                            node: dict, path: str) -> Document:
     """审计事件确认后的直接建档/更新：一个事件只动一个节点，绝不整库遍历
     （2026-08-14 流程定稿，取代早期"门铃+整库确认"）。batchQuery 不返回
     父节点——先记存储搜索给的 path、置 directory_pending，父节点关系由
     每月 10/24 全量核对补准。"""
-    from .service import is_robot_uploader
     workspace_id = node.get("workspace_id") or ""
     if workspace_id and db.get(Workspace, workspace_id) is None:
         # 未补种的新库连注册行都没有：建占位（名称由月度核对刷新）。标记
@@ -248,48 +284,9 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    key_attached = False
-    if not doc.storage_dentry_id and (event.biz_id or "").isdigit():
-        doc.storage_dentry_id = event.biz_id
-        key_attached = True
+    _attach_numeric_id(db, event, doc)
     db.flush()
-    kind = _action_kind(event)
-    eligible = (not doc.is_folder
-                and not is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)
-                and doc.file_class in review_classes(settings.review_classes)
-                and _should_auto_review(db, settings, doc, event))
-    # 首挂下载键只在"初检等待正文补评"时才算评审理由——重命名等元数据事件
-    # 顺带带来 bizId 时，键照挂但不越权触发评审（白名单语义优先）。
-    upgrade_due = key_attached and _awaiting_content_upgrade(db, doc.node_id)
-    if eligible and (kind == "review" or upgrade_due):
-        # 上传/新建类立即评审（2026-08-14 拍板：不设等待窗）。不依赖
-        # is_new/changed 的时间戳判断——同秒覆盖上传时间戳不变，靠时间戳
-        # 会整条漏评（codex P0-2）。重复入队由 pending/running 排他挡住。
-        active = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
-                                                   ReviewJob.status.in_(("pending", "running"))).limit(1))
-        if active is None or active.status == "pending":
-            # 无任务→建任务；pending 任务运行时抓的正文已含本次变更。两种
-            # 情况本次变更都有评审兜着，合并窗才可以清（codex 第八轮 P0：
-            # 不许清了标记又不建任务，把修改永久丢掉）。
-            if active is None:
-                db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
-                                 trigger="audit", requested_by="system"))
-            doc.review_due_at = None
-            doc.dirty_since = None
-        else:
-            # running：正文可能已抓走，本次变更评不进去——置"立即到期"标记，
-            # 任务结束后由收割器补评一次（指纹去重挡住无谓重跑）。
-            stamp = utcnow()
-            if doc.review_due_at is None:
-                doc.dirty_since = stamp
-            doc.review_due_at = stamp
-    elif eligible and kind == "modify":
-        # 正文修改进合并窗：30 分钟无后续修改合并评一次；dirty_since 记首次
-        # 置脏，持续编辑 6 小时封顶由收割器裁决（harvest_due_reviews）。
-        stamp = utcnow()
-        if doc.review_due_at is None:
-            doc.dirty_since = stamp
-        doc.review_due_at = stamp + timedelta(seconds=MODIFY_MERGE_WINDOW_SECONDS)
+    _route_review_event(db, settings, doc, event)
     return doc
 
 
@@ -364,9 +361,9 @@ def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEven
 
 def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings, summary: dict,
                           queued: set[str]) -> bool:
-    """成功终态按动作类型收口（codex P0-3）：评审/修改类须"文档入镜像 + 正文
-    下载键在文档上"才 done；键挂不上（bizId 非数字）转死信而非伪装成功；
-    元数据/删除/恢复/忽略各归专属终态，done 的不变量（键可下载）不被稀释。"""
+    """成功终态按动作类型收口：评审/修改类须"文档入镜像 + 正文适配器
+    已具备定位条件"才 done。上传文件需要数字下载键；原生 .adoc 只需要
+    node id。元数据/删除/恢复/忽略各归专属终态。"""
     if event.match_status != "confirmed" or not event.matched_node_id:
         return False
     kind = _action_kind(event)
@@ -381,14 +378,15 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
         _finish(db, event, "ignored_unknown_action")
         summary["unknown_actions"] = summary.get("unknown_actions", 0) + 1
         return True
-    _attach_numeric_id(db, event, settings)
+    _attach_numeric_id(db, event)
     doc = db.get(Document, event.matched_node_id)
     if doc is None:
         return False
     if kind == "metadata":
         _finish(db, event, "metadata_applied")
         return True
-    if doc.storage_dentry_id:
+    if _body_fetch_ready(doc):
+        _route_review_event(db, settings, doc, event)
         _finish(db, event, "done")
         return True
     if not (event.biz_id or "").isdigit():
@@ -477,7 +475,8 @@ def _cutoff_ms(cutoff: str) -> int | None:
 def _should_auto_review(db: Session, settings: Settings, doc: Document, event: FileAuditEvent) -> bool:
     """存量豁免门禁（codex 第六轮 P0）：审计拉取的游标重叠会重放截止前的旧
     事件——挂键无妨，自动评审必须满足 KG_REVIEW_SINCE（文档或事件时间在
-    上线时刻之后），或该文档已有 metadata_only 评审等待正文补评。"""
+    上线时刻之后）。历史无正文/metadata_only 记录不构成补评理由；只有该
+    文档之后发生新的、白名单内的正文事件才会自然进入评审。"""
     cutoff = settings.review_since
     if not cutoff:
         return True
@@ -487,9 +486,7 @@ def _should_auto_review(db: Session, settings: Settings, doc: Document, event: F
     edge_ms = _cutoff_ms(cutoff)
     if edge_ms is not None and event.gmt_create and event.gmt_create >= edge_ms:
         return True
-    latest = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)
-                       .order_by(ReviewInstance.created_at.desc()).limit(1))
-    return latest is not None and latest.review_scope == "metadata_only"
+    return False
 
 
 def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, summary: dict) -> None:
@@ -506,7 +503,7 @@ def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, sum
 
 def process_audit_events(db: Session, settings: Settings) -> dict:
     """One bridge cycle.「完成才消费」生命周期：wiki 事件唯有 locator 确认
-    节点、文档入镜像、下载键在文档上才算 done；到期未确认转 dead_letter_*
+    节点、文档入镜像、正文适配器具备定位条件才算 done；到期未确认转 dead_letter_*
     可观测死信。定位按"最久未尝试"轮转取额（公平），巡走走持久化队列
     （预算外的库下轮续走），两者都有硬预算，绝不独占 worker。"""
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
@@ -625,12 +622,12 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                                      if d.get("dentry_uuid") == confirmed_id), "")
                     doc = _upsert_audit_document(db, settings, event, hit, hit_path)
                     summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
-                    # 完成语义按类型收口（codex P0-3）：done 保留"键可下载"
-                    # 不变量；元数据类以镜像更新为终态；非数字 bizId 转死信。
+                    # 完成语义按类型收口：上传文件须有数字下载键，原生
+                    # .adoc 由 node id 导出正文；元数据类只更新镜像。
                     kind = _action_kind(event)
                     if kind == "metadata":
                         _finish(db, event, "metadata_applied")
-                    elif doc.storage_dentry_id:
+                    elif _body_fetch_ready(doc):
                         _finish(db, event, "done")
                     elif not (event.biz_id or "").isdigit():
                         _finish(db, event, "dead_letter_no_numeric_biz_id")
