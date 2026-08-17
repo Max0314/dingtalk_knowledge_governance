@@ -16,6 +16,11 @@ logger = logging.getLogger("kg.worker")
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # httpx INFO includes full URLs (the .adoc export URL carries a temporary
+    # signature); DingTalk Stream INFO includes its connection ticket. Keep
+    # application summaries at INFO, but never persist those credentials.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("dingtalk_stream.client").setLevel(logging.WARNING)
     settings = get_settings(); init_db()
     start_stream_consumer(settings)
     with SessionLocal() as db:
