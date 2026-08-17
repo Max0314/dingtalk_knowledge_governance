@@ -36,6 +36,9 @@ def _run_client(settings: Settings) -> None:
     except ImportError:
         logger.warning("dingtalk-stream SDK not installed; stream consumer disabled")
         return
+    # The SDK sets its client logger to INFO while importing. Reset it after
+    # import so the temporary WebSocket connection ticket never enters logs.
+    logging.getLogger("dingtalk_stream.client").setLevel(logging.WARNING)
 
     class AllEventsHandler(dingtalk_stream.EventHandler):
         async def process(self, event: "dingtalk_stream.EventMessage"):
