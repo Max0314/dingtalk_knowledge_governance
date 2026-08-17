@@ -55,13 +55,15 @@ CONFIRM_FINISH_BUDGET = 50
 GIVE_UP_AFTER_MS = 48 * 3600 * 1000
 
 # 操作类型白名单（codex P0-1 + 2026-08-14 拍板）。匹配顺序即语义优先级：
-# "从回收站恢复"先于"删除"，"移除成员"先于"移除"。未知写操作按"正文修改"
-# 保守归类——走合并窗且有指纹去重兜底，不会凭空多花模型钱。
+# "从回收站恢复"先于"删除"，"移除成员"先于"移除"。修改类同样是显式白名单
+# ——未命中任何名单的动作绝不评审（codex 第八轮 P0：默认评审违反白名单
+# 原则），带 ignored_unknown_action 终态进诊断，观察到新动作再扩名单。
 IGNORE_ACTIONS = ("协作", "成员", "分享", "公开", "外链", "权限", "评论", "链接", "收藏", "浏览", "预览", "下载")
 RESTORE_ACTIONS = ("恢复", "还原")
 DELETE_ACTIONS = ("删除", "撤回", "移除", "回收站")
 METADATA_ACTIONS = ("重命名", "移动")
 REVIEW_ACTIONS = ("上传", "新建", "创建", "复制", "转发", "导入", "副本", "覆盖")
+MODIFY_ACTIONS = ("修改", "编辑", "更新")
 
 # In-memory debounce: workspace_id -> monotonic seconds of the last bridge
 # walk. Worker restarts forget it; one extra walk is harmless. Failed walks
@@ -148,16 +150,16 @@ def _awaiting_content_upgrade(db: Session, node_id: str) -> bool:
 
 
 def _action_kind(event: FileAuditEvent) -> str:
-    """审计动作五分类：review（立即评审）/ modify（合并窗评审）/ metadata
+    """审计动作分类：review（立即评审）/ modify（合并窗评审）/ metadata
     （只更新镜像）/ delete、restore（软删/恢复，绝不评审）/ ignore（纯协同
-    动作，直接终态）。"""
+    动作，直接终态）/ unknown（不在任何白名单：绝不评审，终态可观测）。"""
     view = event.action_view or ""
     for keywords, kind in ((IGNORE_ACTIONS, "ignore"), (RESTORE_ACTIONS, "restore"),
                            (DELETE_ACTIONS, "delete"), (METADATA_ACTIONS, "metadata"),
-                           (REVIEW_ACTIONS, "review")):
+                           (REVIEW_ACTIONS, "review"), (MODIFY_ACTIONS, "modify")):
         if any(keyword in view for keyword in keywords):
             return kind
-    return "modify"
+    return "unknown"
 
 
 def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEvent,
@@ -243,13 +245,24 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
         # 上传/新建类立即评审（2026-08-14 拍板：不设等待窗）。不依赖
         # is_new/changed 的时间戳判断——同秒覆盖上传时间戳不变，靠时间戳
         # 会整条漏评（codex P0-2）。重复入队由 pending/running 排他挡住。
-        pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
-                                                    ReviewJob.status.in_(("pending", "running"))))
-        if not pending:
-            db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
-                             trigger="audit", requested_by="system"))
-        doc.review_due_at = None
-        doc.dirty_since = None
+        active = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
+                                                   ReviewJob.status.in_(("pending", "running"))).limit(1))
+        if active is None or active.status == "pending":
+            # 无任务→建任务；pending 任务运行时抓的正文已含本次变更。两种
+            # 情况本次变更都有评审兜着，合并窗才可以清（codex 第八轮 P0：
+            # 不许清了标记又不建任务，把修改永久丢掉）。
+            if active is None:
+                db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
+                                 trigger="audit", requested_by="system"))
+            doc.review_due_at = None
+            doc.dirty_since = None
+        else:
+            # running：正文可能已抓走，本次变更评不进去——置"立即到期"标记，
+            # 任务结束后由收割器补评一次（指纹去重挡住无谓重跑）。
+            stamp = utcnow()
+            if doc.review_due_at is None:
+                doc.dirty_since = stamp
+            doc.review_due_at = stamp
     elif eligible and kind == "modify":
         # 正文修改进合并窗：30 分钟无后续修改合并评一次；dirty_since 记首次
         # 置脏，持续编辑 6 小时封顶由收割器裁决（harvest_due_reviews）。
@@ -277,24 +290,22 @@ def _finish(db: Session, event: FileAuditEvent, resolution: str) -> None:
 
 
 def _resolve_node_locally(db: Session, event: FileAuditEvent) -> str:
-    """删除/恢复事件的本地匹配：数字 bizId 直查下载键，其次同 bizId 的历史
-    已确认事件（上传确认时留下的映射）。绝不按文件名猜——同名多节点删错档
-    案不可接受；匹配不上就保持 pending 到 48h 死信，真实删除由每月 10/24
-    全量核对的 watch_misses 兜底。"""
+    """删除/恢复事件的本地匹配：数字 bizId 直查下载键，仅此一条路。
+
+    生产只读实证（codex 第八轮，2026-08-17）：274 条删除/撤回/恢复事件全为
+    数字 bizId，但与文档下载键匹配数为 0——删除流水的 bizId 与上传的下载键
+    不在同一命名空间，即时软删基本不会命中，真实删除权威=每月 10/24 全量
+    核对的 watch_misses。本函数保留为尽力而为；匹配不上保持 pending 到 48h
+    死信可观测。绝不按文件名猜（同名多节点删错档案不可接受）。"稳定标识
+    重构"待原始审计流水核实后另行处理（biz_id 唯一键改动风险见 memory）。
+
+    注意：不查"同 bizId 的历史已确认事件"——file_audit_events.biz_id 是
+    唯一键（入库去重），同库不可能存在第二条同 bizId 行，那是死路。"""
     if (event.biz_id or "").isdigit():
         node_id = db.scalar(select(Document.node_id)
                             .where(Document.storage_dentry_id == event.biz_id).limit(1))
         if node_id:
             return node_id
-    if event.biz_id:
-        prior = db.scalar(select(FileAuditEvent.matched_node_id)
-                          .where(FileAuditEvent.biz_id == event.biz_id,
-                                 FileAuditEvent.match_status == "confirmed",
-                                 FileAuditEvent.matched_node_id != "",
-                                 FileAuditEvent.id != event.id)
-                          .order_by(FileAuditEvent.gmt_create.desc()).limit(1))
-        if prior:
-            return prior
     return ""
 
 
@@ -345,6 +356,10 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
     if kind == "ignore":
         _finish(db, event, "ignored_action")
         summary["ignored"] = summary.get("ignored", 0) + 1
+        return True
+    if kind == "unknown":
+        _finish(db, event, "ignored_unknown_action")
+        summary["unknown_actions"] = summary.get("unknown_actions", 0) + 1
         return True
     _attach_numeric_id(db, event, settings)
     doc = db.get(Document, event.matched_node_id)
@@ -492,6 +507,12 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             # 协作/分享/权限等纯协同动作：终态忽略，零定位消费（codex P0-1）
             _finish(db, event, "ignored_action")
             summary["ignored"] = summary.get("ignored", 0) + 1
+            continue
+        if kind == "unknown":
+            # 白名单外的未知动作：绝不评审（codex 第八轮 P0），带专属终态
+            # 进诊断——status_brief 计数，观察到新动作类型再扩名单。
+            _finish(db, event, "ignored_unknown_action")
+            summary["unknown_actions"] = summary.get("unknown_actions", 0) + 1
             continue
         if kind in ("delete", "restore"):
             _handle_delete_restore(db, settings, event, kind, summary)

@@ -4,7 +4,7 @@ import hashlib
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from .config import Settings
 from .db import BridgeWalk, Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, WatchPlan, Workspace, WorkspaceRole, utcnow
@@ -223,32 +223,42 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     return True
 
 
+HARVEST_BATCH = 100
+
+
 def harvest_due_reviews(db: Session, settings: Settings) -> int:
     """修改合并窗收割：到期（30 分钟无新修改）或触顶（持续编辑满 6 小时）的
     脏文档入队一次合并评审（trigger=modify_merged）。评审侧还有指纹去重兜
-    底——正文无实质变化不会重复出分。窗口字段无论入没入队都清零，绝不留
-    永久脏位。"""
+    底——正文无实质变化不会重复出分。
+
+    到期筛选在 SQL 层完成并按最早到期排序（codex 第八轮 P0：无条件取前
+    100 条会被未到期行占满、饿死真正到期的文档）。窗口字段只在"本次变更
+    已有评审兜着"（成功建任务，或有尚未启动的 pending 任务）时清零；撞上
+    running 任务则原样保留——正文可能已被抓走，任务结束后下轮再收割补评
+    （codex 第八轮 P0：清了标记又不建任务=修改永久丢失）。"""
     now = _to_naive_utc(utcnow())
+    cap_edge = now - timedelta(seconds=MODIFY_MERGE_MAX_SECONDS)
     harvested = 0
-    rows = db.scalars(select(Document).where(Document.review_due_at.is_not(None)).limit(100)).all()
+    rows = db.scalars(select(Document)
+                      .where(Document.review_due_at.is_not(None),
+                             or_(Document.review_due_at <= now, Document.dirty_since <= cap_edge))
+                      .order_by(Document.review_due_at.asc())
+                      .limit(HARVEST_BATCH)).all()
     for doc in rows:
-        due = _to_naive_utc(doc.review_due_at)
-        dirty = _to_naive_utc(doc.dirty_since)
-        deadline = due
-        if dirty is not None:
-            deadline = min(due, dirty + timedelta(seconds=MODIFY_MERGE_MAX_SECONDS))
-        if deadline is None or deadline > now:
-            continue
-        doc.review_due_at = None
-        doc.dirty_since = None
         if doc.is_deleted or doc.is_folder:
+            doc.review_due_at = None
+            doc.dirty_since = None
             continue
-        pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
-                                                    ReviewJob.status.in_(("pending", "running"))))
-        if pending is None:
+        active = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
+                                                   ReviewJob.status.in_(("pending", "running"))).limit(1))
+        if active is not None and active.status == "running":
+            continue  # 保留到期标记，任务完成后下一轮收割
+        if active is None:
             db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
                              trigger="modify_merged", requested_by="system"))
             harvested += 1
+        doc.review_due_at = None
+        doc.dirty_since = None
     if rows:
         db.commit()
     return harvested
@@ -460,7 +470,8 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         ws.source_updated_at = raw.get("updated_at", "") or ws.source_updated_at
         ws.creator_key = raw.get("creator_id", "") or ws.creator_key
         ws.synced_at = utcnow()
-        ws.is_active = True  # 走到这说明库可见：曾被 404 排除的自动复活
+        ws.is_active = True  # 走到这说明库可见：曾被排除的自动复活
+        ws.unreachable_misses = 0
         run.workspace_name = ws.name
         run.workspaces_seen = 1
         # 显式补种标记：只有"完整走完"的 seed 轮才置位。用"镜像非空"推断会把
@@ -506,11 +517,14 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         run.status, run.error_code, run.finished_at = "failed", f"{exc.code}:{exc.status_code}"[:64], utcnow()
         run.error_detail = str(exc)[:512]
         if exc.code == "workspace_not_visible":
-            # 库已删除或失权（P-06 德国DG路由器场景，2026-08-14 拍板）：自动
-            # 退出活跃集合，补种/计划不再被它卡死；重新可见时上面自动复活。
+            # 库疑似已删除或失权（P-06 德国DG路由器场景）：计一次缺席，连续
+            # 两次才自动退出活跃集合——单次列表不完整不足以停掉正常库
+            # （codex 第八轮 P1）；重新可见时上面自动复活并清零计数。
             ws_row = db.get(Workspace, workspace_id)
             if ws_row is not None:
-                ws_row.is_active = False
+                ws_row.unreachable_misses = (ws_row.unreachable_misses or 0) + 1
+                if ws_row.unreachable_misses >= 2:
+                    ws_row.is_active = False
     except Exception as exc:
         db.rollback()
         run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
@@ -631,13 +645,19 @@ def watch_scan_decision(db: Session, settings: Settings) -> str:
 def mark_scan_cycle_complete(db: Session, settings: Settings,
                              seen_workspace_ids: set[str] | None = None) -> None:
     """整轮走完时结账：补种全清后才消费计划日（首轮本身就是一次全量）。
-    ``seen_workspace_ids`` 是本轮解析到的全部库 id：注册表里整轮都没出现的
-    库即已删除/失权，自动标记不可见（传空/None 时跳过判决，防止解析瞬时
-    失败误伤全量）。"""
+    ``seen_workspace_ids`` 是本轮解析到的全部库 id：注册表里整轮缺席的库
+    计一次缺席，连续两轮缺席才标记不可见（codex 第八轮 P1：单次列表不完整
+    不能误停正常库；中途新注册的库也因此天然豁免）。传空/None 跳过判决，
+    防解析瞬时失败误伤全量。"""
     if seen_workspace_ids:
         for ws in db.scalars(select(Workspace).where(Workspace.is_active.is_(True))).all():
-            if ws.workspace_id not in seen_workspace_ids:
-                ws.is_active = False
+            if ws.workspace_id in seen_workspace_ids:
+                if ws.unreachable_misses:
+                    ws.unreachable_misses = 0
+            else:
+                ws.unreachable_misses = (ws.unreachable_misses or 0) + 1
+                if ws.unreachable_misses >= 2:
+                    ws.is_active = False
     if _seeding_pending(db):
         db.commit()
         return

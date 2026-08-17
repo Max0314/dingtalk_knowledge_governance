@@ -42,9 +42,12 @@ class Workspace(Base):
     # non-empty mirror mistakes an interrupted seed for done and floods the
     # review queue with stock files on the next walk.
     watch_seeded: Mapped[bool] = mapped_column(Boolean, default=False)
-    # False = 当前不可见（列表三连不含/详情 404，如已删除或迁移的库）：退出
-    # 活跃补种集合与当前统计，历史数据保留；恢复可见后自动回归。
+    # False = 当前不可见（连续两次探测缺席/404，如已删除或失权的库）：退出
+    # 补种集合、知识库列表与当前统计，历史数据保留；恢复可见后自动回归。
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # 连续缺席计数（整轮全量没见到 / 详情+列表都 404 各计一次）；见到即清零。
+    # 两次才判不可见——单次列表不完整不能误停正常库（codex 第八轮 P1）。
+    unreachable_misses: Mapped[int] = mapped_column(Integer, default=0)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     documents: Mapped[list["Document"]] = relationship(back_populates="workspace")
 
@@ -95,8 +98,9 @@ class Document(Base):
     # accepts this numeric form; empty means no event seen yet.
     storage_dentry_id: Mapped[str] = mapped_column(String(64), default="")
     # 修改合并窗（2026-08-14 定稿）：正文修改事件只置脏与到期时间，收割器
-    # 到点合并评一次；dirty_since + 6h 封顶防止持续编辑永不评审。
-    review_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 到点合并评一次；dirty_since + 6h 封顶防止持续编辑永不评审。带索引：
+    # 收割查询按到期筛选+排序，绝大多数行为 NULL。
+    review_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     dirty_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # 最近一次操作人（审计事件）；绝不覆盖 uploader_key——通知归属属于上传人。
@@ -480,8 +484,23 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
             if attempt == max_attempts - 1:
                 raise RuntimeError(f"数据库在 {max_attempts * retry_delay:.0f} 秒内不可达。") from last_error
             time.sleep(retry_delay)
-    Base.metadata.create_all(engine)
-    _ensure_columns()
+    if engine.dialect.name == "mysql":
+        # api 与 worker 同时启动会并发跑 ALTER/CREATE INDEX（曾出现重复索引
+        # 竞争反复重启，codex 第八轮 P1）。MySQL 命名锁串行化迁移段：后到者
+        # 等前者做完再进（届时重新 inspect 一切已就位、全部跳过）。锁超时
+        # （返回 0）按无锁继续——迁移本身幂等，退化等价于旧行为。
+        from sqlalchemy import text
+        with engine.connect() as lock_conn:
+            got = lock_conn.execute(text("SELECT GET_LOCK('kg_schema_migration', 60)")).scalar()
+            try:
+                Base.metadata.create_all(engine)
+                _ensure_columns()
+            finally:
+                if got:
+                    lock_conn.execute(text("SELECT RELEASE_LOCK('kg_schema_migration')"))
+    else:
+        Base.metadata.create_all(engine)
+        _ensure_columns()
 
 
 # create_all only creates missing tables; columns added to an existing model
@@ -493,7 +512,8 @@ EXTRA_COLUMNS = {
                   "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
                   "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
     "workspaces": {"watch_seeded": "TINYINT(1) NOT NULL DEFAULT 0",
-                   "is_active": "TINYINT(1) NOT NULL DEFAULT 1"},
+                   "is_active": "TINYINT(1) NOT NULL DEFAULT 1",
+                   "unreachable_misses": "INTEGER NOT NULL DEFAULT 0"},
     "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
                           "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
                           "last_attempt_at": "DATETIME NULL",
@@ -513,6 +533,9 @@ EXTRA_COLUMNS = {
 EXTRA_INDEXES = {
     "historical_file_nodes": {
         "ix_hfn_snapshot_node": "CREATE INDEX ix_hfn_snapshot_node ON historical_file_nodes (snapshot_id, node_id)",
+    },
+    "documents": {
+        "ix_documents_review_due_at": "CREATE INDEX ix_documents_review_due_at ON documents (review_due_at)",
     },
 }
 

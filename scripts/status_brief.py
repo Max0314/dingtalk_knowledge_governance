@@ -94,6 +94,10 @@ def main() -> None:
             "merge_window_pending": db.scalar(
                 select(func.count()).select_from(Document)
                 .where(Document.review_due_at.is_not(None))) or 0,
+            # 白名单外的未知动作（终态可观测）：出现即评估是否扩名单
+            "unknown_actions": db.scalar(
+                select(func.count()).select_from(FileAuditEvent)
+                .where(FileAuditEvent.resolution == "ignored_unknown_action")) or 0,
         }
         if settings.review_since:
             # 审计漏捕嫌疑：上线后创建/修改、可评审、非机器人，却从未有过

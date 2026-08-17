@@ -1029,11 +1029,13 @@ class _RaisingSearchClient:
         raise AssertionError("locator must not be called for this action kind")
 
 
-def test_action_kind_five_way_whitelist():
+def test_action_kind_whitelist_classification():
     ns = lambda view: SimpleNamespace(action_view=view)
     assert audit_bridge._action_kind(ns("知识库上传文件")) == "review"
     assert audit_bridge._action_kind(ns("创建副本")) == "review"
     assert audit_bridge._action_kind(ns("知识库修改文件")) == "modify"
+    assert audit_bridge._action_kind(ns("编辑文档")) == "modify"
+    assert audit_bridge._action_kind(ns("更新文件")) == "modify"
     assert audit_bridge._action_kind(ns("知识库重命名文件")) == "metadata"
     assert audit_bridge._action_kind(ns("移动文件")) == "metadata"
     assert audit_bridge._action_kind(ns("知识库删除文件")) == "delete"
@@ -1042,7 +1044,26 @@ def test_action_kind_five_way_whitelist():
     assert audit_bridge._action_kind(ns("知识库分享文件")) == "ignore"
     assert audit_bridge._action_kind(ns("添加知识库协作成员")) == "ignore"
     assert audit_bridge._action_kind(ns("移除知识库成员")) == "ignore"    # 成员动作优先于"移除"
-    assert audit_bridge._action_kind(ns("某未知写操作")) == "modify"      # 未知保守走合并窗
+    # 白名单外一律 unknown——绝不默认评审（codex 第八轮 P0）
+    assert audit_bridge._action_kind(ns("某未知写操作")) == "unknown"
+    assert audit_bridge._action_kind(ns("")) == "unknown"
+
+
+def test_unknown_action_terminal_never_reviews(env, monkeypatch):
+    """白名单外动作：终态 ignored_unknown_action，不评审、不置合并窗、
+    零定位消费（codex 第八轮 P0：未知动作默认评审违反白名单原则）。"""
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _RaisingSearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("tb-unk1", "桥接测试文档", "99280", action_view="知识库某新奇操作")
+    summary = run_bridge(org)
+    assert summary.get("unknown_actions") == 1 and summary["walks"] == [] and summary["unlocated"] == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-unk1"))
+        assert event.processed is True and event.resolution == "ignored_unknown_action"
+        doc = db.get(Document, "bridge-A")  # 同名镜像文档不受任何影响
+        assert doc.review_due_at is None
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "bridge-A")).all() == []
 
 
 def test_ignore_action_finishes_without_any_lookup(env, monkeypatch):

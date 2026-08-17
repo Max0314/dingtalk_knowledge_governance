@@ -265,28 +265,35 @@ def test_inactive_workspace_excluded_from_seeding(settings):
         db.commit()
 
 
-def test_cycle_completion_marks_absent_workspaces_inactive(settings):
-    """整轮走完仍未出现在解析列表的注册库 → 自动标记不可见；传空集
-    （解析瞬时失败）不判决，防止误伤全量。"""
+def test_cycle_completion_two_strikes_before_inactive(settings):
+    """整轮缺席计一次缺席，连续两轮才标记不可见（codex 第八轮 P1：单次
+    列表不完整不能误停正常库）；重新出现清零计数；空集不判决。"""
     with SessionLocal() as db:
-        db.merge(Workspace(workspace_id="gone-404", name="已被删除的库", watch_seeded=True, is_active=True))
+        db.merge(Workspace(workspace_id="gone-404", name="已被删除的库", watch_seeded=True,
+                           is_active=True, unreachable_misses=0))
         db.commit()
         seen = {row[0] for row in db.execute(select(Workspace.workspace_id)
                                              .where(Workspace.is_active.is_(True)))} - {"gone-404"}
         service.mark_scan_cycle_complete(db, settings, seen)
-        assert db.get(Workspace, "gone-404").is_active is False
-        assert db.get(Workspace, WS).is_active is True  # 本轮看到的库不受影响
-        db.get(Workspace, "gone-404").is_active = True
+        ws = db.get(Workspace, "gone-404")
+        assert ws.is_active is True and ws.unreachable_misses == 1   # 第一击：仅计数
+        service.mark_scan_cycle_complete(db, settings, seen)
+        assert db.get(Workspace, "gone-404").is_active is False      # 第二击：排除
+        assert db.get(Workspace, WS).is_active is True               # 本轮看到的库不受影响
+        ws = db.get(Workspace, "gone-404")
+        ws.is_active, ws.unreachable_misses = True, 1
         db.commit()
+        service.mark_scan_cycle_complete(db, settings, seen | {"gone-404"})
+        assert db.get(Workspace, "gone-404").unreachable_misses == 0  # 重新出现清零
         service.mark_scan_cycle_complete(db, settings, set())
-        assert db.get(Workspace, "gone-404").is_active is True  # 空集不判决
+        assert db.get(Workspace, "gone-404").is_active is True        # 空集不判决
         db.query(Workspace).filter(Workspace.workspace_id == "gone-404").delete(synchronize_session=False)
         db.commit()
 
 
-def test_workspace_not_visible_marks_inactive_then_revives(settings, monkeypatch):
-    """404/失权的库：watch_workspace 失败即自动排除；恢复可见后一次成功
-    巡走自动复活。"""
+def test_workspace_not_visible_two_strikes_then_revives(settings, monkeypatch):
+    """404/失权的库：连续两次探测失败才自动排除（单次列表抖动不误停）；
+    恢复可见后一次成功巡走自动复活并清零计数。"""
     import asyncio
 
     from app.integrations import IntegrationError
@@ -300,17 +307,23 @@ def test_workspace_not_visible_marks_inactive_then_revives(settings, monkeypatch
 
     monkeypatch.setattr(service, "DingtalkClient", VanishedClient)
     with SessionLocal() as db:
-        db.merge(Workspace(workspace_id="vanished-1", name="德国DG路由器", watch_seeded=True, is_active=True))
+        db.merge(Workspace(workspace_id="vanished-1", name="德国DG路由器", watch_seeded=True,
+                           is_active=True, unreachable_misses=0))
         db.commit()
         run = asyncio.run(service.watch_workspace(db, settings, "vanished-1"))
         assert run.status == "failed" and run.error_code.startswith("workspace_not_visible")
-        assert db.get(Workspace, "vanished-1").is_active is False
+        ws = db.get(Workspace, "vanished-1")
+        assert ws.is_active is True and ws.unreachable_misses == 1   # 第一击：仅计数
+        run_again = asyncio.run(service.watch_workspace(db, settings, "vanished-1"))
+        assert run_again.status == "failed"
+        assert db.get(Workspace, "vanished-1").is_active is False    # 第二击：排除
     monkeypatch.setattr(service, "DingtalkClient", FakeClient)
     FakeClient.nodes = {}
     with SessionLocal() as db:
         run2 = asyncio.run(service.watch_workspace(db, settings, "vanished-1"))
         assert run2.status == "succeeded"
-        assert db.get(Workspace, "vanished-1").is_active is True  # 重新可见自动复活
+        ws = db.get(Workspace, "vanished-1")
+        assert ws.is_active is True and ws.unreachable_misses == 0   # 重新可见自动复活
         db.query(Workspace).filter(Workspace.workspace_id == "vanished-1").delete(synchronize_session=False)
         db.commit()
 

@@ -85,7 +85,11 @@ def _collect(db: Session) -> dict[str, Any]:
     # rides ix_hfn_snapshot_node).
     live_join = and_(HistoricalFileNode.snapshot_id == baseline,
                      HistoricalFileNode.node_id == Document.node_id)
+    # 不可见库（is_active=False，连续缺席/404）：其增量镜像退出当前统计；
+    # 基线快照按年度口径保持不动（不可变基线）。
+    inactive_ws = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
     live_where = (Document.is_folder.is_(False), Document.is_deleted.is_(False),
+                  Document.workspace_id.not_in(inactive_ws),
                   HistoricalFileNode.id.is_(None))
 
     def live_agg(*columns):

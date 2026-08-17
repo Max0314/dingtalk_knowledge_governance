@@ -180,6 +180,106 @@ def test_harvest_due_reviews_window_and_cap():
         db.commit()
 
 
+def test_harvest_due_docs_never_starved_by_undue_rows(monkeypatch):
+    """codex 第八轮 P0 回归：到期筛选在 SQL 层——批量额度再小、未到期行
+    再多，已到期的文档也必须被收割到。"""
+    from datetime import timedelta
+
+    from app import service
+    from app.db import ReviewJob, utcnow
+
+    init_db()
+    monkeypatch.setattr(service, "HARVEST_BATCH", 2)  # 额度 2 < 未到期行数 3
+    now = utcnow().replace(tzinfo=None)
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        ids = ["hstarve-a", "hstarve-b", "hstarve-c", "hstarve-due"]
+        for node_id in ids:
+            db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+            db.query(Document).filter(Document.node_id == node_id).delete(synchronize_session=False)
+        for node_id in ("hstarve-a", "hstarve-b", "hstarve-c"):
+            db.add(Document(node_id=node_id, workspace_id="demo-workspace", name=f"{node_id}.docx",
+                            extension="docx", file_class="document",
+                            review_due_at=now + timedelta(minutes=20), dirty_since=now - timedelta(minutes=10)))
+        # 到期时间放到两天前：按最早到期排序必然进入本轮额度
+        db.add(Document(node_id="hstarve-due", workspace_id="demo-workspace", name="唯一到期.docx",
+                        extension="docx", file_class="document",
+                        review_due_at=now - timedelta(days=2), dirty_since=now - timedelta(days=2)))
+        db.commit()
+        assert service.harvest_due_reviews(db, get_settings()) >= 1
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "hstarve-due")).all()
+        assert [j.trigger for j in jobs] == ["modify_merged"]
+        for node_id in ("hstarve-a", "hstarve-b", "hstarve-c"):
+            undue = db.get(Document, node_id)
+            assert undue.review_due_at is not None  # 未到期行不被 SQL 筛选捞走
+        for node_id in ids:
+            db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+            db.query(Document).filter(Document.node_id == node_id).delete(synchronize_session=False)
+        db.commit()
+
+
+def test_harvest_keeps_window_while_job_running():
+    """codex 第八轮 P0 回归：撞上 running 任务时保留到期标记（正文可能已被
+    抓走），任务完成后下一轮收割补评；绝不清了标记又不建任务。"""
+    from datetime import timedelta
+
+    from app.db import ReviewJob, utcnow
+    from app.service import harvest_due_reviews
+
+    init_db()
+    now = utcnow().replace(tzinfo=None)
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        for node_id in ("hrun-1",):
+            db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+            db.query(Document).filter(Document.node_id == node_id).delete(synchronize_session=False)
+        db.add(Document(node_id="hrun-1", workspace_id="demo-workspace", name="在途任务.docx",
+                        extension="docx", file_class="document",
+                        review_due_at=now - timedelta(days=2), dirty_since=now - timedelta(days=2)))
+        db.add(ReviewJob(job_id="hrun-job-1", node_id="hrun-1", trigger="audit", status="running"))
+        db.commit()
+        harvest_due_reviews(db, get_settings())
+        doc = db.get(Document, "hrun-1")
+        assert doc.review_due_at is not None and doc.dirty_since is not None  # 窗口保留
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "hrun-1",
+                                                  ReviewJob.trigger == "modify_merged")).all() == []
+        job = db.get(ReviewJob, "hrun-job-1")
+        job.status = "succeeded"
+        db.commit()
+        harvest_due_reviews(db, get_settings())   # 任务结束后补评
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "hrun-1",
+                                                  ReviewJob.trigger == "modify_merged")).all()
+        assert len(jobs) == 1
+        doc = db.get(Document, "hrun-1")
+        assert doc.review_due_at is None and doc.dirty_since is None
+        db.query(ReviewJob).filter(ReviewJob.node_id == "hrun-1").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "hrun-1").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_workspaces_api_hides_inactive():
+    """codex 第八轮 P1：不可见库（连续缺席/404 自动标记）退出知识库列表。"""
+    init_db()
+    with SessionLocal() as db:
+        db.merge(Workspace(workspace_id="api-inactive-1", name="X-已删除测试库",
+                           watch_seeded=True, is_active=False))
+        db.commit()
+    with TestClient(app) as client:
+        ids = [item["workspace_id"] for item in
+               client.get("/api/v1/workspaces", params={"query": "X-已删除测试库", "limit": 200}).json()["items"]]
+        assert "api-inactive-1" not in ids
+    with SessionLocal() as db:
+        db.get(Workspace, "api-inactive-1").is_active = True
+        db.commit()
+    with TestClient(app) as client:
+        ids = [item["workspace_id"] for item in
+               client.get("/api/v1/workspaces", params={"query": "X-已删除测试库", "limit": 200}).json()["items"]]
+        assert "api-inactive-1" in ids
+    with SessionLocal() as db:
+        db.query(Workspace).filter(Workspace.workspace_id == "api-inactive-1").delete(synchronize_session=False)
+        db.commit()
+
+
 def test_review_records_content_note():
     from app.service import run_review
 

@@ -287,12 +287,14 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         HistoricalFileNode.source_created_at.label("created_at"),
         HistoricalFileNode.creator_user_id.label("creator"),
     ).where(HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type != "folder")
+    inactive_ws = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
     live = select(
         Document.node_id, Document.workspace_id, Document.name,
         Document.extension, Document.url,
         Document.source_created_at.label("created_at"),
         Document.uploader_key.label("creator"),
-    ).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
+    ).where(Document.is_folder.is_(False), Document.is_deleted.is_(False),
+            Document.workspace_id.not_in(inactive_ws))  # 不可见库的增量不进检索
     if workspace_id:
         base = base.where(HistoricalFileNode.workspace_id == workspace_id)
         live = live.where(Document.workspace_id == workspace_id)
@@ -454,8 +456,10 @@ def workspaces(query: str = "", level: str = "", department: str = "", creator: 
                db: Session = Depends(db_session)):
     """Registry listing with level classification (C/D/P/I by name prefix),
     search, filters and pagination. Counts and role rows are prefetched in
-    bulk so the page costs a handful of queries, not one per workspace."""
-    rows = db.scalars(select(Workspace).order_by(Workspace.name)).all()
+    bulk so the page costs a handful of queries, not one per workspace.
+    不可见库（is_active=False，连续缺席/404 自动标记）不进列表。"""
+    rows = db.scalars(select(Workspace).where(Workspace.is_active.is_(True))
+                      .order_by(Workspace.name)).all()
     doc_counts = {ws_id: count for ws_id, count in db.execute(
         select(Document.workspace_id, func.count()).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
         .group_by(Document.workspace_id)).all()}
