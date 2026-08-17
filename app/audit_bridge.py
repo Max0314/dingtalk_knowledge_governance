@@ -71,14 +71,15 @@ DELETE_ACTIONS = ("删除", "撤回", "移除", "回收站")
 METADATA_ACTIONS = ("重命名", "移动")
 REVIEW_ACTIONS_EXACT = frozenset({
     "知识库上传文件", "上传文件", "新建文件", "新建文档", "创建文件", "创建文档",
-    "创建副本", "复制或转发文件", "文档导入", "覆盖上传",
+    "创建副本", "复制或转发文件", "文档导入", "覆盖上传", "覆盖文件",
 })
 MODIFY_ACTIONS_EXACT = frozenset({
     "知识库修改文件", "修改文件", "修改文档", "修改文件正文",
     "编辑文件", "编辑文档", "更新文件", "更新文档",
 })
-# 覆盖上传复用旧节点，created_at 不会贴近事件——互证时不算"创建"。
-CREATION_ACTIONS_EXACT = REVIEW_ACTIONS_EXACT - {"覆盖上传"}
+# 覆盖动作复用旧节点，created_at 不会贴近事件——互证时不算"创建"，应使用
+# updated_at。"覆盖文件"是生产审计已出现的真实动作名。
+CREATION_ACTIONS_EXACT = REVIEW_ACTIONS_EXACT - {"覆盖上传", "覆盖文件"}
 
 # In-memory debounce: workspace_id -> monotonic seconds of the last bridge
 # walk. Worker restarts forget it; one extra walk is harmless. Failed walks

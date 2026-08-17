@@ -46,7 +46,7 @@ def env(monkeypatch):
         stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
                      "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1", "old-touched",
                      "del-doc-1", "same-name-del", "rest-doc-1", "mod-doc-1", "own-doc-1", "nd-doc-1",
-                     "matrix-1", "matrix-2", "matrix-3"]
+                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
@@ -636,6 +636,51 @@ def test_upload_event_ignores_recent_update_on_old_node(env, monkeypatch):
     assert second["confirmed"] == 1
 
 
+def test_cover_file_uses_updated_at_and_queues_review(env, monkeypatch):
+    """生产真实动作“覆盖文件”复用旧节点：必须以 updated_at 互证，确认后
+    挂正文下载键并立即入队评审，不能被当成创建事件或 unknown。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+    old_iso = "2026-08-01T09:00:00+00:00"
+    with SessionLocal() as db:
+        db.merge(Document(node_id="cover-doc-1", workspace_id=WS, name="待覆盖.docx",
+                          extension="docx", file_class="document", storage_dentry_id="",
+                          uploader_key="human-uploader", uploader_name="人工上传人",
+                          source_created_at=old_iso, source_updated_at=old_iso))
+        db.commit()
+
+    class CoverSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "cover-doc-1", "name": "待覆盖.docx",
+                     "path": "/桥接测试库/待覆盖.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "待覆盖.docx", "workspace_id": WS, "node_id": "cover-doc-1",
+                     "extension": "docx", "created_at": old_iso, "updated_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", CoverSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("99912100001", "待覆盖", "99141", gmt=now_ms, action_view="覆盖文件")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 1 and summary.get("direct_upserts") == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99912100001"))
+        assert event.processed is True and event.resolution == "done"
+        doc = db.get(Document, "cover-doc-1")
+        assert doc.storage_dentry_id == "99912100001"
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "cover-doc-1")).all()
+        assert [job.trigger for job in jobs] == ["audit"]
+        for job in jobs:
+            db.delete(job)
+        db.delete(doc)
+        db.commit()
+
+
 @pytest.mark.parametrize("action_view", (
     "知识库上传文件", "创建文档", "创建副本", "复制或转发文件", "文档导入 ",
 ))
@@ -1054,6 +1099,8 @@ def test_action_kind_whitelist_classification():
     assert audit_bridge._action_kind(ns("修改")) == "unknown"
     assert audit_bridge._action_kind(ns("上传头像")) == "unknown"
     assert audit_bridge._action_kind(ns(" 知识库上传文件 ")) == "review"  # 前后空白归一
+    assert audit_bridge._action_kind(ns("覆盖文件")) == "review"          # 生产真实动作名
+    assert audit_bridge._is_creation_event(ns("覆盖文件")) is False       # 复用旧节点，用 updated_at 互证
 
 
 def test_unknown_action_terminal_never_reviews(env, monkeypatch):
