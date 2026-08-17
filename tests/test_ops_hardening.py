@@ -120,16 +120,63 @@ def test_dashboard_average_uses_latest_instance_per_doc():
 
 
 def test_sweep_stale_runs():
+    from app.db import BridgeWalk
     from app.service import sweep_stale_runs
 
     init_db()
     with SessionLocal() as db:
         db.merge(SyncRun(run_id="stale-1", status="running", mode="watch", workspace_id="ws-z"))
+        db.merge(BridgeWalk(workspace_id="stale-walk-ws"))  # 跨重启残留的巡走队列行
         db.commit()
         assert sweep_stale_runs(db) >= 1
         row = db.get(SyncRun, "stale-1")
         assert row.status == "failed" and row.error_code == "interrupted_by_restart" and row.finished_at
+        from sqlalchemy import select as sa_select
+        assert db.scalars(sa_select(BridgeWalk)).all() == []  # 启动清空，避免反复 404 烧预算
         db.delete(row)
+        db.commit()
+
+
+def test_harvest_due_reviews_window_and_cap():
+    """合并窗收割：到期收割、6 小时封顶强制收割、未到期不动；收割后窗口
+    字段清零，任务 trigger=modify_merged。"""
+    from datetime import timedelta
+
+    from app.db import ReviewJob, utcnow
+    from app.service import harvest_due_reviews
+
+    init_db()
+    now = utcnow().replace(tzinfo=None)
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        for node_id in ("harv-1", "harv-2", "harv-3"):
+            db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+            db.query(ReviewInstance).filter(ReviewInstance.node_id == node_id).delete(synchronize_session=False)
+            db.query(Document).filter(Document.node_id == node_id).delete(synchronize_session=False)
+        db.add(Document(node_id="harv-1", workspace_id="demo-workspace", name="到期收割.docx",
+                        extension="docx", file_class="document",
+                        review_due_at=now - timedelta(minutes=5), dirty_since=now - timedelta(minutes=35)))
+        db.add(Document(node_id="harv-2", workspace_id="demo-workspace", name="持续编辑封顶.docx",
+                        extension="docx", file_class="document",
+                        review_due_at=now + timedelta(minutes=25), dirty_since=now - timedelta(hours=7)))
+        db.add(Document(node_id="harv-3", workspace_id="demo-workspace", name="窗口未到.docx",
+                        extension="docx", file_class="document",
+                        review_due_at=now + timedelta(minutes=25), dirty_since=now - timedelta(minutes=5)))
+        db.commit()
+        harvested = harvest_due_reviews(db, get_settings())
+        assert harvested >= 2
+        jobs1 = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "harv-1")).all()
+        jobs2 = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "harv-2")).all()
+        assert [j.trigger for j in jobs1] == ["modify_merged"]   # 30 分钟无修改 → 收割
+        assert [j.trigger for j in jobs2] == ["modify_merged"]   # 持续编辑 6 小时封顶 → 强制收割
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "harv-3")).all() == []
+        one = db.get(Document, "harv-1")
+        assert one.review_due_at is None and one.dirty_since is None
+        three = db.get(Document, "harv-3")
+        assert three.review_due_at is not None  # 未到期保持等待
+        for node_id in ("harv-1", "harv-2", "harv-3"):
+            db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
+            db.query(Document).filter(Document.node_id == node_id).delete(synchronize_session=False)
         db.commit()
 
 

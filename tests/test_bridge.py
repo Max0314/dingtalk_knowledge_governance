@@ -37,14 +37,16 @@ def env(monkeypatch):
     monkeypatch.setattr(audit_bridge, "watch_workspace", fake_walk)
     audit_bridge._last_walk.clear()
     with SessionLocal() as db:
-        from app.db import BridgeWalk
+        from app.db import BridgeWalk, Notification
         db.query(BridgeWalk).delete(synchronize_session=False)
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("tb-%")).delete(synchronize_session=False)
         db.query(FileAuditEvent).filter(FileAuditEvent.biz_id.like("999%")).delete(synchronize_session=False)
         db.query(SpaceMap).filter(SpaceMap.space_id.like("990%")).delete(synchronize_session=False)
         # 上一次失败运行可能留下测试文档（各测试的收尾清理没跑到），开场兜底
         stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
-                     "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1"]
+                     "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1", "old-touched",
+                     "del-doc-1", "same-name-del", "rest-doc-1", "mod-doc-1", "own-doc-1", "nd-doc-1",
+                     "matrix-1", "matrix-2", "matrix-3"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
@@ -54,6 +56,7 @@ def env(monkeypatch):
                 # 不清会让 ORM 删除时置空外键而炸 NOT NULL
                 db.query(ReviewJob).filter(ReviewJob.node_id == node_id).delete(synchronize_session=False)
                 db.query(ReviewInstance).filter(ReviewInstance.node_id == node_id).delete(synchronize_session=False)
+                db.query(Notification).filter(Notification.node_id == node_id).delete(synchronize_session=False)
                 db.delete(leftover)
         if not db.get(Workspace, WS):
             db.add(Workspace(workspace_id=WS, name="桥接测试库"))
@@ -70,13 +73,15 @@ def env(monkeypatch):
 
 
 def add_event(biz_id, resource, space_id="2932890480", action_view="知识库上传文件",
-              module_view="团队空间", extension="docx", gmt=1786400000000, received=None):
+              module_view="团队空间", extension="docx", gmt=1786400000000, received=None, operator=""):
     with SessionLocal() as db:
         kwargs = dict(biz_id=biz_id, gmt_create=gmt, action_view=action_view,
                       module_view=module_view, resource=resource, extension=extension,
                       target_space_id=space_id)
         if received is not None:
             kwargs["received_at"] = received  # 重试窗口基准（默认=入库当下）
+        if operator:
+            kwargs["operator_user_id"] = operator
         db.add(FileAuditEvent(**kwargs))
         db.commit()
 
@@ -1004,3 +1009,376 @@ def test_fileclass_and_notify_guardrails():
         db.add(doc); db.add(instance); db.flush()  # column defaults apply at flush
         assert row2.status == "pending" and row2.target_union_id == "u1"
         db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-14 动作白名单 + 软删除 + 合并窗 + 降噪矩阵边界（codex 点名用例）
+# ---------------------------------------------------------------------------
+
+
+class _RaisingSearchClient:
+    """定位器被调用即失败——证明该类事件零远程消费。"""
+
+    def __init__(self, _settings):
+        pass
+
+    async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+        raise AssertionError("locator must not be called for this action kind")
+
+    async def batch_query_wiki_nodes(self, node_ids, operator_id):
+        raise AssertionError("locator must not be called for this action kind")
+
+
+def test_action_kind_five_way_whitelist():
+    ns = lambda view: SimpleNamespace(action_view=view)
+    assert audit_bridge._action_kind(ns("知识库上传文件")) == "review"
+    assert audit_bridge._action_kind(ns("创建副本")) == "review"
+    assert audit_bridge._action_kind(ns("知识库修改文件")) == "modify"
+    assert audit_bridge._action_kind(ns("知识库重命名文件")) == "metadata"
+    assert audit_bridge._action_kind(ns("移动文件")) == "metadata"
+    assert audit_bridge._action_kind(ns("知识库删除文件")) == "delete"
+    assert audit_bridge._action_kind(ns("移动到回收站")) == "delete"
+    assert audit_bridge._action_kind(ns("从回收站恢复文件")) == "restore"  # 恢复优先于回收站
+    assert audit_bridge._action_kind(ns("知识库分享文件")) == "ignore"
+    assert audit_bridge._action_kind(ns("添加知识库协作成员")) == "ignore"
+    assert audit_bridge._action_kind(ns("移除知识库成员")) == "ignore"    # 成员动作优先于"移除"
+    assert audit_bridge._action_kind(ns("某未知写操作")) == "modify"      # 未知保守走合并窗
+
+
+def test_ignore_action_finishes_without_any_lookup(env, monkeypatch):
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _RaisingSearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("tb-ign1", "被分享的文件", "99210", action_view="知识库分享文件")
+    summary = run_bridge(org)
+    assert summary.get("ignored") == 1 and summary["walks"] == [] and summary["unlocated"] == 0
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-ign1"))
+        assert event.processed is True and event.resolution == "ignored_action"
+        assert event.last_attempt_at is None  # 批处理阶段直接终态，从未进定位队列
+
+
+def test_delete_event_soft_deletes_cancels_and_keeps_history(env):
+    from app.db import Notification
+    from app.db import utcnow as db_utcnow
+
+    settings, walks, _ = env
+    with SessionLocal() as db:
+        db.merge(Document(node_id="del-doc-1", workspace_id=WS, name="要删的文件.docx", extension="docx",
+                          file_class="document", storage_dentry_id="99959000001",
+                          source_created_at=gmt_iso(), source_updated_at=gmt_iso()))
+        db.add(ReviewJob(job_id="job-del-1", node_id="del-doc-1", trigger="audit", status="pending"))
+        db.add(ReviewInstance(review_instance_id="ri-del-keep", node_id="del-doc-1", ai_score=77,
+                              verdict="pass", review_scope="full_content"))
+        db.add(Notification(node_id="del-doc-1", review_instance_id="ri-del-keep",
+                            target_union_id="u-del", title="旧通知", body="正文", status="pending"))
+        db.commit()
+    add_event("99959000001", "要删的文件", "99220", action_view="知识库删除文件")
+    summary = run_bridge(settings)
+    assert summary.get("deleted") == 1
+    with SessionLocal() as db:
+        doc = db.get(Document, "del-doc-1")
+        assert doc.is_deleted is True and doc.deleted_at is not None
+        job = db.get(ReviewJob, "job-del-1")
+        assert job.status == "skipped" and job.error_code == "document_deleted"
+        note = db.scalar(select(Notification).where(Notification.node_id == "del-doc-1"))
+        assert note.status == "skipped" and note.error_code == "skipped_document_deleted"
+        assert db.get(ReviewInstance, "ri-del-keep") is not None  # 评审历史全量保留
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99959000001"))
+        assert event.processed is True and event.resolution == "deleted"
+        db.delete(job); db.delete(note)
+        db.query(ReviewInstance).filter(ReviewInstance.node_id == "del-doc-1").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+
+
+def test_delete_never_matches_by_name_and_never_calls_locator(env, monkeypatch):
+    settings, walks, _ = env
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _RaisingSearchClient)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    with SessionLocal() as db:
+        db.merge(Document(node_id="same-name-del", workspace_id=WS, name="同名勿删.docx", extension="docx",
+                          file_class="document", storage_dentry_id="",
+                          source_created_at=gmt_iso(), source_updated_at=gmt_iso()))
+        db.commit()
+    add_event("tb-del-un", "同名勿删", "99230", action_view="知识库删除文件")
+    summary = run_bridge(org)
+    assert summary["walks"] == [] and summary.get("deleted", 0) == 0
+    with SessionLocal() as db:
+        assert db.get(Document, "same-name-del").is_deleted is False  # 绝不按同名删除
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-del-un"))
+        assert event.processed is False  # 保持 pending 至 48h 死信；月度核对兜底真实删除
+        db.query(Document).filter(Document.node_id == "same-name-del").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_restore_event_undeletes_without_review(env):
+    from datetime import datetime as dt, timezone as tz
+
+    settings, walks, _ = env
+    with SessionLocal() as db:
+        db.merge(Document(node_id="rest-doc-1", workspace_id=WS, name="被恢复的文件.docx", extension="docx",
+                          file_class="document", storage_dentry_id="99960000001", is_deleted=True,
+                          deleted_at=dt.now(tz.utc), watch_misses=2,
+                          source_created_at=gmt_iso(), source_updated_at=gmt_iso()))
+        db.commit()
+    add_event("99960000001", "被恢复的文件", "99240", action_view="知识库恢复文件")
+    summary = run_bridge(settings)
+    assert summary.get("restored") == 1
+    with SessionLocal() as db:
+        doc = db.get(Document, "rest-doc-1")
+        assert doc.is_deleted is False and doc.deleted_at is None and doc.watch_misses == 0
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "rest-doc-1")).all() == []  # 恢复不评审
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99960000001"))
+        assert event.processed is True and event.resolution == "restored"
+        db.delete(doc)
+        db.commit()
+
+
+def test_modify_event_merges_into_window_even_same_timestamp(env, monkeypatch):
+    """正文修改不立即评审：置合并窗（同时间戳的覆盖保存也置脏——codex P0-2
+    点名：不依赖 updated_at 变化判断）；后续修改顺延窗口；到点由收割器
+    入队一次 trigger=modify_merged。"""
+    import time as time_module
+    from datetime import timedelta as td
+
+    from app import service
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+    same_iso = gmt_iso(now_ms)  # 载荷 updated_at 与镜像完全一致：时间戳没变
+
+    class ModifySearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "mod-doc-1", "name": "被修改的文件.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "被修改的文件.docx", "workspace_id": WS, "node_id": "mod-doc-1",
+                     "extension": "docx", "updated_at": same_iso}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", ModifySearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    with SessionLocal() as db:
+        db.merge(Document(node_id="mod-doc-1", workspace_id=WS, name="被修改的文件.docx", extension="docx",
+                          file_class="document", storage_dentry_id="99961000001",
+                          source_created_at="2026-08-01T09:00:00+00:00", source_updated_at=same_iso,
+                          review_due_at=None, dirty_since=None))
+        db.commit()
+    add_event("99961000001", "被修改的文件", "99250", gmt=now_ms, action_view="知识库修改文件")
+    run_bridge(org)
+    with SessionLocal() as db:
+        doc = db.get(Document, "mod-doc-1")
+        assert doc.review_due_at is not None and doc.dirty_since is not None  # 同时间戳仍置脏
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "mod-doc-1")).all() == []
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99961000001"))
+        assert event.processed is True and event.resolution == "done"
+        due_first, dirty_first = doc.review_due_at, doc.dirty_since
+    add_event("99961000002", "被修改的文件", "99250", gmt=now_ms + 60000, action_view="知识库修改文件")
+    run_bridge(org)
+    with SessionLocal() as db:
+        doc = db.get(Document, "mod-doc-1")
+        assert doc.review_due_at > due_first          # 后续修改顺延窗口
+        assert doc.dirty_since == dirty_first          # 首次置脏时间不动（6h 封顶基准）
+        # 到点收割：把窗口拨到过去，收割器应入队一次合并评审
+        doc.review_due_at = doc.review_due_at - td(hours=2)
+        db.commit()
+        harvested = service.harvest_due_reviews(db, get_settings())
+        assert harvested >= 1
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "mod-doc-1")).all()
+        assert [job.trigger for job in jobs] == ["modify_merged"]
+        doc = db.get(Document, "mod-doc-1")
+        assert doc.review_due_at is None and doc.dirty_since is None
+        for job in jobs:
+            db.delete(job)
+        db.delete(doc)
+        db.commit()
+
+
+def test_confirmed_non_digit_biz_becomes_dead_letter_not_done(env, monkeypatch):
+    """codex P0-3：非数字 bizId 挂不上下载键——即便 locator 确认并直建了
+    文档，也必须转 dead_letter_no_numeric_biz_id，绝不伪装 done。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class NonDigitSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "nd-doc-1", "name": "非数字键文件.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "非数字键文件.docx", "workspace_id": WS, "node_id": "nd-doc-1",
+                     "extension": "docx", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", NonDigitSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    add_event("tb-nd1", "非数字键文件", "99260", gmt=now_ms)
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 1 and summary.get("dead_letter") == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-nd1"))
+        assert event.processed is True and event.resolution == "dead_letter_no_numeric_biz_id"
+        doc = db.get(Document, "nd-doc-1")
+        assert doc is not None and doc.storage_dentry_id == ""  # 镜像照建，键决不造假
+        db.query(ReviewJob).filter(ReviewJob.node_id == "nd-doc-1").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+
+
+def test_modify_event_never_overwrites_uploader(env, monkeypatch):
+    """归属保护（codex feb567a P1）：修改人是操作者不是上传人——已有文档的
+    后续事件只记 last_modifier_key，上传人与部门归属保持不变。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class TouchSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            return [{"dentry_uuid": "own-doc-1", "name": "归属保护.docx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "归属保护.docx", "workspace_id": WS, "node_id": "own-doc-1",
+                     "extension": "docx", "creator_id": "payload-creator", "updated_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", TouchSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    with SessionLocal() as db:
+        db.merge(Document(node_id="own-doc-1", workspace_id=WS, name="归属保护.docx", extension="docx",
+                          file_class="document", storage_dentry_id="99962000001",
+                          uploader_key="creator-A", uploader_name="张三", department_name="数字化转型部",
+                          org_matched=True, source_created_at="2026-08-01T09:00:00+00:00",
+                          source_updated_at="2026-08-01T09:00:00+00:00"))
+        db.commit()
+    add_event("99962000001", "归属保护", "99270", gmt=now_ms,
+              action_view="知识库修改文件", operator="editor-B")
+    run_bridge(org)
+    with SessionLocal() as db:
+        doc = db.get(Document, "own-doc-1")
+        assert doc.uploader_key == "creator-A" and doc.uploader_name == "张三"
+        assert doc.department_name == "数字化转型部"          # 归属与统计口径不被修改人污染
+        assert doc.last_modifier_key == "editor-B"            # 操作者另行记录
+        db.query(ReviewJob).filter(ReviewJob.node_id == "own-doc-1").delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
+
+
+def _mk_instance(db, node_id, ri, score, verdict, when):
+    row = ReviewInstance(review_instance_id=ri, node_id=node_id, ai_score=score,
+                         verdict=verdict, review_scope="full_content")
+    db.add(row)
+    db.flush()
+    row.created_at = when
+    db.flush()
+    return row
+
+
+def _matrix_doc(db, node_id):
+    from app.db import Notification
+
+    for model, field in ((ReviewJob, ReviewJob.node_id), (ReviewInstance, ReviewInstance.node_id),
+                         (Notification, Notification.node_id)):
+        db.query(model).filter(field == node_id).delete(synchronize_session=False)
+    db.merge(Document(node_id=node_id, workspace_id=WS, name=f"{node_id}.docx", extension="docx",
+                      file_class="document", uploader_key="u-matrix", department_name="AI应用研发部"))
+    db.commit()
+    return db.get(Document, node_id)
+
+
+def _matrix_settings():
+    return get_settings().model_copy(update={"notify_enabled": True, "notify_workspaces": "",
+                                             "notify_departments": "", "notify_on_pass": True})
+
+
+def _cn_day_start_naive():
+    from datetime import datetime, timezone as tz
+    from app import notify as notify_module
+    return (datetime.now(notify_module.CN_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(tz.utc).replace(tzinfo=None))
+
+
+def test_renotify_matrix_flip_notifies_minor_silences_capped(env):
+    """降噪矩阵（2026-08-14 拍板）：结论翻转必通知；同结论 |Δ|<10 留痕静默；
+    降幅 ≥10 想通知但撞每日 1 条重评上限时留痕跳过。"""
+    from datetime import timedelta as td
+
+    from app import notify as notify_module
+
+    settings = _matrix_settings()
+    day0 = _cn_day_start_naive()
+    yesterday = day0 - td(hours=3)
+    with SessionLocal() as db:
+        doc = _matrix_doc(db, "matrix-1")
+        inst1 = _mk_instance(db, "matrix-1", "ri-m1-a", 85, "pass", yesterday)
+        row1 = notify_module.enqueue_review_notification(db, settings, doc, inst1)
+        db.flush()
+        assert row1.status == "pending"  # 首评照旧
+        row1.status, row1.created_at = "sent", yesterday
+        db.flush()
+        inst2 = _mk_instance(db, "matrix-1", "ri-m1-b", 55, "return", day0 + td(minutes=5))
+        row2 = notify_module.enqueue_review_notification(db, settings, doc, inst2)
+        db.flush()
+        assert row2.status == "pending" and "低分说明" in row2.title  # 通过→低分必通知
+        row2.status = "sent"
+        db.flush()
+        inst3 = _mk_instance(db, "matrix-1", "ri-m1-c", 48, "return", day0 + td(minutes=15))
+        row3 = notify_module.enqueue_review_notification(db, settings, doc, inst3)
+        db.flush()
+        assert row3.status == "skipped" and row3.error_code == "suppressed_minor_change"
+        inst4 = _mk_instance(db, "matrix-1", "ri-m1-d", 30, "return", day0 + td(minutes=25))
+        row4 = notify_module.enqueue_review_notification(db, settings, doc, inst4)
+        db.flush()  # 降 18 分本应提醒，但当日重评额度（1 条）已被 row2 用掉
+        assert row4.status == "skipped" and row4.error_code == "suppressed_daily_cap"
+        _matrix_doc(db, "matrix-1")
+        db.query(Document).filter(Document.node_id == "matrix-1").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_renotify_improved_bypasses_pass_gate(env):
+    from datetime import timedelta as td
+
+    from app import notify as notify_module
+
+    settings = _matrix_settings().model_copy(update={"notify_on_pass": False})
+    day0 = _cn_day_start_naive()
+    with SessionLocal() as db:
+        doc = _matrix_doc(db, "matrix-2")
+        _mk_instance(db, "matrix-2", "ri-m2-a", 55, "return", day0 - td(hours=5))
+        inst2 = _mk_instance(db, "matrix-2", "ri-m2-b", 88, "pass", day0 + td(minutes=10))
+        row = notify_module.enqueue_review_notification(db, settings, doc, inst2)
+        db.flush()
+        # 低分→通过：改善反馈必达，不受 KG_NOTIFY_ON_PASS 限制
+        assert row.status == "pending" and "已改善" in row.title
+        assert "55 分 →" in row.body and "达标" in row.body
+        _matrix_doc(db, "matrix-2")
+        db.query(Document).filter(Document.node_id == "matrix-2").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_renotify_drop_warning_keeps_pass_wording(env):
+    from datetime import timedelta as td
+
+    from app import notify as notify_module
+
+    settings = _matrix_settings()
+    day0 = _cn_day_start_naive()
+    with SessionLocal() as db:
+        doc = _matrix_doc(db, "matrix-3")
+        _mk_instance(db, "matrix-3", "ri-m3-a", 95, "pass", day0 - td(hours=5))
+        inst2 = _mk_instance(db, "matrix-3", "ri-m3-b", 80, "pass", day0 + td(minutes=10))
+        row = notify_module.enqueue_review_notification(db, settings, doc, inst2)
+        db.flush()
+        assert row.status == "pending" and "评分下降提醒" in row.title
+        assert "较上次评审下降" in row.body and "结论仍为通过" in row.body
+        _matrix_doc(db, "matrix-3")
+        db.query(Document).filter(Document.node_id == "matrix-3").delete(synchronize_session=False)
+        db.commit()

@@ -5,8 +5,8 @@ from .audit_pull import run_audit_pull
 from .config import get_settings
 from .db import SessionLocal, init_db
 from .notify import process_pending_notifications
-from .service import (mark_scan_cycle_complete, process_next_job, run_watch_slice, seed_demo, sweep_stale_runs,
-                      watch_scan_decision)
+from .service import (harvest_due_reviews, mark_scan_cycle_complete, process_next_job, run_watch_slice, seed_demo,
+                      sweep_stale_runs, watch_scan_decision)
 from .stream import start_stream_consumer
 
 IDLE_CHECK_SECONDS = 600  # 非扫描期：十分钟看一眼日历，零外部调用
@@ -46,6 +46,9 @@ def main() -> None:
                     logger.exception("audit bridge failed")
             next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
         with SessionLocal() as db:
+            harvested = harvest_due_reviews(db, settings)  # 修改合并窗到点的文档入队
+            if harvested:
+                logger.info("merge-window harvest queued %s review(s)", harvested)
             processed = 0
             for _ in range(3):  # 小额度：模型评审单笔可达 2 分钟，不许垄断循环
                 if not process_next_job(db, settings):
@@ -73,7 +76,9 @@ def main() -> None:
                         if sl["unresolved"]:
                             logger.info("watch cycle complete, unresolved: %s", sl["unresolved"])
                         with SessionLocal() as db:
-                            mark_scan_cycle_complete(db, settings)
+                            # 传本轮真实成员：整轮缺席的注册库自动标记不可见
+                            mark_scan_cycle_complete(db, settings,
+                                                     set(sl.get("cycle_workspace_ids") or []))
                         next_watch_at = time.time() + max(60, settings.watch_interval_seconds)
                     else:
                         next_watch_at = time.time()  # continue after draining jobs and pushes

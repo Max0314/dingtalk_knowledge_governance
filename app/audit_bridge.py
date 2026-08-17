@@ -2,25 +2,23 @@
 
 The audit trail reliably says *that* a knowledge-base write happened, but —
 verified live 2026-08-11 — wiki uploads all carry one shared org-wide
-storage-space id, so the event does NOT say in *which* library. The bridge
-therefore treats wiki write events as an unaddressed doorbell:
+storage-space id, so the event does NOT say in *which* library. 2026-08-14
+流程定稿后，桥接是评审的唯一入口，每条 wiki 写事件按动作白名单分流：
 
-  1. consume unprocessed wiki-write events (action mentions 知识库 or
-     module 团队空间);
-  2. ring the governed set: every workspace the mirror governs gets a
-     debounced targeted walk (the proven watcher code, mode="bridge") —
-     node_id-exact diffs enqueue the reviews. In the pilot that is one
-     workspace; org rollout will add a wiki-search resolver to route events
-     by file name before falling back to the sweep;
-  3. backfill matched_node_id where the event's resource name joins a
-     mirrored or snapshot node uniquely — retried after the walks so files
-     the walk just mirrored match too.
+  1. 分类（codex P0-1）：上传/新建/导入类 -> 立即评审；正文修改 -> 合并
+     窗延时评审（30 分钟无后续修改评一次，持续编辑 6 小时封顶）；重命名/
+     移动 -> 只更新元数据；删除/恢复 -> 仅本地匹配（bizId/历史确认映射）
+     做软删/恢复，恢复不评审；协作/分享/权限等纯协同动作 -> 直接终态忽略，
+     不消耗任何定位额度。
+  2. locator：按文件名走存储搜索 + wiki 批量节点查询拿精确 node id，并与
+     节点载荷时间/大小互证（"系统不认识" ≠ 新节点）。
+  3. 确认后直接建档/更新该节点（一个事件只动一个节点，零整库遍历）。
+     完成语义：评审类/修改类事件以"下载键在文档上"为 done；元数据/删除/
+     恢复/忽略各有专属终态，绝不伪装成 done。
 
-space_map remains as an observability tally (which space ids appear, how
-often) and for future per-space modules; wiki routing no longer trusts it.
-
-Cost model: no wiki writes -> no walks. Each ring costs one walk per
-governed workspace, amortized by the debounce window.
+space_map remains as an observability tally. Cost model: no wiki writes ->
+no locator calls; the legacy sweep walk only fires at pilot scale
+(governed <= bridge_sweep_max_governed).
 """
 from __future__ import annotations
 
@@ -32,14 +30,14 @@ import uuid as uuid_module
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .config import Settings
-from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, ReviewInstance,
-                 ReviewJob, SpaceMap, Workspace, utcnow)
+from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, HistoricalSnapshot, Notification,
+                 ReviewInstance, ReviewJob, SpaceMap, Workspace, utcnow)
 from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError
-from .service import watch_workspace
+from .service import MODIFY_MERGE_WINDOW_SECONDS, watch_workspace
 
 logger = logging.getLogger("kg.bridge")
 
@@ -55,6 +53,15 @@ CONFIRM_FINISH_BUDGET = 50
 # 未能确认匹配的事件转入死信的时限：终态带 dead_letter_* 原因可观测，
 # 不伪装成功（发现与评审由 watcher 轮巡 + KG_REVIEW_SINCE 兜底）。
 GIVE_UP_AFTER_MS = 48 * 3600 * 1000
+
+# 操作类型白名单（codex P0-1 + 2026-08-14 拍板）。匹配顺序即语义优先级：
+# "从回收站恢复"先于"删除"，"移除成员"先于"移除"。未知写操作按"正文修改"
+# 保守归类——走合并窗且有指纹去重兜底，不会凭空多花模型钱。
+IGNORE_ACTIONS = ("协作", "成员", "分享", "公开", "外链", "权限", "评论", "链接", "收藏", "浏览", "预览", "下载")
+RESTORE_ACTIONS = ("恢复", "还原")
+DELETE_ACTIONS = ("删除", "撤回", "移除", "回收站")
+METADATA_ACTIONS = ("重命名", "移动")
+REVIEW_ACTIONS = ("上传", "新建", "创建", "复制", "转发", "导入", "副本", "覆盖")
 
 # In-memory debounce: workspace_id -> monotonic seconds of the last bridge
 # walk. Worker restarts forget it; one extra walk is harmless. Failed walks
@@ -132,11 +139,25 @@ def _attach_numeric_id(db: Session, event: FileAuditEvent, settings: Settings) -
                          trigger="content_key", requested_by="system"))
 
 
+def _awaiting_content_upgrade(db: Session, node_id: str) -> bool:
+    """初检承诺的正文补评：最近一次评审是 metadata_only（当时拿不到正文）
+    才成立。"""
+    latest = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == node_id)
+                       .order_by(ReviewInstance.created_at.desc()).limit(1))
+    return latest is not None and latest.review_scope == "metadata_only"
+
+
 def _action_kind(event: FileAuditEvent) -> str:
-    """重命名/移动只动元数据不评审；其余写操作（上传/新建/修改等）参与评审
-    （2026-08-14 流程定稿）。"""
+    """审计动作五分类：review（立即评审）/ modify（合并窗评审）/ metadata
+    （只更新镜像）/ delete、restore（软删/恢复，绝不评审）/ ignore（纯协同
+    动作，直接终态）。"""
     view = event.action_view or ""
-    return "metadata" if any(keyword in view for keyword in ("重命名", "移动")) else "mutate"
+    for keywords, kind in ((IGNORE_ACTIONS, "ignore"), (RESTORE_ACTIONS, "restore"),
+                           (DELETE_ACTIONS, "delete"), (METADATA_ACTIONS, "metadata"),
+                           (REVIEW_ACTIONS, "review")):
+        if any(keyword in view for keyword in keywords):
+            return kind
+    return "modify"
 
 
 def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEvent,
@@ -155,7 +176,6 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
         db.flush()
     doc = db.get(Document, node["node_id"])
     is_new = doc is None
-    changed = (not is_new) and doc.source_updated_at != (node.get("updated_at") or "")
     if doc is None:
         doc = Document(node_id=node["node_id"], workspace_id=workspace_id, name=node.get("name") or "")
         db.add(doc)
@@ -174,10 +194,20 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
         doc.directory_pending = True
     if doc.is_deleted:
         doc.is_deleted = False
+        doc.deleted_at = None
     doc.watch_misses = 0
-    if is_new or changed:
-        creator = node.get("creator_id") or event.operator_user_id or ""
-        doc.uploader_key = creator or doc.uploader_key or ""
+    # 归属保护（codex feb567a P1）：上传人只在建档时落定（节点载荷的
+    # creator 优先，审计操作人兜底）；已有文档的后续事件只记 last_modifier，
+    # 绝不改写上传人——通知与统计都按上传人归属。
+    filled_creator = False
+    if is_new:
+        doc.uploader_key = node.get("creator_id") or event.operator_user_id or ""
+        filled_creator = True
+    elif not doc.uploader_key and node.get("creator_id"):
+        doc.uploader_key = node.get("creator_id") or ""
+        filled_creator = True
+    doc.last_modifier_key = event.operator_user_id or doc.last_modifier_key or ""
+    if filled_creator:
         identity: dict = {}
         if doc.uploader_key:
             identity_input = ({"userId": doc.uploader_key} if doc.uploader_key.isdigit()
@@ -194,23 +224,39 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
             doc.department_name = identity.get("departmentName", "")
             doc.biz_group_name = identity.get("bizGroupName", "")
             doc.org_matched = True
-        elif is_new:
+        else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
     key_attached = False
     if not doc.storage_dentry_id and (event.biz_id or "").isdigit():
         doc.storage_dentry_id = event.biz_id
         key_attached = True
     db.flush()
-    if (_action_kind(event) == "mutate" and (is_new or changed or key_attached)
-            and not doc.is_folder
-            and not is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)
-            and doc.file_class in review_classes(settings.review_classes)
-            and _should_auto_review(db, settings, doc, event)):
+    kind = _action_kind(event)
+    eligible = (not doc.is_folder
+                and not is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)
+                and doc.file_class in review_classes(settings.review_classes)
+                and _should_auto_review(db, settings, doc, event))
+    # 首挂下载键只在"初检等待正文补评"时才算评审理由——重命名等元数据事件
+    # 顺带带来 bizId 时，键照挂但不越权触发评审（白名单语义优先）。
+    upgrade_due = key_attached and _awaiting_content_upgrade(db, doc.node_id)
+    if eligible and (kind == "review" or upgrade_due):
+        # 上传/新建类立即评审（2026-08-14 拍板：不设等待窗）。不依赖
+        # is_new/changed 的时间戳判断——同秒覆盖上传时间戳不变，靠时间戳
+        # 会整条漏评（codex P0-2）。重复入队由 pending/running 排他挡住。
         pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
                                                     ReviewJob.status.in_(("pending", "running"))))
         if not pending:
             db.add(ReviewJob(job_id=str(uuid_module.uuid4()), node_id=doc.node_id,
                              trigger="audit", requested_by="system"))
+        doc.review_due_at = None
+        doc.dirty_since = None
+    elif eligible and kind == "modify":
+        # 正文修改进合并窗：30 分钟无后续修改合并评一次；dirty_since 记首次
+        # 置脏，持续编辑 6 小时封顶由收割器裁决（harvest_due_reviews）。
+        stamp = utcnow()
+        if doc.review_due_at is None:
+            doc.dirty_since = stamp
+        doc.review_due_at = stamp + timedelta(seconds=MODIFY_MERGE_WINDOW_SECONDS)
     return doc
 
 
@@ -230,17 +276,83 @@ def _finish(db: Session, event: FileAuditEvent, resolution: str) -> None:
     _tally_space(db, event)
 
 
+def _resolve_node_locally(db: Session, event: FileAuditEvent) -> str:
+    """删除/恢复事件的本地匹配：数字 bizId 直查下载键，其次同 bizId 的历史
+    已确认事件（上传确认时留下的映射）。绝不按文件名猜——同名多节点删错档
+    案不可接受；匹配不上就保持 pending 到 48h 死信，真实删除由每月 10/24
+    全量核对的 watch_misses 兜底。"""
+    if (event.biz_id or "").isdigit():
+        node_id = db.scalar(select(Document.node_id)
+                            .where(Document.storage_dentry_id == event.biz_id).limit(1))
+        if node_id:
+            return node_id
+    if event.biz_id:
+        prior = db.scalar(select(FileAuditEvent.matched_node_id)
+                          .where(FileAuditEvent.biz_id == event.biz_id,
+                                 FileAuditEvent.match_status == "confirmed",
+                                 FileAuditEvent.matched_node_id != "",
+                                 FileAuditEvent.id != event.id)
+                          .order_by(FileAuditEvent.gmt_create.desc()).limit(1))
+        if prior:
+            return prior
+    return ""
+
+
+def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEvent,
+                           kind: str, summary: dict) -> None:
+    """软删除/恢复（2026-08-14 拍板）：删除只翻 is_deleted 位并取消在途任务
+    与未发通知，全部评审历史保留可查；恢复翻回位即可，绝不触发评审。"""
+    node_id = event.matched_node_id or _resolve_node_locally(db, event)
+    if not node_id:
+        return  # pending：bizId 映射可能晚到，重试到 48h 死信
+    doc = db.get(Document, node_id)
+    if doc is None:
+        return
+    event.matched_node_id = node_id
+    event.match_status = "confirmed"
+    if kind == "delete":
+        doc.is_deleted = True
+        doc.deleted_at = utcnow()
+        doc.review_due_at = None
+        doc.dirty_since = None
+        for job in db.scalars(select(ReviewJob).where(
+                ReviewJob.node_id == node_id, ReviewJob.status.in_(("pending", "running")))).all():
+            job.status, job.error_code, job.finished_at = "skipped", "document_deleted", utcnow()
+        for note in db.scalars(select(Notification).where(
+                Notification.node_id == node_id, Notification.status == "pending")).all():
+            note.status, note.error_code = "skipped", "skipped_document_deleted"
+        _finish(db, event, "deleted")
+        summary["deleted"] = summary.get("deleted", 0) + 1
+    else:
+        doc.is_deleted = False
+        doc.deleted_at = None
+        doc.watch_misses = 0
+        _finish(db, event, "restored")  # 恢复不评审（用户拍板）：正文没变，历史实例仍有效
+        summary["restored"] = summary.get("restored", 0) + 1
+
+
 def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings, summary: dict,
                           queued: set[str]) -> bool:
-    """成功终态的完整定义（codex 第四轮 P0）：locator 确认的节点 + 文档已入
-    镜像 + 正文下载键在文档上。键挂不上（bizId 非数字）转死信而非伪装成功；
-    文档未入镜像保持 pending 重试。"""
+    """成功终态按动作类型收口（codex P0-3）：评审/修改类须"文档入镜像 + 正文
+    下载键在文档上"才 done；键挂不上（bizId 非数字）转死信而非伪装成功；
+    元数据/删除/恢复/忽略各归专属终态，done 的不变量（键可下载）不被稀释。"""
     if event.match_status != "confirmed" or not event.matched_node_id:
         return False
+    kind = _action_kind(event)
+    if kind in ("delete", "restore"):
+        _handle_delete_restore(db, settings, event, kind, summary)
+        return bool(event.processed)
+    if kind == "ignore":
+        _finish(db, event, "ignored_action")
+        summary["ignored"] = summary.get("ignored", 0) + 1
+        return True
     _attach_numeric_id(db, event, settings)
     doc = db.get(Document, event.matched_node_id)
     if doc is None:
         return False
+    if kind == "metadata":
+        _finish(db, event, "metadata_applied")
+        return True
     if doc.storage_dentry_id:
         _finish(db, event, "done")
         return True
@@ -375,6 +487,15 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             continue
         summary["wiki_events"] += 1
         wiki_events.append(event)
+        kind = _action_kind(event)
+        if kind == "ignore":
+            # 协作/分享/权限等纯协同动作：终态忽略，零定位消费（codex P0-1）
+            _finish(db, event, "ignored_action")
+            summary["ignored"] = summary.get("ignored", 0) + 1
+            continue
+        if kind in ("delete", "restore"):
+            _handle_delete_restore(db, settings, event, kind, summary)
+            continue  # 已删节点搜索拿不到，绝不进远程定位；未匹配保持 pending
         _provisional_match(db, event, snapshot_id, summary)  # 仅诊断参考，不再触发整库门铃
         _try_finish_confirmed(db, event, settings, summary, queued)
     db.commit()
@@ -431,6 +552,8 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if remaining <= 0:
                 break
             event.last_attempt_at = now
+            if _action_kind(event) not in ("review", "modify", "metadata"):
+                continue  # 删除/恢复/忽略类不做远程定位；盖章轮转让位后来者
             names = _name_candidates(event)
             try:
                 # 硬时间预算：整组请求包在剩余时间内，40s 的一对外呼不能把
@@ -460,9 +583,18 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                     # （2026-08-14 流程定稿：一个事件只动一个节点）。
                     hit_path = next((d.get("path") or "" for d in dentries
                                      if d.get("dentry_uuid") == confirmed_id), "")
-                    _upsert_audit_document(db, settings, event, hit, hit_path)
-                    _finish(db, event, "done")
+                    doc = _upsert_audit_document(db, settings, event, hit, hit_path)
                     summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
+                    # 完成语义按类型收口（codex P0-3）：done 保留"键可下载"
+                    # 不变量；元数据类以镜像更新为终态；非数字 bizId 转死信。
+                    kind = _action_kind(event)
+                    if kind == "metadata":
+                        _finish(db, event, "metadata_applied")
+                    elif doc.storage_dentry_id:
+                        _finish(db, event, "done")
+                    elif not (event.biz_id or "").isdigit():
+                        _finish(db, event, "dead_letter_no_numeric_biz_id")
+                        summary["dead_letter"] = summary.get("dead_letter", 0) + 1
                 else:
                     summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
             if not event.processed:

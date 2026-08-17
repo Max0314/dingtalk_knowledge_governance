@@ -52,13 +52,17 @@ def main() -> None:
         out["watch_seed_progress"] = {
             "registered_workspaces": db.scalar(select(func.count()).select_from(Workspace)) or 0,
             "seeded": db.scalar(select(func.count()).select_from(Workspace)
-                                .where(Workspace.watch_seeded.is_(True))) or 0}
+                                .where(Workspace.watch_seeded.is_(True))) or 0,
+            # 已删除/失权的库（整轮缺席或 404 自动标记）：不计入补种与计划
+            "inactive": db.scalar(select(func.count()).select_from(Workspace)
+                                  .where(Workspace.is_active.is_(False))) or 0}
         plan = db.get(WatchPlan, 1)
         out["scan_plan"] = {
             "due": current_scan_due(settings),
             "completed_for": plan.completed_for if plan else "",
             "mode": "seeding" if (db.scalar(select(func.count()).select_from(Workspace)
-                                            .where(Workspace.watch_seeded.is_(False))) or 0)
+                                            .where(Workspace.watch_seeded.is_(False),
+                                                   Workspace.is_active.is_(True))) or 0)
                     else ("idle" if plan and plan.completed_for == current_scan_due(settings) else "scanning"),
         }
         week_ago = utcnow() - timedelta(days=7)
@@ -86,6 +90,10 @@ def main() -> None:
             "walk_queue": db.scalar(select(func.count()).select_from(BridgeWalk)) or 0,
             "reviewable_new_docs_without_key_7d": db.scalar(
                 select(func.count()).select_from(Document).where(*no_key_conds)) or 0,
+            # 修改合并窗内待收割的脏文档（30 分钟无新修改后自动评审）
+            "merge_window_pending": db.scalar(
+                select(func.count()).select_from(Document)
+                .where(Document.review_due_at.is_not(None))) or 0,
         }
         if settings.review_since:
             # 审计漏捕嫌疑：上线后创建/修改、可评审、非机器人，却从未有过

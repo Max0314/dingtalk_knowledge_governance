@@ -252,6 +252,69 @@ def test_scan_calendar_and_decision(settings):
         db.commit()
 
 
+def test_inactive_workspace_excluded_from_seeding(settings):
+    """已删除/失权的库不计入补种缺口——不能把 worker 永久拖回连续轮巡
+    （P-06 德国DG路由器教训，2026-08-14 拍板自动排除）。"""
+    with SessionLocal() as db:
+        before = service._seeding_pending(db)
+        db.merge(Workspace(workspace_id="inactive-x", name="已删除的库",
+                           watch_seeded=False, is_active=False))
+        db.commit()
+        assert service._seeding_pending(db) == before
+        db.query(Workspace).filter(Workspace.workspace_id == "inactive-x").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_cycle_completion_marks_absent_workspaces_inactive(settings):
+    """整轮走完仍未出现在解析列表的注册库 → 自动标记不可见；传空集
+    （解析瞬时失败）不判决，防止误伤全量。"""
+    with SessionLocal() as db:
+        db.merge(Workspace(workspace_id="gone-404", name="已被删除的库", watch_seeded=True, is_active=True))
+        db.commit()
+        seen = {row[0] for row in db.execute(select(Workspace.workspace_id)
+                                             .where(Workspace.is_active.is_(True)))} - {"gone-404"}
+        service.mark_scan_cycle_complete(db, settings, seen)
+        assert db.get(Workspace, "gone-404").is_active is False
+        assert db.get(Workspace, WS).is_active is True  # 本轮看到的库不受影响
+        db.get(Workspace, "gone-404").is_active = True
+        db.commit()
+        service.mark_scan_cycle_complete(db, settings, set())
+        assert db.get(Workspace, "gone-404").is_active is True  # 空集不判决
+        db.query(Workspace).filter(Workspace.workspace_id == "gone-404").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_workspace_not_visible_marks_inactive_then_revives(settings, monkeypatch):
+    """404/失权的库：watch_workspace 失败即自动排除；恢复可见后一次成功
+    巡走自动复活。"""
+    import asyncio
+
+    from app.integrations import IntegrationError
+
+    class VanishedClient(FakeClient):
+        async def workspace_detail(self, workspace_id, operator_id):
+            raise IntegrationError("dingtalk_request_failed", "404 on detail", 404)
+
+        async def list_workspaces(self, operator_id, next_token="", max_results=30):
+            return {"items": [], "next_token": ""}  # 操作者列表里也没有
+
+    monkeypatch.setattr(service, "DingtalkClient", VanishedClient)
+    with SessionLocal() as db:
+        db.merge(Workspace(workspace_id="vanished-1", name="德国DG路由器", watch_seeded=True, is_active=True))
+        db.commit()
+        run = asyncio.run(service.watch_workspace(db, settings, "vanished-1"))
+        assert run.status == "failed" and run.error_code.startswith("workspace_not_visible")
+        assert db.get(Workspace, "vanished-1").is_active is False
+    monkeypatch.setattr(service, "DingtalkClient", FakeClient)
+    FakeClient.nodes = {}
+    with SessionLocal() as db:
+        run2 = asyncio.run(service.watch_workspace(db, settings, "vanished-1"))
+        assert run2.status == "succeeded"
+        assert db.get(Workspace, "vanished-1").is_active is True  # 重新可见自动复活
+        db.query(Workspace).filter(Workspace.workspace_id == "vanished-1").delete(synchronize_session=False)
+        db.commit()
+
+
 def test_watch_skips_unreviewable_file_classes(settings):
     FakeClient.nodes = {"D1": node("watch-doc1")}
     cycle(settings)  # seed with one document

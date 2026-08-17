@@ -1,20 +1,34 @@
 from __future__ import annotations
 import asyncio
+import hashlib
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from .config import Settings
-from .db import Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, WatchPlan, Workspace, WorkspaceRole, utcnow
+from .db import BridgeWalk, Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, WatchPlan, Workspace, WorkspaceRole, utcnow
 from .fileclass import classify, review_classes
 from .integrations import ADVISORY_GENRES, BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
 from .scoring import RULE_VERSION, effective_config, score_document, verdict_for
 
 
+# 正文修改的合并评审窗（2026-08-14 拍板）：30 分钟无后续修改评一次；
+# 持续编辑以首次置脏起 6 小时封顶，防止"永远还在改"永不评审。
+MODIFY_MERGE_WINDOW_SECONDS = 1800
+MODIFY_MERGE_MAX_SECONDS = 6 * 3600
+
+
 def iso(value):
     return value.isoformat() if value else None
+
+
+def _to_naive_utc(moment: datetime | None) -> datetime | None:
+    """DB 读回的时间可能带/不带 tzinfo（驱动差异）；比较前统一为 naive UTC。"""
+    if moment is None:
+        return None
+    return moment.astimezone(timezone.utc).replace(tzinfo=None) if moment.tzinfo else moment
 
 
 def robot_keys(settings: Settings) -> set[str]:
@@ -91,7 +105,9 @@ def rule_config_ref(row: ScoringRuleConfig | None) -> str:
     return f"department:{row.department_name}@v{row.version}" if row.scope == "department" else f"global@v{row.version}"
 
 
-def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual") -> ReviewInstance:
+def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual") -> ReviewInstance | None:
+    """返回 None 表示"正文与上次评审逐字节一致，本次跳过"（重命名后保存、
+    格式化重存等假修改不重复出分/推送）；手动重评永不跳过。"""
     from .content import fetch_document_content
 
     doc = db.get(Document, node_id)
@@ -116,6 +132,14 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
         scope = "full_content" if content else "metadata_only"
         if content:
             content_note = ""  # 正文拿到了，原因字段只服务于 metadata_only 的可观测性
+    if content and trigger != "manual_rerun":
+        fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        if fingerprint == (doc.content_fingerprint or ""):
+            latest = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == node_id)
+                               .order_by(ReviewInstance.created_at.desc()).limit(1))
+            if latest is not None and latest.content_fingerprint == fingerprint:
+                content = ""
+                return None
     rule_row = resolve_rule_config(db, doc.department_name)
     rule_cfg = effective_config(rule_row.config if rule_row else None)
     result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n", doc.file_class or "document", rule_cfg)
@@ -187,13 +211,47 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     db.commit()
     try:
         review = run_review(db, settings, job.node_id, job.trigger)
-        job.status, job.result_review_instance_id, job.finished_at = "succeeded", review.review_instance_id, utcnow()
+        if review is None:
+            job.status, job.error_code, job.finished_at = "skipped", "content_unchanged", utcnow()
+        else:
+            job.status, job.result_review_instance_id, job.finished_at = "succeeded", review.review_instance_id, utcnow()
     except KeyError:
         job.status, job.error_code, job.finished_at = "failed", "document_not_found", utcnow()
     except Exception:
         job.status, job.error_code, job.finished_at = "failed", "review_execution_failed", utcnow()
     db.commit()
     return True
+
+
+def harvest_due_reviews(db: Session, settings: Settings) -> int:
+    """修改合并窗收割：到期（30 分钟无新修改）或触顶（持续编辑满 6 小时）的
+    脏文档入队一次合并评审（trigger=modify_merged）。评审侧还有指纹去重兜
+    底——正文无实质变化不会重复出分。窗口字段无论入没入队都清零，绝不留
+    永久脏位。"""
+    now = _to_naive_utc(utcnow())
+    harvested = 0
+    rows = db.scalars(select(Document).where(Document.review_due_at.is_not(None)).limit(100)).all()
+    for doc in rows:
+        due = _to_naive_utc(doc.review_due_at)
+        dirty = _to_naive_utc(doc.dirty_since)
+        deadline = due
+        if dirty is not None:
+            deadline = min(due, dirty + timedelta(seconds=MODIFY_MERGE_MAX_SECONDS))
+        if deadline is None or deadline > now:
+            continue
+        doc.review_due_at = None
+        doc.dirty_since = None
+        if doc.is_deleted or doc.is_folder:
+            continue
+        pending = db.scalar(select(ReviewJob).where(ReviewJob.node_id == doc.node_id,
+                                                    ReviewJob.status.in_(("pending", "running"))))
+        if pending is None:
+            db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
+                             trigger="modify_merged", requested_by="system"))
+            harvested += 1
+    if rows:
+        db.commit()
+    return harvested
 
 
 async def _upsert_document(db: Session, settings: Settings, run: SyncRun, workspace_id: str, item: dict,
@@ -402,6 +460,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         ws.source_updated_at = raw.get("updated_at", "") or ws.source_updated_at
         ws.creator_key = raw.get("creator_id", "") or ws.creator_key
         ws.synced_at = utcnow()
+        ws.is_active = True  # 走到这说明库可见：曾被 404 排除的自动复活
         run.workspace_name = ws.name
         run.workspaces_seen = 1
         # 显式补种标记：只有"完整走完"的 seed 轮才置位。用"镜像非空"推断会把
@@ -446,6 +505,12 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         db.rollback()
         run.status, run.error_code, run.finished_at = "failed", f"{exc.code}:{exc.status_code}"[:64], utcnow()
         run.error_detail = str(exc)[:512]
+        if exc.code == "workspace_not_visible":
+            # 库已删除或失权（P-06 德国DG路由器场景，2026-08-14 拍板）：自动
+            # 退出活跃集合，补种/计划不再被它卡死；重新可见时上面自动复活。
+            ws_row = db.get(Workspace, workspace_id)
+            if ws_row is not None:
+                ws_row.is_active = False
     except Exception as exc:
         db.rollback()
         run.status, run.error_code, run.finished_at = "failed", "watch_execution_failed", utcnow()
@@ -478,7 +543,7 @@ def run_watch_cycle(db: Session, settings: Settings) -> dict:
     return asyncio.run(run_watch_cycle_async(db, settings))
 
 
-_watch_rotation: dict = {"queue": []}
+_watch_rotation: dict = {"queue": [], "cycle_ids": []}
 
 
 async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2) -> dict:
@@ -486,11 +551,13 @@ async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2)
     The worker drains review jobs / notifications / audit pull between slices,
     so a 140-workspace cycle cannot starve them for hours (2026-08-13
     finding). An exhausted rotation reports cycle_completed and refills on the
-    next call."""
+    next call. cycle_ids 记录本轮周期的成员：整轮走完时它就是"这次全量真实
+    看到的库"，缺席者由结账逻辑自动标记不可见。"""
     targets = await resolve_watch_targets(settings)
     by_id = {t["workspace_id"]: t for t in targets["resolved"]}
     if not _watch_rotation["queue"]:
         _watch_rotation["queue"] = list(by_id.keys())
+        _watch_rotation["cycle_ids"] = list(by_id.keys())
     walked = []
     while _watch_rotation["queue"] and len(walked) < max(1, batch):
         ws_id = _watch_rotation["queue"].pop(0)
@@ -502,8 +569,10 @@ async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2)
                        "mode": run.mode, "status": run.status, "documents_seen": run.documents_seen,
                        "documents_new": run.documents_new, "documents_changed": run.documents_changed,
                        "error_code": run.error_code})
+    completed = not _watch_rotation["queue"]
     return {"walked": walked, "remaining": len(_watch_rotation["queue"]), "total": len(by_id),
-            "unresolved": targets["unresolved"], "cycle_completed": not _watch_rotation["queue"]}
+            "unresolved": targets["unresolved"], "cycle_completed": completed,
+            "cycle_workspace_ids": (list(_watch_rotation["cycle_ids"]) or list(by_id.keys())) if completed else []}
 
 
 def run_watch_slice(db: Session, settings: Settings, batch: int = 2) -> dict:
@@ -543,22 +612,34 @@ def _watch_plan(db: Session) -> WatchPlan:
     return plan
 
 
+def _seeding_pending(db: Session) -> int:
+    """待补种数只数活跃库：已删除/失权的库（is_active=False）永远补不了种，
+    不能让它把 worker 永久拖回连续轮巡（P-06 德国DG路由器教训）。"""
+    return db.scalar(select(func.count()).select_from(Workspace)
+                     .where(Workspace.watch_seeded.is_(False), Workspace.is_active.is_(True))) or 0
+
+
 def watch_scan_decision(db: Session, settings: Settings) -> str:
     """"scan" = 需要推进全量巡走；"idle" = 本期计划已完成，只等下个计划日。
     首轮补种未完成时始终 scan（2026-08-14 决策：补种完成后停止连续轮巡，
     全量扫描固定每月 10/24 日；期间的变化发现交给审计增量拉取 + 桥接）。"""
-    seeding_pending = db.scalar(select(func.count()).select_from(Workspace)
-                                .where(Workspace.watch_seeded.is_(False))) or 0
-    if seeding_pending:
+    if _seeding_pending(db):
         return "scan"
     return "idle" if _watch_plan(db).completed_for == current_scan_due(settings) else "scan"
 
 
-def mark_scan_cycle_complete(db: Session, settings: Settings) -> None:
-    """整轮走完时结账：补种全清后才消费计划日（首轮本身就是一次全量）。"""
-    seeding_pending = db.scalar(select(func.count()).select_from(Workspace)
-                                .where(Workspace.watch_seeded.is_(False))) or 0
-    if seeding_pending:
+def mark_scan_cycle_complete(db: Session, settings: Settings,
+                             seen_workspace_ids: set[str] | None = None) -> None:
+    """整轮走完时结账：补种全清后才消费计划日（首轮本身就是一次全量）。
+    ``seen_workspace_ids`` 是本轮解析到的全部库 id：注册表里整轮都没出现的
+    库即已删除/失权，自动标记不可见（传空/None 时跳过判决，防止解析瞬时
+    失败误伤全量）。"""
+    if seen_workspace_ids:
+        for ws in db.scalars(select(Workspace).where(Workspace.is_active.is_(True))).all():
+            if ws.workspace_id not in seen_workspace_ids:
+                ws.is_active = False
+    if _seeding_pending(db):
+        db.commit()
         return
     plan = _watch_plan(db)
     plan.completed_for = current_scan_due(settings)
@@ -569,10 +650,14 @@ def mark_scan_cycle_complete(db: Session, settings: Settings) -> None:
 def sweep_stale_runs(db: Session) -> int:
     """Mark runs a dead process left in "running" as interrupted. Called once
     at worker boot — with a single worker, anything still "running" then is a
-    leftover, not live work (7 such rows accumulated by 2026-08-13)."""
+    leftover, not live work (7 such rows accumulated by 2026-08-13)。同时清空
+    巡走残留队列：直建流程下走整库只剩试点级兜底，跨重启的旧行（如已删库
+    P-06）只会反复 404 烧预算，一次性出清。"""
     stale = db.scalars(select(SyncRun).where(SyncRun.status == "running")).all()
     for run in stale:
         run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
+    for row in db.scalars(select(BridgeWalk)).all():
+        db.delete(row)
     db.commit()
     return len(stale)
 

@@ -42,6 +42,9 @@ class Workspace(Base):
     # non-empty mirror mistakes an interrupted seed for done and floods the
     # review queue with stock files on the next walk.
     watch_seeded: Mapped[bool] = mapped_column(Boolean, default=False)
+    # False = 当前不可见（列表三连不含/详情 404，如已删除或迁移的库）：退出
+    # 活跃补种集合与当前统计，历史数据保留；恢复可见后自动回归。
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     documents: Mapped[list["Document"]] = relationship(back_populates="workspace")
 
@@ -91,6 +94,13 @@ class Document(Base):
     # event — verified by cross-download 2026-08-12). The download API only
     # accepts this numeric form; empty means no event seen yet.
     storage_dentry_id: Mapped[str] = mapped_column(String(64), default="")
+    # 修改合并窗（2026-08-14 定稿）：正文修改事件只置脏与到期时间，收割器
+    # 到点合并评一次；dirty_since + 6h 封顶防止持续编辑永不评审。
+    review_due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dirty_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 最近一次操作人（审计事件）；绝不覆盖 uploader_key——通知归属属于上传人。
+    last_modifier_key: Mapped[str] = mapped_column(id_string(), default="")
     workspace: Mapped[Workspace] = relationship(back_populates="documents")
     reviews: Mapped[list["ReviewInstance"]] = relationship(back_populates="document")
 
@@ -482,7 +492,8 @@ EXTRA_COLUMNS = {
     "sync_runs": {"workspace_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
                   "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
-    "workspaces": {"watch_seeded": "TINYINT(1) NOT NULL DEFAULT 0"},
+    "workspaces": {"watch_seeded": "TINYINT(1) NOT NULL DEFAULT 0",
+                   "is_active": "TINYINT(1) NOT NULL DEFAULT 1"},
     "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
                           "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
                           "last_attempt_at": "DATETIME NULL",
@@ -491,7 +502,11 @@ EXTRA_COLUMNS = {
                           "failures": "INTEGER NOT NULL DEFAULT 0"},
     "documents": {"parent_node_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "path": "VARCHAR(1024) NOT NULL DEFAULT ''",
-                  "directory_pending": "TINYINT(1) NOT NULL DEFAULT 0"},
+                  "directory_pending": "TINYINT(1) NOT NULL DEFAULT 0",
+                  "review_due_at": "DATETIME NULL",
+                  "dirty_since": "DATETIME NULL",
+                  "deleted_at": "DATETIME NULL",
+                  "last_modifier_key": "VARCHAR(128) NOT NULL DEFAULT ''"},
 }
 
 

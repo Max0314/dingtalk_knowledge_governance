@@ -98,6 +98,8 @@ def test_model_score_recomputes_verdict(monkeypatch):
         if not db.get(Document, "content-2"):
             db.add(Document(node_id="content-2", workspace_id="content-ws", name="判级测试_V1.0.docx",
                             extension="docx", file_class="document"))
+        # 共享测试库跑第二遍时正文与上轮一致：清指纹绕过 content_unchanged 去重
+        db.get(Document, "content-2").content_fingerprint = ""
         db.commit()
         settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
         instance = service.run_review(db, settings, "content-2", "test")
@@ -135,6 +137,7 @@ def test_genre_demotes_document_rules_to_advisory(monkeypatch):
         if not db.get(Document, "content-3"):
             db.add(Document(node_id="content-3", workspace_id="content-ws", name="登录流程测试用例.docx",
                             extension="docx", file_class="document"))
+        db.get(Document, "content-3").content_fingerprint = ""
         db.commit()
         settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
         instance = service.run_review(db, settings, "content-3", "test")
@@ -164,7 +167,39 @@ def test_run_review_uses_extracted_content(monkeypatch):
         if not db.get(Document, "content-1"):
             db.add(Document(node_id="content-1", workspace_id="content-ws", name="抽取测试_V1.0.docx",
                             extension="docx", file_class="document"))
+        db.get(Document, "content-1").content_fingerprint = ""
         db.commit()
         instance = run_review(db, get_settings(), "content-1", "test")
         assert instance.review_scope == "full_content"
         assert instance.content_fingerprint  # sha256 of the ephemeral body
+
+
+def test_fingerprint_dedup_skips_unchanged_content(monkeypatch):
+    """指纹去重（2026-08-14 拍板）：正文与上次评审逐字节一致的自动重评直接
+    跳过（不出分不推送）；手动重评永不跳过。"""
+    import app.content as content_module
+    from app import service
+    from app.db import ReviewInstance
+
+    async def fake_fetch(settings, doc):
+        return ("固定不变的正文内容。", "storage_download")
+
+    monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)
+    init_db()
+    with SessionLocal() as db:
+        if not db.get(Workspace, "content-ws"):
+            db.add(Workspace(workspace_id="content-ws", name="抽取测试库"))
+        db.query(ReviewInstance).filter(ReviewInstance.node_id == "content-fp").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "content-fp").delete(synchronize_session=False)
+        db.add(Document(node_id="content-fp", workspace_id="content-ws", name="指纹去重_V1.0.docx",
+                        extension="docx", file_class="document"))
+        db.commit()
+        first = service.run_review(db, get_settings(), "content-fp", "audit")
+        assert first is not None and first.content_fingerprint
+        second = service.run_review(db, get_settings(), "content-fp", "modify_merged")
+        assert second is None  # 假修改：正文没变，不重复出分
+        manual = service.run_review(db, get_settings(), "content-fp", "manual_rerun")
+        assert manual is not None  # 人为明确意图永不跳过
+        db.query(ReviewInstance).filter(ReviewInstance.node_id == "content-fp").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "content-fp").delete(synchronize_session=False)
+        db.commit()
