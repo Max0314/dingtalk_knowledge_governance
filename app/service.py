@@ -110,7 +110,7 @@ class ContentUnavailableError(RuntimeError):
     不评审、不推送，任务以 skipped + 原因落日志。异常消息即原因码。"""
 
 
-def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual") -> ReviewInstance | None:
+def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual_rerun") -> ReviewInstance | None:
     """返回 None 表示"正文与上次评审逐字节一致，本次跳过"（重命名后保存、
     格式化重存等假修改不重复出分/推送）；手动重评永不跳过。
 

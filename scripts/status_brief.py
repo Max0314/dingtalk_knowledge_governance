@@ -17,7 +17,13 @@ from sqlalchemy import func, select
 from app.config import get_settings
 from app.db import (AuditState, BridgeWalk, Document, FileAuditEvent, Notification, ReviewInstance, ReviewJob,
                     SessionLocal, SyncRun, WatchPlan, Workspace, init_db, utcnow)
+from app.fileclass import review_classes
 from app.service import current_scan_due
+
+
+def _storage_key_review_classes(configured: str) -> set[str]:
+    """Reviewable classes whose body adapter requires a numeric storage key."""
+    return review_classes(configured) - {"native_doc"}
 
 
 def main() -> None:
@@ -68,12 +74,12 @@ def main() -> None:
         week_ago = utcnow() - timedelta(days=7)
         from sqlalchemy import or_ as sa_or
 
-        from app.fileclass import review_classes
         # 无键新增文档：只统计"应当有键"的对象——上线时刻之后创建/修改、
-        # 可评审文件类型、非机器人（否则重种存量/图片/机器人同步全是假阳性）
+        # 可评审上传文件、非机器人。原生 .adoc 按设计用 node id 导出正文，
+        # 永远没有数字下载键，不能计入欠账。
         no_key_conds = [Document.is_folder.is_(False), Document.is_deleted.is_(False),
                         Document.storage_dentry_id == "", Document.discovered_at >= week_ago,
-                        Document.file_class.in_(sorted(review_classes(settings.review_classes)))]
+                        Document.file_class.in_(sorted(_storage_key_review_classes(settings.review_classes)))]
         for prefix in (p.strip() for p in settings.robot_name_prefixes.split(",") if p.strip()):
             no_key_conds.append(~Document.uploader_name.like(f"{prefix}%"))
         robot_ids = [t.strip() for t in settings.robot_user_ids.split(",") if t.strip()]

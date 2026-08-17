@@ -237,9 +237,17 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     if doc is None:
         doc = Document(node_id=node["node_id"], workspace_id=workspace_id, name=node.get("name") or "")
         db.add(doc)
-    for field in ("name", "category", "extension", "url"):
+    for field in ("name", "category", "url"):
         if node.get(field):
             setattr(doc, field, node[field])
+    # batchQuery normally carries extension, but the audit trail is the
+    # authoritative fallback for the confirmed event. This matters most for
+    # native .adoc nodes: without the fallback they would be classified as
+    # "other", assigned the wrong body-adapter semantics and silently miss
+    # review. Preserve a known mirror extension before trusting the fallback.
+    extension = node.get("extension") or doc.extension or event.extension
+    if extension:
+        doc.extension = extension
     doc.size = node.get("size") or doc.size or 0
     doc.source_created_at = node.get("created_at") or doc.source_created_at or ""
     doc.source_updated_at = node.get("updated_at") or doc.source_updated_at or ""

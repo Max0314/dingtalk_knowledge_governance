@@ -16,7 +16,8 @@ from __future__ import annotations
 import io
 import re
 import zipfile
-from xml.etree import ElementTree
+
+from defusedxml import ElementTree
 
 from .config import Settings
 from .db import Document

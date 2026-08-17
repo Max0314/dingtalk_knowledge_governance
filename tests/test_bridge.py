@@ -1310,9 +1310,10 @@ def test_confirmed_non_digit_biz_becomes_dead_letter_not_done(env, monkeypatch):
         db.commit()
 
 
-def test_native_adoc_needs_no_numeric_key_and_enters_review(env, monkeypatch):
+def test_native_adoc_uses_audit_extension_fallback_and_enters_review(env, monkeypatch):
     """Native DingTalk documents are body-ready by node id: a non-numeric audit
-    bizId must not turn a valid .adoc event into a storage-key dead letter."""
+    bizId must not turn a valid .adoc event into a storage-key dead letter. The
+    audit extension also covers an occasionally sparse batchQuery payload."""
     import time as time_module
 
     settings, walks, _ = env
@@ -1327,7 +1328,7 @@ def test_native_adoc_needs_no_numeric_key_and_enters_review(env, monkeypatch):
 
         async def batch_query_wiki_nodes(self, node_ids, operator_id):
             return [{"name": "在线方案.adoc", "workspace_id": WS, "node_id": "adoc-native-1",
-                     "extension": "adoc", "created_at": gmt_iso(now_ms)}]
+                     "created_at": gmt_iso(now_ms)}]  # extension intentionally absent
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", NativeDocSearch)
     org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})

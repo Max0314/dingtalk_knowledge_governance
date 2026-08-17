@@ -59,6 +59,19 @@ def test_office_extraction_rejects_oversized_uncompressed_xml(monkeypatch):
     assert extract_text("docx", data) == ""
 
 
+def test_sheet_and_slide_extraction_reject_dtd_entities():
+    payloads = {
+        "xlsx": {"xl/worksheets/sheet1.xml":
+                 "<!DOCTYPE worksheet [<!ENTITY secret 'expanded'>]>"
+                 "<worksheet xmlns='http://x'><t>&secret;</t></worksheet>"},
+        "pptx": {"ppt/slides/slide1.xml":
+                 "<!DOCTYPE p:sld [<!ENTITY secret 'expanded'>]>"
+                 "<p:sld xmlns:a='http://a' xmlns:p='http://p'><a:t>&secret;</a:t></p:sld>"},
+    }
+    for extension, entries in payloads.items():
+        assert extract_text(extension, zip_bytes(entries)) == ""
+
+
 def test_sheet_class_uses_reduced_rule_subset():
     from app.scoring import score_document
 

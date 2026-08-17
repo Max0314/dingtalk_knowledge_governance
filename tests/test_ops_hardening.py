@@ -453,3 +453,71 @@ def test_dependency_credential_log_filter_blocks_info_only():
     app_info = logging.LogRecord("kg.worker", logging.INFO, __file__, 1, "summary", (), None)
     assert guard.filter(http_info) is False and guard.filter(stream_info) is False
     assert guard.filter(http_warning) is True and guard.filter(app_info) is True
+
+
+def test_storage_key_metric_excludes_native_documents():
+    from scripts.status_brief import _storage_key_review_classes
+
+    classes = _storage_key_review_classes("")
+    assert "native_doc" not in classes
+    assert {"document", "sheet", "slide", "text"} <= classes
+
+
+def test_run_review_once_uses_current_trigger_and_structured_results(monkeypatch, capsys):
+    import json
+    import sys
+    from types import SimpleNamespace
+
+    from app.service import ContentUnavailableError
+    from scripts import run_review_once
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    monkeypatch.setattr(run_review_once, "init_db", lambda: None)
+    monkeypatch.setattr(run_review_once, "SessionLocal", FakeSession)
+    monkeypatch.setattr(run_review_once, "get_settings", lambda: object())
+    triggers = []
+
+    def fake_review(db, settings, node_id, trigger):
+        triggers.append(trigger)
+        return SimpleNamespace(
+            review_instance_id="review-1", node_id=node_id, ai_score=88,
+            verdict="pass", review_scope="full_content", rule_version="V1.1",
+            model_config_version="rule-engine", content_fingerprint="abcdef1234567890",
+            dimensions={}, findings=[],
+        )
+
+    monkeypatch.setattr(run_review_once, "run_review", fake_review)
+    monkeypatch.setattr(sys, "argv", ["run_review_once.py", "node-1"])
+    assert run_review_once.main() == 0
+    succeeded = json.loads(capsys.readouterr().out)
+    assert triggers == ["manual_rerun"] and succeeded["status"] == "succeeded"
+
+    monkeypatch.setattr(run_review_once, "run_review", lambda *args: None)
+    assert run_review_once.main() == 0
+    unchanged = json.loads(capsys.readouterr().out)
+    assert unchanged == {"status": "skipped", "node_id": "node-1",
+                         "error_code": "content_unchanged"}
+
+    def no_content(*args):
+        raise ContentUnavailableError("fetch_failed:dingtalk_adoc_export_timeout")
+
+    monkeypatch.setattr(run_review_once, "run_review", no_content)
+    assert run_review_once.main() == 0
+    unavailable = json.loads(capsys.readouterr().out)
+    assert unavailable["status"] == "skipped"
+    assert unavailable["error_code"] == "content_unavailable:fetch_failed:dingtalk_adoc_export_timeout"
+
+    def failed_init():
+        raise RuntimeError("mysql://secret-that-must-not-leak")
+
+    monkeypatch.setattr(run_review_once, "init_db", failed_init)
+    assert run_review_once.main() == 1
+    failed = capsys.readouterr().out
+    assert json.loads(failed)["error_code"] == "review_execution_failed"
+    assert "secret-that-must-not-leak" not in failed
