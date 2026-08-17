@@ -58,6 +58,8 @@ def test_baseline_endpoints_and_notification_outbox():
             instance = db.query(ReviewInstance).filter(ReviewInstance.node_id == doc.node_id).first()
             settings = get_settings().model_copy(update={"notify_enabled": True})
             instance.verdict = "return"
+            # 2026-08-17 拍板后只有拿到正文的评审才推送；样本按完整评审模拟
+            instance.review_scope = "full_content"
             row = enqueue_review_notification(db, settings, doc, instance)
             assert row is not None and row.target_union_id == doc.uploader_key
             db.rollback()

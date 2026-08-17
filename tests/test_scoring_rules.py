@@ -78,7 +78,7 @@ def test_rules_api_crud_and_review_resolution():
 
             # demo-001 的上传人部门是研发中心 -> 命中部门配置；版本随两次保存为 v2
             with SessionLocal() as db:
-                instance = run_review(db, get_settings(), "demo-001", "rules_test")
+                instance = run_review(db, get_settings(), "demo-001", "manual_rerun")
                 assert instance.rule_config_ref == "department:研发中心@v2"
                 db.query(ReviewInstance).filter(ReviewInstance.review_instance_id == instance.review_instance_id).delete()
                 db.commit()
@@ -96,7 +96,7 @@ def test_rules_api_crud_and_review_resolution():
             deleted = client.delete("/api/v1/scoring-rules/departments/研发中心").json()
             assert deleted["fallback"] == "global"
             with SessionLocal() as db:
-                instance = run_review(db, get_settings(), "demo-001", "rules_test")
+                instance = run_review(db, get_settings(), "demo-001", "manual_rerun")
                 assert instance.rule_config_ref == "global@v1"
                 db.query(ReviewInstance).filter(ReviewInstance.review_instance_id == instance.review_instance_id).delete()
                 db.commit()

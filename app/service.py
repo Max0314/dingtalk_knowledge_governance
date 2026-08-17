@@ -105,9 +105,18 @@ def rule_config_ref(row: ScoringRuleConfig | None) -> str:
     return f"department:{row.department_name}@v{row.version}" if row.scope == "department" else f"global@v{row.version}"
 
 
+class ContentUnavailableError(RuntimeError):
+    """拿不到正文（无下载键/格式不可解析/下载失败等）：2026-08-17 拍板
+    不评审、不推送，任务以 skipped + 原因落日志。异常消息即原因码。"""
+
+
 def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "manual") -> ReviewInstance | None:
     """返回 None 表示"正文与上次评审逐字节一致，本次跳过"（重命名后保存、
-    格式化重存等假修改不重复出分/推送）；手动重评永不跳过。"""
+    格式化重存等假修改不重复出分/推送）；手动重评永不跳过。
+
+    拿不到正文抛 ContentUnavailableError（2026-08-17 拍板：初检分数只反映
+    命名不反映内容，宁缺毋滥）；手动重评/演示种子是明确的人为意图，保留
+    元数据评审能力。"""
     from .content import fetch_document_content
 
     doc = db.get(Document, node_id)
@@ -132,6 +141,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
         scope = "full_content" if content else "metadata_only"
         if content:
             content_note = ""  # 正文拿到了，原因字段只服务于 metadata_only 的可观测性
+    if not doc.is_folder and not content and trigger not in ("manual_rerun", "demo_seed"):
+        raise ContentUnavailableError(content_note or "empty")
     if content and trigger != "manual_rerun":
         fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()
         if fingerprint == (doc.content_fingerprint or ""):
@@ -215,6 +226,10 @@ def process_next_job(db: Session, settings: Settings) -> bool:
             job.status, job.error_code, job.finished_at = "skipped", "content_unchanged", utcnow()
         else:
             job.status, job.result_review_instance_id, job.finished_at = "succeeded", review.review_instance_id, utcnow()
+    except ContentUnavailableError as exc:
+        # 拿不到正文：不评审不推送，留痕即可（2026-08-17 拍板）。下次该文档
+        # 有新事件（上传/修改）会自然重新触发。
+        job.status, job.error_code, job.finished_at = "skipped", f"content_unavailable:{exc}"[:64], utcnow()
     except KeyError:
         job.status, job.error_code, job.finished_at = "failed", "document_not_found", utcnow()
     except Exception:

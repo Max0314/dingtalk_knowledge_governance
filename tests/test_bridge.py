@@ -1012,7 +1012,7 @@ def test_notify_department_allowlist():
     from app import notify as notify_module
 
     low = SimpleNamespace(review_instance_id="ri-dept", ai_score=50.0, verdict="return",
-                          review_scope="metadata_only", rule_version="V1.1", findings=[])
+                          review_scope="full_content", rule_version="V1.1", findings=[])
     doc_in = SimpleNamespace(node_id="dept-1", workspace_id="ws-x", uploader_key="u-1",
                              name="a.docx", department_name="AI应用研发部")
     doc_out = SimpleNamespace(node_id="dept-2", workspace_id="ws-x", uploader_key="u-2",
@@ -1045,7 +1045,7 @@ def test_fileclass_and_notify_guardrails():
     with SessionLocal() as db:
         doc = Document(node_id="bridge-notify", workspace_id=WS, name="x.docx", uploader_key="u1")
         instance = ReviewInstance(review_instance_id="ri-guard", node_id="bridge-notify", ai_score=50,
-                                  verdict="return", review_scope="metadata_only")
+                                  verdict="return", review_scope="full_content")
         settings = get_settings().model_copy(update={"notify_enabled": True, "notify_workspaces": "other-ws"})
         row = enqueue_review_notification(db, settings, doc, instance)
         assert row.status == "skipped" and row.error_code == "workspace_not_allowlisted"

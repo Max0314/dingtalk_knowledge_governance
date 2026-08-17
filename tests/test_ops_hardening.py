@@ -332,19 +332,60 @@ def test_workspaces_api_hides_inactive():
         db.commit()
 
 
-def test_review_records_content_note():
-    from app.service import run_review
+def test_no_content_review_skips_with_reason():
+    """2026-08-17 拍板：拿不到正文不评审、不推送——任务 skipped 带
+    content_unavailable:* 原因落日志；手动重评是明确人为意图，保留
+    元数据评审能力（但仍不推送）。"""
+    import pytest
+
+    from app import service
+    from app.db import ReviewJob
 
     init_db()
     with SessionLocal() as db:
         _ensure_demo_workspace(db)
+        db.query(ReviewJob).filter(ReviewJob.node_id == "note-doc").delete(synchronize_session=False)
+        db.query(ReviewInstance).filter(ReviewInstance.node_id == "note-doc").delete(synchronize_session=False)
         db.merge(Document(node_id="note-doc", workspace_id="demo-workspace", name="正文原因_V1.0.docx",
-                          extension="docx", uploader_name="张三", department_name="研发中心"))
+                          extension="docx", uploader_name="张三", department_name="研发中心",
+                          file_class="document"))
         db.commit()
-        instance = run_review(db, get_settings(), "note-doc", trigger="test")
-        assert instance.review_scope == "metadata_only"
-        # 本地无存储配置：原因应被记录而不是丢弃
-        assert instance.content_note in {"disabled", "no_numeric_id", "unsupported"}
-        db.delete(db.get(ReviewInstance, instance.review_instance_id))
-        db.delete(db.get(Document, "note-doc"))
+        with pytest.raises(service.ContentUnavailableError):
+            service.run_review(db, get_settings(), "note-doc", trigger="audit")
+        assert db.scalars(select(ReviewInstance).where(ReviewInstance.node_id == "note-doc")).all() == []
+        # 任务执行层：同样的失败映射成 skipped + 原因码
+        db.add(ReviewJob(job_id="nc-job-1", node_id="note-doc", trigger="audit", status="pending"))
         db.commit()
+        for _ in range(50):  # 共享库可能有别的残留任务排在前面，逐个沥干
+            job = db.get(ReviewJob, "nc-job-1")
+            if job.status != "pending" or not service.process_next_job(db, get_settings()):
+                break
+        job = db.get(ReviewJob, "nc-job-1")
+        assert job.status == "skipped" and job.error_code.startswith("content_unavailable")
+        # 手动重评：出元数据实例（原因照记），但不会推送
+        manual = service.run_review(db, get_settings(), "note-doc", trigger="manual_rerun")
+        assert manual is not None and manual.review_scope == "metadata_only"
+        assert manual.content_note in {"disabled", "no_numeric_id", "unsupported"}
+        db.query(ReviewJob).filter(ReviewJob.node_id == "note-doc").delete(synchronize_session=False)
+        db.query(ReviewInstance).filter(ReviewInstance.node_id == "note-doc").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "note-doc").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_metadata_only_instance_never_pushes():
+    from types import SimpleNamespace
+
+    from app import notify as notify_module
+
+    init_db()
+    with SessionLocal() as db:
+        doc = SimpleNamespace(node_id="nopush-1", workspace_id="ws-x", uploader_key="u-1",
+                              name="无正文.docx", department_name="AI应用研发部")
+        partial = SimpleNamespace(review_instance_id="ri-nopush", ai_score=88.0, verdict="pass",
+                                  review_scope="metadata_only", rule_version="V1.1", findings=[])
+        settings = get_settings().model_copy(update={"notify_enabled": True, "notify_workspaces": "",
+                                                     "notify_departments": "", "notify_on_pass": True})
+        row = notify_module.enqueue_review_notification(db, settings, doc, partial)
+        db.flush()
+        assert row is not None and row.status == "skipped" and row.error_code == "no_content_not_pushed"
+        db.rollback()

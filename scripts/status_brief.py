@@ -140,6 +140,12 @@ def main() -> None:
             "total": db.scalar(select(func.count()).select_from(ReviewInstance)) or 0,
             "last_24h": db.scalar(select(func.count()).select_from(ReviewInstance)
                                   .where(ReviewInstance.created_at >= day_ago)) or 0,
+            # 拿不到正文而放弃的评审（2026-08-17 拍板：不评不推只留痕）
+            "skipped_no_content_24h": db.scalar(
+                select(func.count()).select_from(ReviewJob)
+                .where(ReviewJob.status == "skipped",
+                       ReviewJob.error_code.like("content_unavailable%"),
+                       ReviewJob.created_at >= day_ago)) or 0,
             "latest": [{"score": r.ai_score, "verdict": r.verdict, "scope": r.review_scope,
                         "at": r.created_at.isoformat(timespec="seconds")}
                        for r in db.scalars(select(ReviewInstance)

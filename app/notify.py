@@ -162,6 +162,14 @@ def enqueue_review_notification(db: Session, settings: Settings, doc: Document, 
     """Queue a push for a finished review. Caller commits."""
     if not settings.notify_enabled:
         return None
+    if getattr(instance, "review_scope", "") != "full_content":
+        # 2026-08-17 拍板：拿不到正文不推送——初检推送整体下线（手动重评产生
+        # 的 metadata_only 实例同样只留痕不打扰）。
+        notification = Notification(node_id=doc.node_id,
+                                    review_instance_id=getattr(instance, "review_instance_id", "") or "",
+                                    status="skipped", error_code="no_content_not_pushed")
+        db.add(notification)
+        return notification
     prev = _prev_instance(db, doc.node_id, instance)
     decision, mode = _notify_decision(db, settings, doc.node_id, instance, prev)
     if decision == "silent":
