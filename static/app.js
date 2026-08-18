@@ -3,6 +3,10 @@
 /* 导航中断：换页时作废上一页仍在飞的请求。快速连点原先会让每一页都跑完
    自己的接口，且先点的那页响应回来得晚就把后点的页面整个覆盖掉——看起来
    就是"点了没反应，然后跳回去了"。 */
+const aborted=e=>e&&(e.name==='AbortError'||e.code===20);
+const optional=(promise,fallback=null)=>promise.catch(e=>{if(aborted(e))throw e;return fallback});
+function ensureCurrentNav(controller){if(controller&&(controller!==navAbort||controller.signal.aborted)){
+  const e=new Error('Navigation aborted');e.name='AbortError';throw e}}
 let navAbort=null;
 const api=(url,options={})=>fetch(url.replace(/^\//,''),{signal:navAbort&&navAbort.signal,headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));
   if(r.status===401){renderLogin();throw new Error(data.detail?.message||'请先登录')}
@@ -76,9 +80,13 @@ function bindDocRows(){document.querySelectorAll('[data-doc]').forEach(x=>x.oncl
 
 /* ---- views ---- */
 async function overview(){
+  const controller=navAbort;
   /* index.html 里的首屏预取只兑现一次；之后回到本页走正常请求。 */
   let d=null;if(window.__boot){d=await window.__boot;window.__boot=null}
   if(!d)d=await api('/api/v1/dashboard/overview');
+  /* head 里的预取早于 AbortController 创建，无法真正 cancel；至少
+     不允许它在用户已切到别页后回来覆盖当前 DOM。 */
+  ensureCurrentNav(controller);
   const org=d.org_context||{};
   document.querySelector('#scopePill').textContent=`已登记 ${d.metrics.workspace_count} 库`;
   shell('知识库总览','公司知识库全景：规模、增量与文档质量。月份按钉钉 createTime（Asia/Shanghai）归属。',`
@@ -119,13 +127,15 @@ async function renderOverviewTrend(){const title=document.querySelector('#trendT
   }catch(e){toast(e.message);state.ovDay='';renderOverviewTrend()}}
 
 async function increments(){
+  const controller=navAbort;
   const st=state.inc=state.inc||{year:'',month:'',fDept:'',fGroup:'',fPerson:'',orgDept:'',orgGroup:'',orgPerson:null,orgQ:'',excl:true};
   if(state.incPreset){Object.assign(st,state.incPreset);state.incPreset=null}
   const [d,meta]=await Promise.all([
     api('/api/v1/metrics/monthly-increments'),
-    api('/api/v1/metrics/uploaders/months').catch(()=>null)]);
+    optional(api('/api/v1/metrics/uploaders/months'))]);
   st.latestYear=meta&&meta.months&&meta.months.length?meta.months[meta.months.length-1].month.slice(0,4):String(new Date().getFullYear());
   const sum=k=>d.rows.reduce((a,r)=>a+r[k],0);
+  ensureCurrentNav(controller);
   shell('数据看板',d.metric_note,`
   <div class="grid metrics">
     ${statCard('全量新增',nf(sum('total')),'全部观测月份合计')}
@@ -195,7 +205,7 @@ function fillIncDatalists(){const st=state.inc,org=st&&st._org;if(!org)return;
 
 async function renderOrgSection(){const st=state.inc,card=document.querySelector('#orgCard');if(!card)return;
   const orgYear=st.month?'':(st.year||st.latestYear);
-  const org=await api('/api/v1/metrics/org?'+new URLSearchParams({year:orgYear,month:st.month||''})).catch(()=>({items:[]}));
+  const org=await optional(api('/api/v1/metrics/org?'+new URLSearchParams({year:orgYear,month:st.month||''})),{items:[]});
   if(!document.querySelector('#orgCard'))return;
   st._org=org.items||[];fillIncDatalists();
   const periodLabel=st.month||((st.year||st.latestYear)+' 全年');
@@ -225,7 +235,7 @@ async function renderOrgSection(){const st=state.inc,card=document.querySelector
 
 async function loadOrgEntity(kind,name,year,month){const panel=document.querySelector('#personPanel');if(!panel||!name)return;
   const params=new URLSearchParams({year:month?'':year,month:month||''});params.set(kind,name);
-  const tree=await api('/api/v1/metrics/increments/tree?'+params).catch(()=>null);
+  const tree=await optional(api('/api/v1/metrics/increments/tree?'+params));
   if(!document.querySelector('#personPanel'))return;
   if(!tree){panel.innerHTML='<h2>分布明细</h2><div class="empty">加载失败</div>';return}
   const label=month||(year+' 全年');const unit=tree.level==='day'?'日':'月';
@@ -271,7 +281,9 @@ async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p
   const d=await api('/api/v1/files?'+qs);state._filesLast=d;renderFilesBox(d)}
 
 async function documents(){
+  const controller=navAbort;
   state.bl={query:'',ws:'',dept:'',up:'',offset:0};
+  ensureCurrentNav(controller);
   shell('文档列表','基线快照与实时增量合并去重后的全部文档，默认展示最新入库；可按知识库、归属部门、上传人、文件名过滤，有评审的行可点击查看详情。',`
   <section class="card"><div class="card-head"><h2>全部文档（<span id="fl-total">…</span>）</h2><div class="controls" style="flex-wrap:wrap;gap:8px">
     <select class="input" id="bl-ws"><option value="">全部知识库</option></select>
@@ -308,8 +320,9 @@ async function loadDeptOptions(sel){try{
   el.value=cur
 }catch(e){}}
 
-async function reviews(state_={verdict:'',query:'',dept:'',up:'',offset:0}){const qs=new URLSearchParams({verdict:state_.verdict,query:state_.query,department:state_.dept||'',uploader:state_.up||'',offset:state_.offset,limit:50});
+async function reviews(state_={verdict:'',query:'',dept:'',up:'',offset:0}){const controller=navAbort;const qs=new URLSearchParams({verdict:state_.verdict,query:state_.query,department:state_.dept||'',uploader:state_.up||'',offset:state_.offset,limit:50});
   const d=await api('/api/v1/reviews?'+qs);
+  ensureCurrentNav(controller);
   shell('评审记录','全部 AI 评审实例；实例不可变，重评产生新记录。分数为建议，最终结论由审核员保存。',`
   <section class="card"><div class="card-head"><div class="controls" style="flex-wrap:wrap;gap:8px">
     <select class="input" id="rv-verdict"><option value="">全部结论</option><option value="pass" ${state_.verdict==='pass'?'selected':''}>通过</option><option value="manual_review" ${state_.verdict==='manual_review'?'selected':''}>待人工审核</option><option value="return" ${state_.verdict==='return'?'selected':''}>退回</option></select>
@@ -332,7 +345,7 @@ async function reviews(state_={verdict:'',query:'',dept:'',up:'',offset:0}){cons
   if(pv)pv.onclick=()=>reviews({...state_,offset:Math.max(0,state_.offset-50)});
   if(nx)nx.onclick=()=>reviews({...state_,offset:state_.offset+50})}
 
-async function documentDetail(id){const d=await api('/api/v1/documents/'+id);const r=d.latest_review;
+async function documentDetail(id){const controller=navAbort;const d=await api('/api/v1/documents/'+id);const r=d.latest_review;
   const allDims=r?r.dimensions:{};const model=allDims.model;const ruleDims=Object.entries(allDims).filter(([k])=>k!=='model').map(([,v])=>v);
   const dualBanner=model?`<section class="card section-gap"><div class="card-head"><h2>综合评分构成</h2><span class="chip">文体：${model.genre||'未判定'}</span></div>
     <div class="detail-meta" style="font-size:15px;flex-wrap:wrap;gap:18px">
@@ -345,6 +358,7 @@ async function documentDetail(id){const d=await api('/api/v1/documents/'+id);con
     ${model.model_dimensions&&Object.keys(model.model_dimensions).length?`<div class="controls" style="flex-wrap:wrap;gap:8px;margin-top:10px">${Object.entries(model.model_dimensions).map(([k,v])=>`<span class="chip">${k} ${v}</span>`).join('')}</div>`:''}
     ${model.findings&&model.findings.length?`<ul style="margin-top:10px">${model.findings.map(f=>`<li>${f.message}</li>`).join('')}</ul>`:''}
   </section>`:'';
+  ensureCurrentNav(controller);
   shell('评审详情','AI 分数为建议；最终结论由知识库审核员保存。',`
   <section class="card"><div class="detail-header"><div class="document-icon">▤</div><div><h2 style="margin:0">${d.name}</h2><p class="sub">节点 ${d.node_id} · 知识库 ${state.coverageNames[d.workspace_id]||d.workspace_id}</p><div class="detail-meta"><span>上传人：${fmt(d.uploader_name)}</span><span>入库时间：${fmt(d.source_created_at)}</span><span>归属：${fmt(d.department_name)} / ${fmt(d.biz_group_name)}</span><span>重评次数：${d.rerun_count}</span></div></div><div class="big-score">${r&&r.ai_score>0?r.ai_score:'—'}<span>/100</span><br><small>${r?verdictText(r.verdict):'未评审'}</small></div></div></section>
   ${dualBanner}
@@ -355,6 +369,7 @@ async function documentDetail(id){const d=await api('/api/v1/documents/'+id);con
   document.querySelector('#rerun').onclick=async()=>{const j=await api('/api/v1/documents/'+id+'/reviews',{method:'POST',body:JSON.stringify({trigger:'manual_rerun'})});toast('已提交评审任务 '+j.job_id.slice(0,8))}}
 
 async function workspaces(){
+  const controller=navAbort;
   state.wsReg=state.wsReg||{query:'',level:'',department:'',creator:'',admin:'',offset:0};const p=state.wsReg;
   const qs=new URLSearchParams({query:p.query,level:p.level==='其他'?'':p.level,department:p.department,creator:p.creator,admin:p.admin,offset:p.offset,limit:50});
   if(p.level==='其他')qs.set('level','其他');
@@ -362,6 +377,7 @@ async function workspaces(){
   const s=reg.summary||{visible_workspaces:reg.total,scanned:'—',empty:'—',excluded:'—'},org=reg.org_context||{};
   const facet=Object.fromEntries((reg.levels||[]).map(l=>[l.level,l.count]));
   const tabs=[['','全部'],['C','C-公司级'],['D','D-部门级'],['P','P-项目级'],['I','I-个人级'],['其他','其他']];
+  ensureCurrentNav(controller);
   shell('知识库管理','公司知识库注册表：等级分类、搜索、筛选与分页；点击行查看月度分布与治理配置。',`
   <div class="grid metrics">
     ${statCard('注册知识库',reg.total_all??reg.total,`全公司约 ${org.org_total_knowledge_bases||'—'} 库`)}
@@ -432,9 +448,10 @@ async function gotoFolder(parent){const st=state.fold;if(!st)return;
     state.bl={query:'',ws:st.ws,offset:0}}
   catch(e){if(!aborted(e))toast(e.message)}}
 
-async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),api('/api/v1/workspaces/'+id).catch(()=>null),api('/api/v1/baseline/workspaces/'+id+'/folders').catch(()=>null)]);
-  try{await loadWorkspaceNames()}catch(e){}
+async function workspaceDetail(id){const controller=navAbort;const[m,g,fd]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),optional(api('/api/v1/workspaces/'+id)),optional(api('/api/v1/baseline/workspaces/'+id+'/folders'))]);
+  try{await loadWorkspaceNames()}catch(e){if(aborted(e))throw e}
   const name=state.coverageNames[id]||id;
+  ensureCurrentNav(controller);
   shell('知识库详情',name,`
   <section class="card"><div class="card-head"><h2>月度入库分布（基线 + 增量，共 ${nf(m.total_files)} 个文件）</h2><button class="secondary" id="back">返回</button></div><div id="wsChart" class="chart"></div></section>
   ${fd?'<section class="card section-gap" id="folderCard"><div class="empty loading">正在加载目录…</div></section>':''}
@@ -456,9 +473,10 @@ async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1
     await api('/api/v1/workspaces/'+id+'/governance',{method:'PATCH',body:JSON.stringify({owner_department_id:f.get('owner_department_id'),owner_department_name:f.get('owner_department_name'),owner_biz_group_name:f.get('owner_biz_group_name'),administrators:arr('administrators'),reviewers:arr('reviewers')})});toast('治理配置已保存')}}
 
 const MODEL_PRESETS=['qwen3.7-plus','qwen3.7-max','qwen3.6-plus','qwen3.6-flash','deepseek-v4-pro','deepseek-v4-flash','deepseek-v3.2','kimi-k2.7-code','kimi-k2.6','kimi-k2.5','glm-5.2','glm-5.1','glm-5','MiniMax-M2.5'];
-async function models(editing){const d=await api('/api/v1/model-configs');
+async function models(editing){const controller=navAbort;const d=await api('/api/v1/model-configs');
   const cur=editing?d.items.find(x=>x.id===editing):null;
   const f=cur||{name:'',provider:'openai_compatible',base_url:'',model_name:'',temperature:null,thinking_mode:'',timeout_seconds:60,enabled:false,version:'v1',has_key:false,api_key_masked:''};
+  ensureCurrentNav(controller);
   shell('模型配置',`评分规则 ${d.rule_version} · ${d.api_key_policy}`,`
   <div class="grid two-cols">
   <form class="card" id="model-form"><div class="card-head"><h2>${cur?'编辑：'+cur.name:'新建模型配置'}</h2>${cur?'<button type="button" class="secondary" id="cancel-edit">取消编辑</button>':''}</div>
@@ -499,7 +517,8 @@ async function models(editing){const d=await api('/api/v1/model-configs');
     document.querySelectorAll('[data-rb]').forEach(r=>r.onclick=async()=>{if(!confirm('回滚到该历史版本？当前状态会先留档。'))return;
       await api('/api/v1/model-configs/'+r.dataset.cfg+'/rollback/'+r.dataset.rb,{method:'POST'});toast('已回滚');models()})})}
 
-async function diagnostics(){const[d,n,sr]=await Promise.all([api('/api/v1/diagnostics/connectivity'),api('/api/v1/notifications?limit=10').catch(()=>null),api('/api/v1/diagnostics/sync-runs?status=failed').catch(()=>null)]);
+async function diagnostics(){const controller=navAbort;const[d,n,sr]=await Promise.all([api('/api/v1/diagnostics/connectivity'),optional(api('/api/v1/notifications?limit=10')),optional(api('/api/v1/diagnostics/sync-runs?status=failed'))]);
+  ensureCurrentNav(controller);
   shell('连接诊断',d.body_storage,`
   <section class="card"><h2>外部接口状态</h2>${d.items.map(x=>`<div class="diagnostic"><span class="health ${x.status}"></span><div><b>${x.name}</b><br><small>${x.status}</small></div><span class="message">${x.message}</span></div>`).join('')}<div class="section-gap"><button class="primary" id="refresh">刷新诊断</button></div></section>
   ${sr&&sr.items&&sr.items.length?`<section class="card section-gap"><div class="card-head"><h2>最近监控异常</h2><span class="hint">近 30 条运行里的失败记录，含所属知识库与异常详情</span></div>
@@ -538,7 +557,7 @@ function rcDimsHtml(cat,cfg,canEdit){const dis=canEdit?'':'disabled';
       <td>${r.params.length?r.params.map(p=>`<label class="rc-par">${p.label}<input class="input rc-num" type="number" min="${p.min}" max="${p.max}" data-par="${dm.key}|${r.key}|${p.key}" value="${(rc.params||{})[p.key]??p.default}" ${dis}></label>`).join(' '):'—'}</td></tr>`}).join('')}
     </tbody></table></div></section>`}).join('')}
 
-async function rules(){const d=await api('/api/v1/scoring-rules');
+async function rules(){const controller=navAbort;const d=await api('/api/v1/scoring-rules');
   const st=state.rc=state.rc||{dept:''};
   if(st.dept&&!d.departments.find(x=>x.department_name===st.dept))st.dept='';
   const perm=d.permissions,cur=st.dept?d.departments.find(x=>x.department_name===st.dept):d.global;
@@ -549,6 +568,7 @@ async function rules(){const d=await api('/api/v1/scoring-rules');
   const addBox=perm.is_admin?`<input class="input" id="rc-newdept" list="rc-cands" placeholder="部门名称（bi_center 口径）" style="width:190px"><datalist id="rc-cands">${d.department_candidates.filter(n=>!d.departments.find(x=>x.department_name===n)).map(n=>`<option value="${n}">`).join('')}</datalist><button class="secondary" id="rc-adddept">＋ 新建部门规则</button>`:'';
   const metaLine=cur.config_id?`当前版本 v${cur.version} · 最近由 ${cur.updated_by||'—'} 于 ${(cur.updated_at||'').replace('T',' ').slice(0,16)} 修改`:'尚未保存过：当前生效的是内置 V1.1 默认参数';
   const editorsBox=st.dept?`<div class="controls" style="flex-wrap:wrap;gap:8px;margin-top:10px"><span class="field-label">规则维护人</span>${perm.is_admin?`<input class="input" id="rc-editors" style="flex:1;min-width:260px" placeholder="unionId:姓名, unionId:姓名（逗号分隔）" value="${(cur.editors||[]).map(e=>e.union_id+(e.name?':'+e.name:'')).join(', ')}"><button class="secondary" id="rc-editors-save">保存维护人</button>`:`<span class="hint">${(cur.editors||[]).map(e=>e.name||e.union_id).join('、')||'未指定（仅全局管理员可修改本部门规则）'}</span>`}</div>`:'';
+  ensureCurrentNav(controller);
   shell('评分规则配置',d.match_note,`
   <section class="card"><div class="controls" style="flex-wrap:wrap;gap:8px">${chips}<span style="flex:1"></span>${addBox}</div></section>
   <section class="card section-gap"><div class="card-head"><h2>${st.dept?st.dept+' · 部门规则':'全局默认规则'}</h2><div class="controls" style="flex-wrap:wrap;gap:8px">
@@ -623,7 +643,6 @@ function routeOf(hash){const h=(hash||'').replace(/^#\/?/,'');const i=h.indexOf(
   if(head==='ws'&&rest)return{view:'workspaces',run:()=>workspaceDetail(rest)};
   if(views[head])return{view:head,run:views[head]};
   return{view:'overview',run:overview}}
-const aborted=e=>e&&(e.name==='AbortError'||e.code===20);
 /* 页面骨架：点击导航后立刻有反馈，不再停在上一页直到接口返回；高度也和
    真实内容接近，落地时不会再把页面顶一下。 */
 function pageSkeleton(){disposeCharts();
