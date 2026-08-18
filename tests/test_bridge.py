@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app import audit_bridge
+from app.audit_pull import _filename_extension
 from app.config import get_settings
 from app.db import Document, FileAuditEvent, ReviewInstance, ReviewJob, SessionLocal, SpaceMap, Workspace, init_db
 from app.fileclass import classify, review_classes
@@ -46,7 +47,7 @@ def env(monkeypatch):
         stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
                      "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1", "old-touched",
                      "del-doc-1", "same-name-del", "rest-doc-1", "mod-doc-1", "own-doc-1", "nd-doc-1",
-                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1", "adoc-native-1"]
+                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1", "adoc-native-1", "bad-audit-ext"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
@@ -155,6 +156,65 @@ def test_snapshot_join_backfills_match(env):
 def locator_settings(settings):
     return settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op",
                                        "wiki_storage_space_id": "2932890480"})
+
+
+def test_audit_extension_prefers_filename_when_trail_metadata_is_wrong():
+    assert _filename_extension("工具领取明细.xlsx", "adoc") == "xlsx"
+    assert _filename_extension("无后缀在线文档", "adoc") == "adoc"
+
+
+def test_pre_cutover_event_is_retained_without_locator_or_review(env, monkeypatch):
+    """方案 A：修复前积压只留审计终态，绝不触发定位、入队或通知。"""
+    settings, walks, _ = env
+
+    class LocatorMustNotRun:
+        def __init__(self, _settings):
+            raise AssertionError("pre-cutover event must not call the locator")
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", LocatorMustNotRun)
+    add_event("99997000001", "修复前积压.docx", "99297", gmt=DEFAULT_GMT)
+    org = locator_settings(settings).model_copy(update={"audit_review_since": gmt_iso(DEFAULT_GMT + 1)})
+    summary = run_bridge(org)
+    assert summary["pre_cutover_not_reviewed"] == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99997000001"))
+        assert event.processed is True and event.resolution == "pre_cutover_not_reviewed"
+        assert event.matched_node_id == ""
+        assert db.scalars(select(ReviewJob).where(ReviewJob.node_id == "bridge-A")).all() == []
+
+
+def test_exact_fresh_node_confirms_despite_bad_audit_extension(env, monkeypatch):
+    """真实节点的精确文件名和创建时间比审计扩展名提示更可靠。"""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class BadExtensionSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert keyword == "误标格式的台账.xlsx"
+            return [{"dentry_uuid": "bad-audit-ext", "name": "误标格式的台账.xlsx"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "误标格式的台账.xlsx", "workspace_id": WS, "node_id": "bad-audit-ext",
+                     "extension": "xlsx", "size": 31114, "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", BadExtensionSearch)
+    add_event("99997000002", "误标格式的台账.xlsx", "99298", extension="adoc", gmt=now_ms)
+    summary = run_bridge(locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0}))
+    assert summary["confirmed"] == 1 and summary["extension_mismatch_confirmed"] == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99997000002"))
+        doc = db.get(Document, "bad-audit-ext")
+        assert event.processed is True and event.resolution == "done"
+        assert doc is not None and doc.extension == "xlsx" and doc.storage_dentry_id == "99997000002"
+        assert [job.trigger for job in db.scalars(select(ReviewJob).where(ReviewJob.node_id == doc.node_id)).all()] == ["audit"]
+        db.query(ReviewJob).filter(ReviewJob.node_id == doc.node_id).delete(synchronize_session=False)
+        db.delete(doc)
+        db.commit()
 
 
 def test_locator_routes_precisely(env, monkeypatch):

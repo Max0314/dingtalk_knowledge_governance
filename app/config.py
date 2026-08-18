@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # not-yet-seeded workspace must still get its review — the audit bridge
     # consumes such events without walking ungoverned spaces.
     review_since: str = ""
+    # Audit-only no-backfill cutover. Events before this instant are retained
+    # as terminal audit records but never located, queued, or reviewed. It is
+    # deliberately separate from review_since, whose job is stock exemption.
+    audit_review_since: str = ""
     # A document is soft-deleted after this many consecutive complete walks
     # without seeing it (recycle-bin restores clear the flag again).
     watch_delete_misses: int = 2

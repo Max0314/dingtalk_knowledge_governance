@@ -42,9 +42,10 @@ from .service import MODIFY_MERGE_WINDOW_SECONDS, watch_workspace
 logger = logging.getLogger("kg.bridge")
 
 BATCH = 500
-# 每轮远程定位的事件上限与时间预算：单事件是"搜索+批量节点查询"两个 20s
-# 超时的串行外呼，必须双重限额，绝不独占 worker。
-WIKI_LOCATE_BUDGET = 5
+# 每轮远程定位的事件上限与时间预算。名称搜索与节点查询都受并发上限约束，
+# 使高频上传不会积压，同时不会独占 worker 或压垮钉钉接口。
+WIKI_LOCATE_BUDGET = 20
+WIKI_LOCATE_CONCURRENCY = 5
 LOCATE_TIME_BUDGET_SECONDS = 30
 # 每轮桥接巡走的库数上限；没走到的库留在持久化队列里下一轮续走。
 WALK_BUDGET = 5
@@ -96,6 +97,12 @@ def _name_candidates(event: FileAuditEvent) -> list[str]:
     if event.extension and not event.resource.endswith("." + event.extension):
         names.append(f"{event.resource}.{event.extension}")
     return [name for name in names if name]
+
+
+def _extension_mismatch(event: FileAuditEvent, node: dict) -> bool:
+    """Audit extension is advisory; this only feeds non-sensitive counters."""
+    return bool(event.extension and node.get("extension")
+                and event.extension.lower() != str(node["extension"]).lower())
 
 
 def _latest_snapshot_id(db: Session) -> str:
@@ -370,10 +377,12 @@ def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEven
 
 
 def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings, summary: dict,
-                          queued: set[str]) -> bool:
+                          queued: set[str], cutoff_ms: int | None = None) -> bool:
     """成功终态按动作类型收口：评审/修改类须"文档入镜像 + 正文适配器
     已具备定位条件"才 done。上传文件需要数字下载键；原生 .adoc 只需要
     node id。元数据/删除/恢复/忽略各归专属终态。"""
+    if _finish_pre_cutover_event(db, event, summary, cutoff_ms):
+        return True
     if event.match_status != "confirmed" or not event.matched_node_id:
         return False
     kind = _action_kind(event)
@@ -426,15 +435,18 @@ def _is_creation_event(event: FileAuditEvent) -> bool:
 
 def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
     """搜索命中唯一 ≠ 就是本事件的节点（同名新文件未进索引时，搜索只会返回
-    旧节点）。互证优先用 locator 节点载荷自带的时间/扩展名，载荷没有才退回
-    镜像文档；仍证实不了一律拒绝——"系统不认识"绝不是确认依据。
+    旧节点）。只有节点创建/修改时间（或已确认的数字下载键）可以互证；仍
+    证实不了一律拒绝——"系统不认识"绝不是确认依据。
 
     上传/新建事件只认 created_at 互证（codex 第七轮 P0）：上传产生新节点，
     其创建时间必然贴近事件；旧同名节点哪怕刚被人修改过（updated_at 落在
     窗口内）也不是这次上传的节点。修改类事件才允许 updated_at 互证。"""
     allow_updated = not _is_creation_event(event)
-    if event.extension and node.get("extension") and event.extension.lower() != str(node["extension"]).lower():
-        return False
+    # resourceExtension is advisory. Production has reported adoc for fresh
+    # .xlsx/.docx uploads, so it must never reject the stronger proof: exact
+    # filename + unique node + event-time corroboration. A nonzero size is
+    # still an independent safety check; zero means the audit trail omitted
+    # the size. Node type is persisted from the wiki node, not this hint.
     if event.size and node.get("size") and int(event.size) != int(node["size"]):
         return False
     if _near_event(node.get("created_at") or "", event.gmt_create):
@@ -445,8 +457,6 @@ def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
     if doc is not None:
         if doc.storage_dentry_id and doc.storage_dentry_id == (event.biz_id or ""):
             return True
-        if event.extension and doc.extension and event.extension.lower() != doc.extension.lower():
-            return False
         if event.size and doc.size and int(event.size) != int(doc.size):
             return False
         if _near_event(doc.source_created_at, event.gmt_create):
@@ -480,6 +490,21 @@ def _cutoff_ms(cutoff: str) -> int | None:
         return int(edge.timestamp() * 1000)
     except ValueError:
         return None
+
+
+def _finish_pre_cutover_event(db: Session, event: FileAuditEvent, summary: dict,
+                              cutoff_ms: int | None) -> bool:
+    """Retain, but do not replay, events that predate a repair cutover.
+
+    This is intentionally stricter than the ordinary ``review_since`` stock
+    gate: Plan A must not issue locator calls, attach download keys, enqueue
+    jobs, or notify for the known pre-repair backlog.
+    """
+    if cutoff_ms is None or not event.gmt_create or event.gmt_create >= cutoff_ms:
+        return False
+    _finish(db, event, "pre_cutover_not_reviewed")
+    summary["pre_cutover_not_reviewed"] = summary.get("pre_cutover_not_reviewed", 0) + 1
+    return True
 
 
 def _should_auto_review(db: Session, settings: Settings, doc: Document, event: FileAuditEvent) -> bool:
@@ -519,10 +544,13 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
+    cutoff_ms = _cutoff_ms(settings.audit_review_since)
     snapshot_id = _latest_snapshot_id(db)
     queued: set[str] = set()  # 本轮事务内的巡走去重
     wiki_events: list[FileAuditEvent] = []
     for event in events:
+        if _finish_pre_cutover_event(db, event, summary, cutoff_ms):
+            continue
         if not _is_wiki_write(event):
             event.processed = True
             continue
@@ -544,7 +572,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             _handle_delete_restore(db, settings, event, kind, summary)
             continue  # 已删节点搜索拿不到，绝不进远程定位；未匹配保持 pending
         _provisional_match(db, event, snapshot_id, summary)  # 仅诊断参考，不再触发整库门铃
-        _try_finish_confirmed(db, event, settings, summary, queued)
+        _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
 
@@ -562,7 +590,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     finish_stamp = utcnow()
     for event in confirmed_pending:
         event.last_attempt_at = finish_stamp
-        _try_finish_confirmed(db, event, settings, summary, queued)
+        _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
 
     # Locator: a wiki-search by file name gives the doorbell an address, and
     # its exact, corroborated node id is the ONLY authoritative match.
@@ -573,41 +601,61 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     unlocated = 0
     now = utcnow()
     now_ms = int(time.time() * 1000)
+    candidate_conditions = [FileAuditEvent.processed.is_(False), FileAuditEvent.match_status != "confirmed",
+                            or_(FileAuditEvent.action_view.like("%知识库%"),
+                                FileAuditEvent.module_view == "团队空间")]
+    if cutoff_ms is not None:
+        # Plan A: old backlog is retained terminally by the bounded main pass;
+        # never let it consume remote locator capacity before that happens.
+        candidate_conditions.append(FileAuditEvent.gmt_create >= cutoff_ms)
     candidates = db.scalars(
-        select(FileAuditEvent)
-        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status != "confirmed",
-               or_(FileAuditEvent.action_view.like("%知识库%"), FileAuditEvent.module_view == "团队空间"))
+        select(FileAuditEvent).where(*candidate_conditions)
+        # Fresh, unattempted events are latency-sensitive; retry candidates
+        # then rotate fairly by their oldest last attempt.
         .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
-                  FileAuditEvent.last_attempt_at.asc(), FileAuditEvent.gmt_create.asc())
+                  FileAuditEvent.gmt_create.desc(), FileAuditEvent.last_attempt_at.asc())
         .limit(WIKI_LOCATE_BUDGET)).all()
     if settings.bridge_locator_enabled and settings.wiki_storage_space_id and candidates:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
-        started = time.monotonic()
+        locatable = [event for event in candidates
+                     if _action_kind(event) in ("review", "modify", "metadata")]
+        for event in candidates:
+            event.last_attempt_at = now
 
-        async def _locate(names: list[str]):
+        async def _locate_one(event: FileAuditEvent):
             # Storage search returns dentryUuids (== wiki nodeIds) plus the
             # directory path; the wiki batch query then names the workspace
             # each hit lives in. 两者都要带回：path 是目录归属的线索。
+            names = _name_candidates(event)
             dentries = await client.search_dentries(names[0], operator, [settings.wiki_storage_space_id])
             exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
             nodes = await client.batch_query_wiki_nodes(exact_ids, operator) if exact_ids else []
-            return dentries, nodes
+            return event, names, dentries, nodes
 
-        for event in candidates:
-            remaining = LOCATE_TIME_BUDGET_SECONDS - (time.monotonic() - started)
-            if remaining <= 0:
-                break
-            event.last_attempt_at = now
-            if _action_kind(event) not in ("review", "modify", "metadata"):
-                continue  # 删除/恢复/忽略类不做远程定位；盖章轮转让位后来者
-            names = _name_candidates(event)
-            try:
-                # 硬时间预算：整组请求包在剩余时间内，40s 的一对外呼不能把
-                # 30s 预算撑到 70s（codex 第五轮 P1）。
-                dentries, nodes = asyncio.run(asyncio.wait_for(_locate(names), timeout=remaining))
-            except (IntegrationError, RuntimeError, TimeoutError):
-                unlocated += 1  # 网络失败/超时：事件保持 pending，下一轮重试
+        async def _locate_all():
+            semaphore = asyncio.Semaphore(WIKI_LOCATE_CONCURRENCY)
+
+            async def _bounded(event: FileAuditEvent):
+                async with semaphore:
+                    try:
+                        return await _locate_one(event)
+                    except (IntegrationError, RuntimeError, TimeoutError):
+                        return event, None, None, None
+
+            return await asyncio.gather(*[_bounded(event) for event in locatable])
+
+        try:
+            located = asyncio.run(asyncio.wait_for(_locate_all(), timeout=LOCATE_TIME_BUDGET_SECONDS))
+        except TimeoutError:
+            # All selected events keep their retry stamp and receive another
+            # fair turn. A timeout cannot block the worker past its budget.
+            located = []
+            unlocated += len(locatable)
+        summary["locator_attempted"] = summary.get("locator_attempted", 0) + len(locatable)
+        for event, names, dentries, nodes in located:
+            if names is None:
+                unlocated += 1  # network failure: keep pending for retry
                 continue
             hits = [node for node in nodes if node.get("name") in names]
             workspaces = {node.get("workspace_id") for node in hits if node.get("workspace_id")}
@@ -621,6 +669,8 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                 # 搜索唯一还不够：须与节点载荷/镜像互证（同名新文件未入索引
                 # 时，唯一命中的很可能是旧节点）。互证失败保持 pending。
                 if _event_matches_node(db, event, hit):
+                    if _extension_mismatch(event, hit):
+                        summary["extension_mismatch_confirmed"] = summary.get("extension_mismatch_confirmed", 0) + 1
                     if event.matched_node_id != confirmed_id:
                         summary["matched"] += 1
                     event.matched_node_id = confirmed_id
@@ -645,7 +695,7 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                 else:
                     summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
             if not event.processed:
-                _try_finish_confirmed(db, event, settings, summary, queued)
+                _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
     elif candidates:
         unlocated = len(candidates)
     if unlocated:

@@ -34,6 +34,22 @@ READ_MARKERS = ("预览", "下载", "导出")
 CST = timezone(timedelta(hours=8))
 
 
+def _filename_extension(resource: object, reported: object = "") -> str:
+    """Return the filename suffix when available.
+
+    ``resourceExtension`` in the audit trail is advisory: production has
+    reported ``adoc`` for uploaded .xlsx/.docx files. The filename is used
+    only to canonicalize the stored hint; the bridge still requires an exact
+    filename plus temporal node corroboration before it can act on an event.
+    """
+    name = str(resource or "").strip().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if "." in name:
+        suffix = name.rsplit(".", 1)[-1].strip().lower()
+        if suffix and len(suffix) <= 32:
+            return suffix
+    return str(reported or "").strip().lower()[:32]
+
+
 def _is_read(action_view: str) -> bool:
     return any(marker in (action_view or "") for marker in READ_MARKERS)
 
@@ -96,12 +112,13 @@ def _ingest(db: Session, rows: list[dict]) -> dict:
             dupes += 1
             continue
         known.add(biz_id)
+        resource = str(row.get("resource") or "")[:512]
         db.add(FileAuditEvent(
             biz_id=biz_id, gmt_create=gmt,
             operator_user_id=str(row.get("userId") or ""), operator_name=str(row.get("operatorName") or "")[:128],
             action=str(row.get("action") or ""), action_view=action_view[:64],
-            module_view=module[:64], resource=str(row.get("resource") or "")[:512],
-            extension=str(row.get("resourceExtension") or "")[:32],
+            module_view=module[:64], resource=resource,
+            extension=_filename_extension(resource, row.get("resourceExtension")),
             size=int(row.get("resourceSize") or 0), target_space_id=str(row.get("targetSpaceId") or "")[:64],
             ip_address=str(row.get("ipAddress") or "")[:64], platform=str(row.get("platformView") or "")[:32],
         ))

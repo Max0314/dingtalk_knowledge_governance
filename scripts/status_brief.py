@@ -91,6 +91,10 @@ def main() -> None:
         out["bridge"] = {
             "pending_retry": db.scalar(select(func.count()).select_from(FileAuditEvent)
                                        .where(FileAuditEvent.processed.is_(False))) or 0,
+            # Plan A repair cutover: retained audit evidence that intentionally
+            # did not replay into node matching, review jobs, or notifications.
+            "pre_cutover_not_reviewed": db.scalar(select(func.count()).select_from(FileAuditEvent)
+                                                   .where(FileAuditEvent.resolution == "pre_cutover_not_reviewed")) or 0,
             "dead_letter_total": db.scalar(select(func.count()).select_from(FileAuditEvent)
                                            .where(FileAuditEvent.resolution.like("dead_letter%"))) or 0,
             "walk_queue": db.scalar(select(func.count()).select_from(BridgeWalk)) or 0,
