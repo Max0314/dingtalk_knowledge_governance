@@ -16,13 +16,27 @@ const noteText=v=>!v?'':(NOTE_ZH[v]||(String(v).startsWith('fetch_failed')?'正�
 const COLOR={routine:'#2563eb',bulk:'#f59e0b'};
 function toast(msg){const x=document.querySelector('#toast');x.textContent=msg;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),2800)}
 
-/* ---- charts ---- */
+/* ---- charts ----
+   一个 ResizeObserver 驱动全部图表，且只在宽度真的变了时重绘。旧实现里
+   全局 window 'resize' 监听没有节流，滚动条每出现/消失一次就同步重绘所有
+   图表；而 init 后那个 requestAnimationFrame(resize) 每次渲染都多画一帧。 */
 const charts=new Map();
-window.addEventListener('resize',()=>charts.forEach(c=>c.resize()));
-function disposeCharts(){charts.forEach(c=>c.dispose());charts.clear()}
+const chartWidths=new WeakMap();
+const chartObserver=window.ResizeObserver?new ResizeObserver(entries=>{
+  entries.forEach(e=>{const w=Math.round(e.contentRect.width);
+    if(chartWidths.get(e.target)===w)return;chartWidths.set(e.target,w);
+    const c=echarts.getInstanceByDom(e.target);
+    if(c&&!c.isDisposed())requestAnimationFrame(()=>{if(!c.isDisposed())c.resize()})})}):null;
+if(!chartObserver)window.addEventListener('resize',()=>charts.forEach(c=>c.resize()));
+function untrack(c){const el=c&&!c.isDisposed()&&c.getDom();if(el&&chartObserver)chartObserver.unobserve(el)}
+function disposeCharts(){charts.forEach(c=>{untrack(c);c.dispose()});charts.clear()}
 function renderChart(id,option){const el=document.getElementById(id);if(!el)return;if(!window.echarts){el.outerHTML='<div class="chart-fallback">图表组件未加载（/vendor/echarts.min.js）。数据见下方表格。</div>';return}
-  const old=charts.get(id);if(old)old.dispose();
-  const c=echarts.init(el);charts.set(id,c);c.setOption(option);requestAnimationFrame(()=>{if(!c.isDisposed())c.resize()})}
+  let c=charts.get(id);
+  if(c&&(c.isDisposed()||c.getDom()!==el)){untrack(c);c.dispose();c=null}
+  if(!c){c=echarts.init(el);charts.set(id,c);
+    if(chartObserver){chartWidths.set(el,Math.round(el.getBoundingClientRect().width));chartObserver.observe(el)}}
+  /* 复用实例 + notMerge：下钻/筛选时不再 dispose+init 重建画布，掉的就是那一下闪。 */
+  c.setOption(option,{notMerge:true})}
 function stackedOption(rows,{zoom=false}={}){return{
   tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:ps=>{const m=ps[0].axisValue;const r=ps.find(p=>p.seriesName==='日常新增')?.value||0;const b=ps.find(p=>p.seriesName==='批量导入')?.value||0;return `<b>${m}</b><br/>全量新增：<b>${nf(r+b)}</b><br/>日常新增：${nf(r)}<br/>批量导入：${nf(b)}`}},
   legend:{data:['日常新增','批量导入'],top:0,itemWidth:14,itemHeight:9,textStyle:{fontSize:12,color:'#6b7280'}},
@@ -57,7 +71,10 @@ function statusChip(item){if(item.status==='scanned')return '<span class="chip g
 function bindDocRows(){document.querySelectorAll('[data-doc]').forEach(x=>x.onclick=()=>goDoc(x.dataset.doc))}
 
 /* ---- views ---- */
-async function overview(){const d=await api('/api/v1/dashboard/overview');
+async function overview(){
+  /* index.html 里的首屏预取只兑现一次；之后回到本页走正常请求。 */
+  let d=null;if(window.__boot){d=await window.__boot;window.__boot=null}
+  if(!d)d=await api('/api/v1/dashboard/overview');
   const org=d.org_context||{};
   document.querySelector('#scopePill').textContent=`已登记 ${d.metrics.workspace_count} 库`;
   shell('知识库总览','公司知识库全景：规模、增量与文档质量。月份按钉钉 createTime（Asia/Shanghai）归属。',`
@@ -112,9 +129,9 @@ async function increments(){
     ${statCard('其中日常新增',nf(sum('routine')),'全量 − 批量导入')}
     ${statCard('文件总保有量',nf(d.total_files),meta?`${meta.workspace_count} 库 · ${meta.uploader_count} 位上传人`:'主基线 + 实时增量')}
   </div>
-  <section class="card section-gap" id="treeCard"><div class="empty">正在加载增量构成…</div></section>
+  <section class="card section-gap" id="treeCard"><div class="empty loading">正在加载增量构成…</div></section>
   <section class="section-gap"><div class="grid two-cols">
-    <section class="card" id="orgCard"><div class="empty">正在加载部门分布…</div></section>
+    <section class="card" id="orgCard"><div class="empty loading">正在加载部门分布…</div></section>
     <section class="card person-panel" id="personPanel"><h2>分布明细</h2><div class="empty">点击左侧部门、业务组或成员，查看对应的上传分布。</div></section>
   </div></section>`,
   `<button class="secondary" id="csvBtn">导出 CSV</button>`);

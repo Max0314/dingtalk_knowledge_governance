@@ -4,15 +4,21 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>钉钉知识库治理</title>
-<link rel="icon" type="image/png" href="assets/brand/app-icon.png?v=20260813b">
-<link rel="stylesheet" href="styles.css?v=20260813b">
+<link rel="icon" type="image/png" href="assets/brand/app-icon.png?v=20260818a">
+<link rel="stylesheet" href="styles.css?v=20260818a">
+<script>
+/* 首屏并发：总览接口在这里就发出，而不是等 1MB 的 echarts 下载+解析完、
+   app.js 执行、再串行等一次 auth/me 之后才开始。未登录时这次预取拿到 401
+   并作废，登录跳转仍由 app.js 的 auth/me 分支统一负责。 */
+window.__boot=fetch('api/v1/dashboard/overview').then(function(r){return r.ok?r.json():null}).catch(function(){return null});
+</script>
 </head>
 <body>
 <div class="app-layout">
   <header class="app-header">
     <button class="icon-btn menu-btn" id="menuBtn" aria-label="菜单">☰</button>
     <div class="app-brand">
-      <img class="brand-img" src="assets/brand/app-icon.png?v=20260813b" alt="logo">
+      <img class="brand-img" src="assets/brand/app-icon.png?v=20260818a" alt="logo">
       <div class="brand-text"><b>钉钉知识库治理</b><small>入库可追溯 · 质量可评审 · 增量可统计</small></div>
     </div>
     <div class="header-actions">
@@ -40,10 +46,21 @@
     <div class="side-foot">正文不落库<br><small>评审期间仅内存 / tmpfs</small></div>
   </aside>
   <div class="sidebar-backdrop" id="backdrop"></div>
-  <main class="app-main"><div id="app" class="page-shell"><div class="card muted">正在加载治理数据…</div></div></main>
+  <main class="app-main"><div id="app" class="page-shell">
+    <!-- 骨架屏按总览页的真实版式占位：加载态和完成态高度接近，页面不再从
+         一张小卡片突然长到两屏，滚动条也就不会中途冒出来。 -->
+    <div class="skeleton skeleton-head"></div>
+    <div class="grid metrics" aria-hidden="true">
+      <div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div>
+      <div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div>
+    </div>
+    <div class="skeleton skeleton-chart" aria-hidden="true"></div>
+    <div class="skeleton skeleton-table" aria-hidden="true"></div>
+    <p class="hint" role="status">正在加载治理数据…</p>
+  </div></main>
 </div>
 <div id="toast" class="toast"></div>
-<script src="vendor/echarts.min.js?v=20260813b"></script>
-<script src="app.js?v=20260813b"></script>
+<script src="vendor/echarts.min.js?v=20260818a"></script>
+<script src="app.js?v=20260818a"></script>
 </body>
 </html>

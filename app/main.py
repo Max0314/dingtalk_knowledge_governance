@@ -1,17 +1,20 @@
 from __future__ import annotations
+import hashlib
+import os
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 from . import metrics, orgmap
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .scoring import RULE_VERSION, catalog_dict, effective_config
 from .service import document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict
@@ -32,6 +35,10 @@ app = FastAPI(title="DingTalk Knowledge Governance", version="1.0.0", lifespan=l
 from .auth import guard_middleware, register_auth_routes  # noqa: E402
 
 app.middleware("http")(guard_middleware)
+# Nothing in front of us compresses: the platform nginx only reverse-proxies,
+# so JSON payloads and the static bundle went out raw (1.1 MB per page load).
+# Level 6 is nginx's default — level 9 costs ~3x the CPU for ~2% less bytes.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 register_auth_routes(app)
 
 
@@ -109,49 +116,61 @@ def health():
 
 @app.get("/api/v1/dashboard/overview")
 def dashboard(db: Session = Depends(db_session)):
+    """The overview page's only request. Everything it returns is rendered;
+    it used to also build `latest_documents` (8 docs x 2 N+1 queries, ordered
+    by an unindexed column) and `coverage_summary` (the full per-workspace
+    list, of which 4 integers were kept) — neither was ever read by app.js.
+    """
     workspaces = db.scalar(select(func.count()).select_from(Workspace)) or 0
-    # 均值口径：每份文档只取最新实例——旧实例是审计留痕（含早期 35/0 分误判
-    # 存成 pass 的历史），不再参与平均分。
-    latest_per_doc: dict[str, ReviewInstance] = {}
-    for item in db.scalars(select(ReviewInstance).order_by(ReviewInstance.created_at.desc())).all():
-        latest_per_doc.setdefault(item.node_id, item)
-    reviews = list(latest_per_doc.values())
-    average = round(sum(x.ai_score for x in reviews) / len(reviews), 1) if reviews else None
     increments = metrics.monthly_increments(db)
-    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-    month_reviews = [x for x in reviews if x.created_at and x.created_at.strftime("%Y-%m") == current_month]
-    month_average = round(sum(x.ai_score for x in month_reviews) / len(month_reviews), 1) if month_reviews else None
-    month_row = next((row for row in increments["rows"] if row["month"] == current_month), None)
-    latest = []
-    for doc in db.scalars(select(Document).where(Document.is_folder.is_(False)).order_by(Document.discovered_at.desc()).limit(8)).all():
-        review = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == doc.node_id).order_by(ReviewInstance.created_at.desc()))
-        count = db.scalar(select(func.count()).select_from(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)) or 0
-        latest.append(document_dict(doc, review, max(0, count - 1)))
-    coverage_summary = metrics.coverage(db)["summary"] if workspaces else {"visible_workspaces": 0, "scanned": 0, "empty": 0, "excluded": 0}
+    now = datetime.now(timezone.utc)
+    # Naive-UTC bounds, matching how the rest of the service compares stored
+    # timestamps in SQL (see notify._day_start).
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    # 均值口径：每份文档只取最新实例——旧实例是审计留痕（含早期 35/0 分误判
+    # 存成 pass 的历史），不再参与平均分。口径不变，但取最新和求均值都下推到
+    # SQL：这里原先把整张 review_instances（含 dimensions/findings 两个 JSON
+    # 列）拉进 Python 只为算两个平均分，正是 metrics._collect 警告过的反模式。
+    ranked = select(
+        ReviewInstance.ai_score.label("ai_score"),
+        ReviewInstance.created_at.label("created_at"),
+        func.row_number().over(partition_by=ReviewInstance.node_id,
+                               order_by=ReviewInstance.created_at.desc()).label("rank"),
+    ).subquery()
+    latest = select(ranked.c.ai_score, ranked.c.created_at).where(ranked.c.rank == 1).subquery()
+    average, month_average = db.execute(select(
+        func.avg(latest.c.ai_score),
+        # AVG skips NULLs, so the CASE narrows the same population to this month.
+        func.avg(case((and_(latest.c.created_at >= month_start,
+                            latest.c.created_at < next_month), latest.c.ai_score))),
+    )).one()
+    month_row = next((row for row in increments["rows"] if row["month"] == now.strftime("%Y-%m")), None)
     # The snapshot-frozen org note dates from the personal-authorization era
     # (23.5% coverage); rebuild it from whichever snapshot is the primary
     # baseline right now so a baseline switch never leaves a stale banner.
-    org_context = dict(increments["baseline"]["definition"].get("org_context", {}))
-    primary = db.get(HistoricalSnapshot, metrics.primary_snapshot_id(db))
-    baseline_libs = len(((primary.definition or {}).get("workspaces") or {})) if primary else 0
-    if primary and not baseline_libs:  # older snapshots store no workspace map
+    # monthly_increments already resolved and returned that snapshot — asking
+    # for it again re-read every snapshot row with its full definition JSON.
+    baseline = increments["baseline"]
+    definition = baseline["definition"] or {}
+    org_context = dict(definition.get("org_context", {}))
+    baseline_libs = len(definition.get("workspaces") or {})
+    if baseline["snapshot_id"] and not baseline_libs:  # older snapshots store no workspace map
         baseline_libs = db.scalar(select(func.count(func.distinct(HistoricalFileNode.workspace_id)))
-                                  .where(HistoricalFileNode.snapshot_id == primary.snapshot_id)) or 0
-    org_context["note"] = (f"文件总量与月度增量按全量基线 {primary.snapshot_id if primary else '—'}"
+                                  .where(HistoricalFileNode.snapshot_id == baseline["snapshot_id"])) or 0
+    org_context["note"] = (f"文件总量与月度增量按全量基线 {baseline['snapshot_id'] or '—'}"
                            f"（{baseline_libs or '—'} 库）+ 实时增量计算；服务身份已登记 {workspaces} 个知识库。")
     return {
         "metrics": {
             "workspace_count": workspaces,
             "total_files": increments["total_files"],
             "month_increment": month_row["total"] if month_row else 0,
-            "average_ai_score": average,
-            "month_average_score": month_average,
+            "average_ai_score": round(average, 1) if average is not None else None,
+            "month_average_score": round(month_average, 1) if month_average is not None else None,
         },
-        "coverage_summary": coverage_summary,
         "org_context": org_context,
         "monthly": increments["rows"][-14:],
         "yearly": increments["yearly"],
-        "latest_documents": latest,
     }
 
 
@@ -968,23 +987,56 @@ async def dingtalk_nodes(workspace_id: str, operator_id: str, parent_node_id: st
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
-NO_STORE_SUFFIXES = (".html", ".js", ".css")
+REVALIDATE_SUFFIXES = (".html", ".js", ".css")
+# Vendor bundles are pinned by the ?v= stamp in index.html and never change
+# under a given URL. echarts.min.js alone is 1 MB, and re-sending it on every
+# page load was the single largest cost of opening the dashboard.
+IMMUTABLE_PARTS = ("vendor",)
+ASSET_MAX_AGE = 86400
 
 
-def _static_response(path: Path) -> FileResponse:
-    # HTML/JS/CSS must revalidate every load — a stale cached app.js against a
-    # newer API broke the dashboard once (2026-08-12). 304s keep it cheap.
-    headers = {"Cache-Control": "no-cache"} if path.suffix in NO_STORE_SUFFIXES else None
-    return FileResponse(path, headers=headers)
+def _cache_control(path: Path) -> str:
+    if any(part in IMMUTABLE_PARTS for part in path.parts):
+        return "public, max-age=31536000, immutable"
+    if path.suffix in REVALIDATE_SUFFIXES:
+        return "no-cache"
+    # Everything else (icons) used to ship with no Cache-Control at all, which
+    # left the browser guessing a lifetime from Last-Modified.
+    return f"public, max-age={ASSET_MAX_AGE}"
+
+
+def _file_etag(stat_result: os.stat_result) -> str:
+    """Same shape as Starlette's own FileResponse etag, computed up front so a
+    conditional request can be answered before the body is opened."""
+    base = f"{stat_result.st_mtime}-{stat_result.st_size}".encode()
+    return f'"{hashlib.md5(base, usedforsecurity=False).hexdigest()}"'
+
+
+def _static_response(request: Request, path: Path) -> Response:
+    """HTML/JS/CSS still revalidate on every load — a stale cached app.js
+    against a newer API broke the dashboard once (2026-08-12).
+
+    Starlette's bare FileResponse only implements Range, never a conditional
+    request, so "revalidate" meant re-sending the whole body: repeat loads
+    measured 1.12 MB with zero cache hits. Answering If-None-Match here keeps
+    the freshness guarantee and makes the repeat load a 304.
+    """
+    stat_result = path.stat()
+    etag = _file_etag(stat_result)
+    headers = {"Cache-Control": _cache_control(path), "ETag": etag}
+    known = {tag.strip().removeprefix("W/") for tag in request.headers.get("if-none-match", "").split(",")}
+    if etag in known:
+        return Response(status_code=304, headers=headers)
+    return FileResponse(path, headers=headers, stat_result=stat_result)
 
 
 @app.get("/")
-def index():
-    return _static_response(ROOT / "static" / "index.html")
+def index(request: Request):
+    return _static_response(request, ROOT / "static" / "index.html")
 
 
 @app.get("/{path:path}")
-def static_files(path: str):
+def static_files(request: Request, path: str):
     candidate = ROOT / "static" / path
-    if candidate.is_file() and candidate.resolve().is_relative_to((ROOT / "static").resolve()): return _static_response(candidate)
-    return _static_response(ROOT / "static" / "index.html")
+    if candidate.is_file() and candidate.resolve().is_relative_to((ROOT / "static").resolve()): return _static_response(request, candidate)
+    return _static_response(request, ROOT / "static" / "index.html")

@@ -177,12 +177,22 @@ def _refresh_in_background() -> None:
 def collected(db: Session) -> dict[str, Any]:
     """Stale-while-revalidate：请求路径只读缓存，过期时返回旧值并由后台线程
     刷新——任何页面都不因指标重算而卡住。冷启动的第一次同步计算（SQL 聚合
-    后为亚秒级）。"""
-    stamp = _change_stamp(db)
+    后为亚秒级）。
+
+    TTL 先判、变更戳后判：`_change_stamp` 本身是两次 COUNT(*) 全表扫描（基线
+    表约 28 万行），而它原先跑在每一次读缓存之前——守卫比它保护的缓存还贵，
+    单次总览请求要为此扫 6 次表。命中窗口内现在完全不发 SQL。
+
+    可观测行为不变：戳变化时旧逻辑同样只是"触发后台刷新 + 继续返回旧值"，
+    差别仅是刷新时机推迟到 TTL 边界。"""
     now = time.monotonic()
-    if _cache["value"] is not None and _cache["stamp"] == stamp and now - _cache["at"] < CACHE_TTL_SECONDS:
+    if _cache["value"] is not None and now - _cache["at"] < CACHE_TTL_SECONDS:
         return _cache["value"]
+    stamp = _change_stamp(db)
     if _cache["value"] is not None:
+        if _cache["stamp"] == stamp:  # 没变：续期，不重算
+            _cache["at"] = now
+            return _cache["value"]
         if _refresh_lock.acquire(blocking=False):
             threading.Thread(target=_refresh_in_background, daemon=True).start()
         return _cache["value"]

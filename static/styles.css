@@ -1,5 +1,10 @@
 :root{--blue:#2563eb;--blue-700:#1d4ed8;--blue-50:#eff6ff;--ink:#111827;--muted:#6b7280;--line:#e5e7eb;--bg:#f9fafb;--card:#fff;--good:#10b981;--warn:#f59e0b;--bad:#ef4444;--amber-50:#fffbeb;--radius:10px;--header-h:64px;--sidebar-w:228px}
 *{box-sizing:border-box}
+/* The page grows past the viewport as soon as data lands, so the classic
+   15px scrollbar kept appearing and disappearing — every toggle re-laid out
+   the fixed header and every card, and fired a full chart redraw. Reserving
+   the gutter up front is what stops the sideways jump. */
+html{scrollbar-gutter:stable}
 html,body{margin:0;padding:0}
 body{background:var(--bg);color:var(--ink);font:14px/1.55 Inter,"PingFang SC","Microsoft YaHei",Arial,sans-serif}
 b{font-weight:600}
@@ -52,6 +57,16 @@ b{font-weight:600}
 .banner{display:flex;gap:10px;align-items:flex-start;background:var(--amber-50);border:1px solid #fde68a;color:#92400e;border-radius:var(--radius);padding:10px 14px;font-size:12.5px;margin-bottom:16px}
 .hint{color:var(--muted);font-size:12.5px;margin:5px 0}
 .empty{color:var(--muted);text-align:center;padding:34px 10px;font-size:13px}
+/* Loading placeholders hold roughly the height of the content that replaces
+   them; without this the page height stepped up two or three times per view. */
+.empty.loading{min-height:280px;display:grid;place-items:center;padding:0}
+.skeleton{border-radius:var(--radius);background:linear-gradient(90deg,#eef1f5 25%,#f6f8fa 37%,#eef1f5 63%);background-size:400% 100%;animation:skeleton-sweep 1.3s ease-in-out infinite}
+@keyframes skeleton-sweep{0%{background-position:100% 50%}100%{background-position:0 50%}}
+.skeleton-head{height:46px;max-width:340px;margin-bottom:16px}
+.skeleton-card{height:104px}
+.skeleton-chart{height:356px;margin-top:16px}
+.skeleton-table{height:220px;margin-top:16px}
+@media (prefers-reduced-motion:reduce){.skeleton{animation:none}}
 .section-gap{margin-top:16px}
 
 /* chips & badges */
