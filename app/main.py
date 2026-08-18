@@ -1,7 +1,6 @@
 from __future__ import annotations
 import hashlib
 import os
-import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -17,7 +16,7 @@ from .config import get_settings
 from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .scoring import RULE_VERSION, catalog_dict, effective_config
-from .service import document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict
+from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict, workspace_level
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -243,26 +242,112 @@ def departments_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
     return metrics.department_rollup(db, month)
 
 
+ROOT_FOLDER = "(根目录)"
+
+
 @app.get("/api/v1/baseline/workspaces/{workspace_id}/folders")
-def baseline_folders(workspace_id: str, snapshot_id: str = "", limit: int = Query(default=200, ge=1, le=500), db: Session = Depends(db_session)):
-    """Directory groups within one snapshot. When the snapshot recorded folder
-    nodes (the 2026-08 uploader scan does), folder names come back too."""
+def baseline_folders(workspace_id: str, parent: str = "", snapshot_id: str = "",
+                     limit: int = Query(default=200, ge=1, le=1000), db: Session = Depends(db_session)):
+    """One level of the directory tree, not the whole thing flattened.
+
+    The previous version grouped every file by parent_node_id and returned the
+    top-N buckets by size, so a library's root folders and their deeply nested
+    children arrived as one undifferentiated list with no way to descend or
+    back out — and `total_folders` reported the page size, never the real count.
+
+    `parent` selects the level: "" (or the root sentinel) is the library root.
+    Each child folder carries both its own file count and the recursive total,
+    so a folder that only holds subfolders still shows what is underneath it.
+    """
     snapshot = snapshot_id or metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
-    rows = db.execute(
-        select(HistoricalFileNode.parent_node_id, func.count(), func.min(HistoricalFileNode.source_created_at), func.max(HistoricalFileNode.source_created_at))
-        .where(HistoricalFileNode.workspace_id == workspace_id, HistoricalFileNode.snapshot_id == snapshot,
-               HistoricalFileNode.node_type != "folder")
-        .group_by(HistoricalFileNode.parent_node_id)
-        .order_by(func.count().desc()).limit(limit)).all()
-    folder_names = {r[0]: r[1] for r in db.execute(
-        select(HistoricalFileNode.node_id, HistoricalFileNode.name)
-        .where(HistoricalFileNode.workspace_id == workspace_id, HistoricalFileNode.snapshot_id == snapshot,
-               HistoricalFileNode.node_type == "folder")).all()}
-    total_folders = len(rows)
-    return {"workspace_id": workspace_id, "snapshot_id": snapshot, "total_folders": total_folders,
-            "note": "" if folder_names else "该快照未记录目录名称，目录以节点 ID 标识。",
-            "items": [{"parent_node_id": r[0] or "(根目录)", "folder_name": folder_names.get(r[0], ""),
-                       "file_count": r[1], "earliest": (r[2] or "")[:10], "latest": (r[3] or "")[:10]} for r in rows]}
+    nodes = db.execute(
+        select(HistoricalFileNode.node_id, HistoricalFileNode.parent_node_id,
+               HistoricalFileNode.node_type, HistoricalFileNode.name,
+               HistoricalFileNode.source_created_at)
+        .where(HistoricalFileNode.workspace_id == workspace_id,
+               HistoricalFileNode.snapshot_id == snapshot)).all()
+
+    folders: dict[str, dict] = {}
+    direct_files: dict[str, int] = {}
+    span: dict[str, list[str]] = {}
+    for node_id, parent_id, node_type, name, created in nodes:
+        key = parent_id or ""
+        if node_type == "folder":
+            folders[node_id] = {"name": name or "", "parent": key}
+        else:
+            direct_files[key] = direct_files.get(key, 0) + 1
+            if created:
+                bucket = span.setdefault(key, [created, created])
+                bucket[0] = min(bucket[0], created)
+                bucket[1] = max(bucket[1], created)
+    # Older snapshots stored files only, so a file's parent_node_id points at a
+    # folder that has no row of its own; the same happens to a folder whose own
+    # parent was not captured. Both are hung off the root rather than dropped,
+    # which keeps a folder-less snapshot browsing exactly as the flat list did.
+    for key in list(direct_files):
+        if key and key not in folders:
+            folders[key] = {"name": "", "parent": ""}
+    for entry in folders.values():
+        if entry["parent"] and entry["parent"] not in folders:
+            entry["parent"] = ""
+    children: dict[str, list[str]] = {}
+    for node_id, entry in folders.items():
+        children.setdefault(entry["parent"], []).append(node_id)
+
+    # One memoised post-order pass, iterative: a per-child recursive walk is
+    # quadratic once a level is wide (the primary baseline stores no folder
+    # rows, so a large library synthesises ~9k root entries), and a deep tree
+    # would blow the recursion limit. `visiting` breaks a cyclic parent chain.
+    totals: dict[str, int] = {}
+    for start in folders:
+        if start in totals:
+            continue
+        stack, visiting = [(start, False)], set()
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                visiting.discard(node)
+                totals[node] = direct_files.get(node, 0) + sum(totals.get(c, 0) for c in children.get(node, ()))
+                continue
+            if node in totals or node in visiting:
+                continue
+            visiting.add(node)
+            stack.append((node, True))
+            stack.extend((child, False) for child in children.get(node, ()))
+
+    current = "" if parent in ("", ROOT_FOLDER) else parent
+    breadcrumb = []
+    walker, guard = current, set()
+    while walker and walker in folders and walker not in guard:
+        guard.add(walker)
+        breadcrumb.append({"node_id": walker, "name": folders[walker]["name"] or walker})
+        walker = folders[walker]["parent"]
+    breadcrumb.reverse()
+
+    items = []
+    for child in children.get(current, ()):
+        window = span.get(child, ["", ""])
+        items.append({"node_id": child, "name": folders[child]["name"] or "（未记录名称）",
+                      "direct_files": direct_files.get(child, 0), "total_files": totals.get(child, 0),
+                      "subfolders": len(children.get(child, ())),
+                      "earliest": (window[0] or "")[:10], "latest": (window[1] or "")[:10]})
+    items.sort(key=lambda x: (-x["total_files"], x["name"]))
+    # A level is normally small, but the folder-less fallback puts every parent
+    # id at the root. Cap it and say so rather than shipping thousands of rows.
+    children_at_level = len(items)
+    items = items[:limit]
+
+    named = any(entry["name"] for entry in folders.values())
+    return {"workspace_id": workspace_id, "snapshot_id": snapshot,
+            "parent": current or ROOT_FOLDER,
+            "parent_of_current": folders.get(current, {}).get("parent", "") if current else "",
+            "breadcrumb": breadcrumb,
+            "total_folders": len(folders),
+            "children_at_level": children_at_level,
+            "omitted": max(0, children_at_level - len(items)),
+            "direct_files": direct_files.get(current, 0),
+            "note": "" if named else "该快照未记录目录名称，目录以节点 ID 标识。",
+            "items": items}
 
 
 @app.get("/api/v1/baseline/files")
@@ -340,7 +425,10 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         rows = db.execute(base.order_by(HistoricalFileNode.source_created_at.desc(), HistoricalFileNode.node_id.desc())
                           .offset(offset).limit(limit)).all()
     else:
-        base = base.where(HistoricalFileNode.node_id.not_in(select(Document.node_id)))
+        # 反连接而不是 NOT IN：NOT IN 携带一个 28 万行的子查询，MySQL 对这种
+        # 形态优化很差，而两次 COUNT(*) 都要过它。改法与 metrics._collect 的
+        # live 臂一致（该处已验证走 ix_hfn_snapshot_node）。
+        base = base.outerjoin(Document, Document.node_id == HistoricalFileNode.node_id)                    .where(Document.node_id.is_(None))
         need = offset + limit
         merged = sorted(
             db.execute(base.order_by(HistoricalFileNode.source_created_at.desc(),
@@ -455,6 +543,15 @@ def notifications(status: str = "", limit: int = Query(default=20, ge=1, le=100)
                        "sent_at": n.sent_at.isoformat() if n.sent_at else None} for n in db.scalars(stmt).all()]}
 
 
+@app.get("/api/v1/filters/workspaces")
+def workspace_options(db: Session = Depends(db_session)):
+    """知识库下拉选项。文档列表页此前为了这份 id→名称映射调用 /metrics/coverage，
+    那个接口会为每个知识库构造完整明细（状态、部门、基线与实时计数）。"""
+    rows = db.execute(select(Workspace.workspace_id, Workspace.name)
+                      .where(Workspace.is_active.is_(True)).order_by(Workspace.name)).all()
+    return {"items": [{"workspace_id": r[0], "name": r[1]} for r in rows]}
+
+
 @app.get("/api/v1/filters/departments")
 def department_options(db: Session = Depends(db_session)):
     """知识库归属部门选项（workspaces.owner_department_name，来源：宜搭知识库登记）。"""
@@ -463,15 +560,6 @@ def department_options(db: Session = Depends(db_session)):
                       .group_by(Workspace.owner_department_name)
                       .order_by(func.count().desc())).all()
     return {"items": [{"name": r[0], "count": r[1]} for r in rows]}
-
-
-WORKSPACE_LEVEL_PATTERN = re.compile(r"^([CDPIcdpi])[\-_—－]")
-WORKSPACE_LEVEL_LABELS = {"C": "C-公司级", "D": "D-部门级", "P": "P-项目级", "I": "I-个人级"}
-
-
-def workspace_level(name: str) -> str:
-    match = WORKSPACE_LEVEL_PATTERN.match((name or "").strip())
-    return match.group(1).upper() if match else "其他"
 
 
 @app.get("/api/v1/workspaces")
@@ -491,7 +579,11 @@ def workspaces(query: str = "", level: str = "", department: str = "", creator: 
     for role_row in db.scalars(select(WorkspaceRole)).all():
         bucket = roles.setdefault(role_row.workspace_id, {"administrator": [], "reviewer": []})
         bucket.setdefault(role_row.role, []).append(role_row.display_name or role_row.employee_key)
-    creator_names = {row.user_id: row.name for row in db.scalars(select(EmployeeMap)).all()}
+    # Only the creators these workspaces actually name — this used to read the
+    # whole bi_center employee cache on every page of the registry.
+    creator_keys = {ws.creator_key for ws in rows if ws.creator_key}
+    creator_names = {row.user_id: row.name for row in db.scalars(
+        select(EmployeeMap).where(EmployeeMap.user_id.in_(creator_keys)))} if creator_keys else {}
 
     items = []
     for ws in rows:
@@ -522,12 +614,17 @@ def workspaces(query: str = "", level: str = "", department: str = "", creator: 
         return True
 
     filtered = [entry for entry in items if keep(entry)]
+    context = metrics.snapshot_context(db)  # 一次请求只解析一次基线快照
     level_facets: dict[str, int] = {}
     for entry in filtered:
         level_facets[entry["level"]] = level_facets.get(entry["level"], 0) + 1
-    return {"total": len(filtered), "offset": offset, "limit": limit,
+    # The registry page's four headline cards used to cost a second request to
+    # /metrics/coverage, whose full per-workspace payload it then threw away.
+    return {"total": len(filtered), "total_all": len(items), "offset": offset, "limit": limit,
             "levels": [{"level": key, "label": WORKSPACE_LEVEL_LABELS.get(key, "其他"), "count": value}
                        for key, value in sorted(level_facets.items())],
+            "summary": metrics.coverage_summary(db, context),
+            "org_context": context["definition"].get("org_context", {}),
             "items": filtered[offset:offset + limit]}
 
 

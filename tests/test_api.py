@@ -52,7 +52,10 @@ def test_baseline_endpoints_and_notification_outbox():
         # snapshot_id passed explicitly: uploader stats seeded by a sibling test
         # would otherwise win the default-snapshot pick and empty the listing.
         folders = client.get("/api/v1/baseline/workspaces/demo-workspace/folders", params={"snapshot_id": "test-snap"}).json()
-        assert folders["items"] and folders["items"][0]["parent_node_id"] == "folder-1"
+        # 目录接口改为逐层下钻：items 是当前层的子目录，node_id 就是目录本身。
+        # 该快照只有文件行、没有目录行，folder-1 因此挂在根层。
+        assert folders["items"] and folders["items"][0]["node_id"] == "folder-1"
+        assert folders["items"][0]["total_files"] == 2 and folders["parent"] == "(根目录)"
         files = client.get("/api/v1/baseline/files", params={"workspace_id": "demo-workspace", "query": "历史", "snapshot_id": "test-snap"}).json()
         assert files["total"] == 2
 

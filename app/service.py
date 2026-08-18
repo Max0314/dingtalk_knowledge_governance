@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import re
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -51,6 +52,32 @@ def _at_or_after(value: str, cutoff: str) -> bool:
         return moment >= edge
     except ValueError:
         return value[:10] >= cutoff[:10]
+
+
+# 知识库等级取自库名前缀（C-公司级 / D-部门级 / P-项目级 / I-个人级），
+# 与「知识库管理」页的分类标签同一口径；两处共用这一个实现。
+WORKSPACE_LEVEL_PATTERN = re.compile(r"^([CDPIcdpi])[\-_—－]")
+WORKSPACE_LEVEL_LABELS = {"C": "C-公司级", "D": "D-部门级", "P": "P-项目级", "I": "I-个人级"}
+
+
+def workspace_level(name: str) -> str:
+    match = WORKSPACE_LEVEL_PATTERN.match((name or "").strip())
+    return match.group(1).upper() if match else "其他"
+
+
+def review_excluded_levels(settings: Settings) -> set[str]:
+    return {code.strip().upper() for code in settings.review_excluded_workspace_levels.split(",") if code.strip()}
+
+
+def is_review_excluded_workspace(db: Session, settings: Settings, workspace_id: str) -> bool:
+    """个人知识库（I-）的文件不进自动评审（2026-08-18 用户拍板）：个人库是
+    草稿和私人材料的落脚处，按公司知识标准打分既无意义也会淹没真实问题。
+    手动重评（manual_rerun）仍放行——那是明确的人为意图。"""
+    excluded = review_excluded_levels(settings)
+    if not excluded or not workspace_id:
+        return False
+    workspace = db.get(Workspace, workspace_id)
+    return workspace_level(workspace.name if workspace else "") in excluded
 
 
 def is_robot_uploader(settings: Settings, *identifiers: str) -> bool:
@@ -223,6 +250,11 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     doc = db.get(Document, job.node_id)
     if doc is not None and job.trigger != "manual_rerun" and is_robot_uploader(settings, doc.uploader_key, doc.uploader_name):
         job.status, job.error_code, job.finished_at = "skipped", "robot_uploader", utcnow()
+        db.commit()
+        return True
+    # 同样的第二道闸给个人知识库：入队侧改口径之前排的老任务也不能出分。
+    if doc is not None and job.trigger != "manual_rerun" and is_review_excluded_workspace(db, settings, doc.workspace_id):
+        job.status, job.error_code, job.finished_at = "skipped", "personal_workspace", utcnow()
         db.commit()
         return True
     job.status = "running"

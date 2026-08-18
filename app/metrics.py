@@ -285,23 +285,49 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
                       "routine": buckets[key][0] - buckets[key][1]} for key in keys]}
 
 
+def _scan_status(workspace_id: str, space_totals: dict, live_counts: dict, excluded) -> str:
+    """扫描状态判定的唯一实现——完整清单（coverage）和只要四个计数的注册表页
+    （coverage_summary）共用，口径不会各自漂移。"""
+    if workspace_id in excluded:
+        return "excluded"
+    if space_totals.get(workspace_id, 0) or live_counts.get(workspace_id):
+        return "scanned"
+    return "empty"
+
+
+def _live_workspace_counts(db: Session) -> dict[str, int]:
+    return {row[0]: row[1] for row in db.execute(
+        select(Document.workspace_id, func.count()).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
+        .group_by(Document.workspace_id))}
+
+
+def coverage_summary(db: Session, context: dict[str, Any] | None = None) -> dict[str, int]:
+    """只算四个计数。知识库管理页此前为了这四个整数调用完整的 coverage()，
+    连带构造每个知识库的完整明细再整包丢掉。
+
+    调用方已经取过 snapshot_context 就传进来——它背后是"读出全部快照行连同
+    完整 definition JSON"，一次请求里不该跑两遍。"""
+    data = collected(db)
+    context = context if context is not None else snapshot_context(db)
+    excluded = {item.get("workspace_id") for item in context["definition"].get("excluded_workspaces", [])}
+    live_counts = _live_workspace_counts(db)
+    summary = {"visible_workspaces": 0, "scanned": 0, "empty": 0, "excluded": 0}
+    for workspace_id in db.scalars(select(Workspace.workspace_id)):
+        summary["visible_workspaces"] += 1
+        summary[_scan_status(workspace_id, data["space_totals"], live_counts, excluded)] += 1
+    return summary
+
+
 def coverage(db: Session) -> dict[str, Any]:
     data = collected(db)
     context = snapshot_context(db)
     definition = context["definition"]
     excluded = {item.get("workspace_id"): item for item in definition.get("excluded_workspaces", [])}
-    live_counts = {row[0]: row[1] for row in db.execute(
-        select(Document.workspace_id, func.count()).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
-        .group_by(Document.workspace_id))}
+    live_counts = _live_workspace_counts(db)
     items = []
     for ws in db.scalars(select(Workspace).order_by(Workspace.name)).all():
         baseline_count = data["space_totals"].get(ws.workspace_id, 0)
-        if ws.workspace_id in excluded:
-            status = "excluded"
-        elif baseline_count or live_counts.get(ws.workspace_id):
-            status = "scanned"
-        else:
-            status = "empty"
+        status = _scan_status(ws.workspace_id, data["space_totals"], live_counts, excluded)
         items.append({
             "workspace_id": ws.workspace_id, "name": ws.name, "url": ws.url,
             "status": status,

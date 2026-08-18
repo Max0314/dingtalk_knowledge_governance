@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     # 机器人姓名前缀兜底：bi_center 把数字员工解析成正式员工身份（employeeKey
     # 替换原始 id），仅靠 id 名单拦不住其文档进评审（2026-08-13 生产实测）。
     robot_name_prefixes: str = "数字员工"
+    # 个人知识库不参与自动评审（2026-08-18 用户拍板）：等级取自库名前缀，
+    # 与「知识库管理」页的 C/D/P/I 分类同一口径。留空则不排除任何等级。
+    review_excluded_workspace_levels: str = "I"
     # Union ids allowed to operate model configs and diagnostics when auth is
     # on. Empty denies everyone (fail closed); local dev with auth off is open.
     admin_union_ids: str = ""

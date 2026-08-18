@@ -85,6 +85,94 @@ def test_robot_uploader_detection_and_job_skip():
         db.commit()
 
 
+def test_personal_workspace_files_never_auto_review():
+    """2026-08-18 用户拍板：个人知识库（I-）的文件不参与评审。等级取自库名
+    前缀，与「知识库管理」页的 C/D/P/I 分类同一口径；手动重评仍放行。"""
+    from app.service import is_review_excluded_workspace, process_next_job, workspace_level
+
+    settings = get_settings()
+    assert workspace_level("I-陈鹏列(undefined)") == "I" and workspace_level("i_个人库") == "I"
+    assert workspace_level("C-01-规章制度") == "C" and workspace_level("BOM更新") == "其他"
+
+    init_db()
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        db.merge(Workspace(workspace_id="personal-ws", name="I-测试个人库"))
+        db.commit()
+        assert is_review_excluded_workspace(db, settings, "personal-ws")
+        assert not is_review_excluded_workspace(db, settings, "demo-workspace")
+        # 留空配置=不排除任何等级，口径可回滚
+        assert not is_review_excluded_workspace(
+            db, settings.model_copy(update={"review_excluded_workspace_levels": ""}), "personal-ws")
+
+        db.merge(Document(node_id="personal-doc-1", workspace_id="personal-ws", name="个人草稿.docx",
+                          extension="docx", uploader_key="u-human", uploader_name="陈鹏列",
+                          file_class="document"))
+        db.merge(ReviewJob(job_id="job-personal-1", node_id="personal-doc-1", trigger="audit"))
+        db.commit()
+        for _ in range(10):
+            db.expire_all()
+            if db.get(ReviewJob, "job-personal-1").status != "pending":
+                break
+            if not process_next_job(db, settings):
+                break
+        job = db.get(ReviewJob, "job-personal-1")
+        assert job.status == "skipped" and job.error_code == "personal_workspace"
+        assert (db.scalar(select(func.count()).select_from(ReviewInstance)
+                          .where(ReviewInstance.node_id == "personal-doc-1")) or 0) == 0
+        db.delete(job)
+        db.delete(db.get(Document, "personal-doc-1"))
+        db.query(Workspace).filter(Workspace.workspace_id == "personal-ws").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_folder_browser_walks_one_level_at_a_time():
+    """目录分布逐层下钻：每层只返回子目录，含子目录总数与直属数分开给，
+    面包屑可回退。旧接口把全库目录压成一张平表且无法回上级。"""
+    from app.db import HistoricalFileNode, HistoricalSnapshot
+
+    init_db()
+    with SessionLocal() as db:
+        db.query(HistoricalFileNode).filter(HistoricalFileNode.snapshot_id == "tree-snap").delete(synchronize_session=False)
+        if not db.get(HistoricalSnapshot, "tree-snap"):
+            db.add(HistoricalSnapshot(snapshot_id="tree-snap"))
+        rows = [("f1", "", "folder", "一级目录"), ("f2", "f1", "folder", "二级目录"),
+                ("a.docx", "f1", "file", "甲.docx"),
+                ("b.docx", "f2", "file", "乙.docx"), ("c.docx", "f2", "file", "丙.docx")]
+        for node_id, parent, node_type, name in rows:
+            db.add(HistoricalFileNode(snapshot_id="tree-snap", workspace_id="tree-ws", node_id=node_id,
+                                      parent_node_id=parent, node_type=node_type, name=name,
+                                      extension="docx" if node_type == "file" else "",
+                                      source_created_at="2026-07-15T10:00:00+08:00"))
+        db.commit()
+
+    with TestClient(app) as client:
+        base = "/api/v1/baseline/workspaces/tree-ws/folders"
+        root = client.get(base, params={"snapshot_id": "tree-snap"}).json()
+        assert root["total_folders"] == 2                      # 全库真实目录数，不是本页条数
+        assert [i["node_id"] for i in root["items"]] == ["f1"]  # 根层只有一级目录
+        assert root["items"][0]["total_files"] == 3            # 含子目录
+        assert root["items"][0]["direct_files"] == 1           # 直属
+        assert root["items"][0]["subfolders"] == 1
+        assert root["breadcrumb"] == []
+
+        level1 = client.get(base, params={"snapshot_id": "tree-snap", "parent": "f1"}).json()
+        assert [i["node_id"] for i in level1["items"]] == ["f2"]
+        assert level1["direct_files"] == 1
+        assert [b["node_id"] for b in level1["breadcrumb"]] == ["f1"]
+        assert level1["parent_of_current"] == ""               # 回退到根
+
+        level2 = client.get(base, params={"snapshot_id": "tree-snap", "parent": "f2"}).json()
+        assert level2["items"] == [] and level2["direct_files"] == 2
+        assert [b["node_id"] for b in level2["breadcrumb"]] == ["f1", "f2"]
+        assert level2["parent_of_current"] == "f1"             # 回退到一级目录
+
+    with SessionLocal() as db:
+        db.query(HistoricalFileNode).filter(HistoricalFileNode.snapshot_id == "tree-snap").delete(synchronize_session=False)
+        db.query(HistoricalSnapshot).filter(HistoricalSnapshot.snapshot_id == "tree-snap").delete(synchronize_session=False)
+        db.commit()
+
+
 def test_dashboard_average_uses_latest_instance_per_doc():
     with TestClient(app) as client:
         with SessionLocal() as db:

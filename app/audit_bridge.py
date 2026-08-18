@@ -182,13 +182,15 @@ def _route_review_event(db: Session, settings: Settings, doc: Document,
     no-body debt quiet while ensuring a real upload/overwrite is immediate and
     an online edit still uses the merge window.
     """
-    from .service import is_robot_uploader
+    from .service import is_review_excluded_workspace, is_robot_uploader
 
     kind = _action_kind(event)
     if kind not in ("review", "modify") or not _body_fetch_ready(doc):
         return
     eligible = (not doc.is_folder
                 and not is_robot_uploader(settings, doc.uploader_key, doc.uploader_name)
+                # 个人知识库（I-）不进自动评审（2026-08-18 拍板）
+                and not is_review_excluded_workspace(db, settings, doc.workspace_id)
                 and doc.file_class in review_classes(settings.review_classes)
                 and _should_auto_review(db, settings, doc, event))
     if not eligible:

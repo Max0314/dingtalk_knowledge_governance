@@ -1,6 +1,10 @@
 /* Relative URLs keep the app working both at / (tunnel/dev) and behind the
    /knowledge_governance/ prefix, where nginx strips the prefix. */
-const api=(url,options={})=>fetch(url.replace(/^\//,''),{headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));
+/* 导航中断：换页时作废上一页仍在飞的请求。快速连点原先会让每一页都跑完
+   自己的接口，且先点的那页响应回来得晚就把后点的页面整个覆盖掉——看起来
+   就是"点了没反应，然后跳回去了"。 */
+let navAbort=null;
+const api=(url,options={})=>fetch(url.replace(/^\//,''),{signal:navAbort&&navAbort.signal,headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));
   if(r.status===401){renderLogin();throw new Error(data.detail?.message||'请先登录')}
   if(!r.ok)throw new Error(data.detail?.message||data.detail||'请求失败');return data});
 const app=document.querySelector('#app');
@@ -280,12 +284,18 @@ async function documents(){
   document.querySelector('#bl-btn').onclick=applyFilters;
   document.querySelectorAll('#bl-q,#fl-up').forEach(i=>i.onkeydown=e=>{if(e.key==='Enter')applyFilters()});
   document.querySelectorAll('#bl-ws,#fl-dept').forEach(s=>s.onchange=applyFilters);
-  blSearch().catch(e=>{const box=document.querySelector('#bl-results');if(box)box.innerHTML=`<div class="empty">${e.message}</div>`});
+  blSearch().catch(e=>{if(aborted(e))return;const box=document.querySelector('#bl-results');if(box)box.innerHTML=`<div class="empty">${e.message}</div>`});
   loadWorkspaceOptions('#bl-ws');
   loadDeptOptions('#fl-dept')}
 
+/* 只要 id→名称。原先调 /metrics/coverage，那个接口会为每个知识库构造完整
+   明细（状态、部门、基线与实时计数），下拉框一个字段都用不上。 */
+async function loadWorkspaceNames(){
+  if(!Object.keys(state.coverageNames).length){
+    const c=await api('/api/v1/filters/workspaces');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}
+  return state.coverageNames}
 async function loadWorkspaceOptions(sel){try{
-  if(!Object.keys(state.coverageNames).length){const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}
+  await loadWorkspaceNames();
   const el=document.querySelector(sel);if(!el)return;const cur=el.value;
   el.innerHTML='<option value="">全部知识库</option>'+Object.entries(state.coverageNames).map(([k,v])=>`<option value="${k}">${v}</option>`).join('');
   el.value=cur;
@@ -348,9 +358,8 @@ async function workspaces(){
   state.wsReg=state.wsReg||{query:'',level:'',department:'',creator:'',admin:'',offset:0};const p=state.wsReg;
   const qs=new URLSearchParams({query:p.query,level:p.level==='其他'?'':p.level,department:p.department,creator:p.creator,admin:p.admin,offset:p.offset,limit:50});
   if(p.level==='其他')qs.set('level','其他');
-  const [reg,cov]=await Promise.all([api('/api/v1/workspaces?'+qs),api('/api/v1/metrics/coverage').catch(()=>null)]);
-  if(cov)cov.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name);
-  const s=cov?cov.summary:{visible_workspaces:reg.total,scanned:'—',empty:'—',excluded:'—'},org=(cov&&cov.org_context)||{};
+  const reg=await api('/api/v1/workspaces?'+qs);
+  const s=reg.summary||{visible_workspaces:reg.total,scanned:'—',empty:'—',excluded:'—'},org=reg.org_context||{};
   const facet=Object.fromEntries((reg.levels||[]).map(l=>[l.level,l.count]));
   const tabs=[['','全部'],['C','C-公司级'],['D','D-部门级'],['P','P-项目级'],['I','I-个人级'],['其他','其他']];
   shell('知识库管理','公司知识库注册表：等级分类、搜索、筛选与分页；点击行查看月度分布与治理配置。',`
@@ -384,14 +393,51 @@ async function workspaces(){
   document.querySelector('#wsnext').onclick=()=>{p.offset=p.offset+50;workspaces()};
   document.querySelectorAll('[data-ws]').forEach(x=>x.onclick=()=>goWs(x.dataset.ws))}
 
-async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),api('/api/v1/workspaces/'+id).catch(()=>null),api('/api/v1/baseline/workspaces/'+id+'/folders?limit=100').catch(()=>({items:[],total_folders:0,note:''}))]);
-  if(!Object.keys(state.coverageNames).length){try{const c=await api('/api/v1/metrics/coverage');c.items.forEach(i=>state.coverageNames[i.workspace_id]=i.name)}catch(e){}}
+
+/* 目录分布逐层下钻。原先把全库所有目录连同各级子目录压成一张按文件数排序
+   的平表，Top 100 截断，既看不出层级也退不回上一级；"共 N 个目录"显示的
+   还是本页条数。现在一次只列当前层的子目录，面包屑与"返回上一级"回退，
+   每个目录同时给出含子目录的总数和直属文件数。 */
+function renderFolderPanel(){const st=state.fold,card=document.querySelector('#folderCard');
+  if(!card)return;
+  if(!st||!st.data){card.innerHTML='<div class="empty">该知识库在当前快照中没有目录数据。</div>';return}
+  const fd=st.data,atRoot=!fd.breadcrumb.length;
+  const crumbs='<div class="crumbs"><button class="crumb '+(atRoot?'current':'')+'" data-fcrumb="">全部目录</button>'+
+    fd.breadcrumb.map((b,i)=>`<span class="sep">›</span><button class="crumb ${i===fd.breadcrumb.length-1?'current':''}" data-fcrumb="${b.node_id}">${b.name}</button>`).join('')+'</div>';
+  const rows=fd.items.map(f=>`<tr class="rowlink" data-fdrill="${f.node_id}"><td><b>${f.name}</b>${f.subfolders?` <small style="color:#9ca3af">${f.subfolders} 个子目录 ›</small>`:''}<br><small>${f.node_id}</small></td><td class="num"><b>${nf(f.total_files)}</b></td><td class="num">${f.direct_files?nf(f.direct_files):'—'}</td><td><small>${f.earliest||'—'} ~ ${f.latest||'—'}</small></td></tr>`).join('')
+    ||`<tr><td colspan="4"><div class="empty">该目录下没有子目录${fd.direct_files?`，仅有 ${nf(fd.direct_files)} 个文件`:''}。</div></td></tr>`;
+  const capped=fd.omitted?`本层共 ${nf(fd.children_at_level)} 个子目录，按文件数展示前 ${nf(fd.items.length)} 个，还有 ${nf(fd.omitted)} 个未列出——请用右侧搜索定位。`:'';
+  card.innerHTML=`<div class="card-head"><h2>目录分布（全库共 ${nf(fd.total_folders)} 个目录）</h2><span class="hint">${fd.note||'点击目录逐层下钻，面包屑或“返回上一级”回退'}</span></div>
+  ${capped?`<div class="banner">${capped}</div>`:''}
+  <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">${crumbs}<span style="flex:1"></span>
+    ${atRoot?'':'<button class="secondary" id="fd-up">↑ 返回上一级</button>'}
+    <button class="secondary" id="fd-files">查看本层文件（${nf(fd.direct_files)}）</button></div>
+  <div class="grid two-cols">
+    <div class="table-wrap" style="max-height:340px;overflow-y:auto"><table class="data-table"><thead><tr><th>子目录</th><th class="num">含子目录</th><th class="num">直属</th><th>时间跨度</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div><div class="controls"><input class="input" id="ws-q" placeholder="在本库内按文件名搜索" style="flex:1"><button class="secondary" id="ws-q-btn">搜索</button></div>
+      <div id="bl-results" class="section-gap"><div class="empty">点击目录或输入关键字查看文件。</div></div></div>
+  </div>`;
+  card.querySelectorAll('[data-fdrill]').forEach(x=>x.onclick=()=>gotoFolder(x.dataset.fdrill));
+  card.querySelectorAll('[data-fcrumb]').forEach(x=>x.onclick=()=>gotoFolder(x.dataset.fcrumb));
+  const up=card.querySelector('#fd-up');if(up)up.onclick=()=>gotoFolder(fd.parent_of_current||'');
+  card.querySelector('#fd-files').onclick=()=>{state.bl={query:'',ws:st.ws,offset:0,folder:fd.parent};blSearch()};
+  const wsBtn=card.querySelector('#ws-q-btn');
+  wsBtn.onclick=()=>{state.bl={query:card.querySelector('#ws-q').value,ws:st.ws,offset:0};blSearch()};
+  card.querySelector('#ws-q').onkeydown=e=>{if(e.key==='Enter')wsBtn.click()}}
+
+async function gotoFolder(parent){const st=state.fold;if(!st)return;
+  try{st.data=await api(`/api/v1/baseline/workspaces/${encodeURIComponent(st.ws)}/folders?`+new URLSearchParams({parent}));
+    renderFolderPanel();
+    /* 下钻即换上下文：右侧文件列表跟着回到"未选择"，否则留着上一层的结果会误读。 */
+    state.bl={query:'',ws:st.ws,offset:0}}
+  catch(e){if(!aborted(e))toast(e.message)}}
+
+async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1/metrics/workspaces/'+id+'/months'),api('/api/v1/workspaces/'+id).catch(()=>null),api('/api/v1/baseline/workspaces/'+id+'/folders').catch(()=>null)]);
+  try{await loadWorkspaceNames()}catch(e){}
   const name=state.coverageNames[id]||id;
   shell('知识库详情',name,`
   <section class="card"><div class="card-head"><h2>月度入库分布（基线 + 增量，共 ${nf(m.total_files)} 个文件）</h2><button class="secondary" id="back">返回</button></div><div id="wsChart" class="chart"></div></section>
-  ${fd.items.length?`<section class="card section-gap"><div class="card-head"><h2>目录分布（共 ${nf(fd.total_folders)} 个目录，按文件数 Top ${fd.items.length}）</h2><span class="hint">${fd.note}</span></div><div class="grid two-cols"><div class="table-wrap" style="max-height:340px;overflow-y:auto"><table class="data-table"><thead><tr><th>目录</th><th class="num">文件数</th><th>时间跨度</th></tr></thead><tbody>
-    ${fd.items.map(f=>`<tr class="rowlink" data-folder="${f.parent_node_id}"><td><b>${f.folder_name||(f.parent_node_id==='(根目录)'?'（根目录）':'（未记录名称）')}</b><br><small>${f.parent_node_id}</small></td><td class="num">${nf(f.file_count)}</td><td><small>${f.earliest} ~ ${f.latest}</small></td></tr>`).join('')}
-  </tbody></table></div><div><div class="controls"><input class="input" id="ws-q" placeholder="在本库内按文件名搜索" style="flex:1"><button class="secondary" id="ws-q-btn">搜索</button></div><div id="bl-results" class="section-gap"><div class="empty">点击左侧目录或输入关键字查看文件。</div></div></div></div></section>`:''}
+  ${fd?'<section class="card section-gap" id="folderCard"><div class="empty loading">正在加载目录…</div></section>':''}
   ${g?`<section class="grid two-cols section-gap"><form class="card" id="governance-form"><h2>治理归属与角色</h2><div class="form-grid" style="margin-top:12px">
     <label class="form-field"><span class="field-label">归属部门 ID</span><input class="input" name="owner_department_id" value="${g.owner_department_id||''}"></label>
     <label class="form-field"><span class="field-label">归属部门名称</span><input class="input" name="owner_department_name" value="${g.owner_department_name||''}"></label>
@@ -402,11 +448,8 @@ async function workspaceDetail(id){const[m,g,fd]=await Promise.all([api('/api/v1
   <section class="card"><h2>基本信息</h2><p class="hint">知识库 ID：${id}</p><p class="hint">创建：${fmt((g.source_created_at||'').slice(0,10))} · 最近更新：${fmt((g.source_updated_at||'').slice(0,10))}</p>${g.url?`<p class="hint"><a href="${g.url}" target="_blank" rel="noopener">在钉钉中打开 ↗</a></p>`:''}<p class="hint">实时同步文档数：${nf(g.document_count)}</p></section></section>`:''}`);
   renderChart('wsChart',stackedOption(m.months.map(x=>({month:x.month,routine:x.count,bulk_import:0}))));
   state.bl={query:'',ws:id,offset:0};
-  document.querySelectorAll('[data-folder]').forEach(x=>x.onclick=()=>{state.bl={query:'',ws:id,offset:0,folder:x.dataset.folder};blSearch()});
-  const wsBtn=document.querySelector('#ws-q-btn');
-  if(wsBtn)wsBtn.onclick=()=>{state.bl={query:document.querySelector('#ws-q').value,ws:id,offset:0};blSearch()};
-  const wsQ=document.querySelector('#ws-q');
-  if(wsQ)wsQ.onkeydown=e=>{if(e.key==='Enter')wsBtn.click()};
+  state.fold=fd?{ws:id,data:fd}:null;
+  renderFolderPanel();
   document.querySelector('#back').onclick=()=>goBack('workspaces');
   const form=document.querySelector('#governance-form');
   if(form)form.onsubmit=async e=>{e.preventDefault();const f=new FormData(e.currentTarget),arr=k=>String(f.get(k)||'').split(',').map(x=>x.trim()).filter(Boolean);
@@ -580,9 +623,20 @@ function routeOf(hash){const h=(hash||'').replace(/^#\/?/,'');const i=h.indexOf(
   if(head==='ws'&&rest)return{view:'workspaces',run:()=>workspaceDetail(rest)};
   if(views[head])return{view:head,run:views[head]};
   return{view:'overview',run:overview}}
-function render(){const r=routeOf(location.hash);state.view=r.view;document.body.classList.remove('sidebar-open');
+const aborted=e=>e&&(e.name==='AbortError'||e.code===20);
+/* 页面骨架：点击导航后立刻有反馈，不再停在上一页直到接口返回；高度也和
+   真实内容接近，落地时不会再把页面顶一下。 */
+function pageSkeleton(){disposeCharts();
+  app.innerHTML=`<div class="skeleton skeleton-head"></div>
+  <div class="grid metrics" aria-hidden="true">${'<div class="skeleton skeleton-card"></div>'.repeat(4)}</div>
+  <div class="skeleton skeleton-chart" aria-hidden="true"></div>
+  <div class="skeleton skeleton-table" aria-hidden="true"></div>`}
+function render(){if(navAbort)navAbort.abort();
+  navAbort=window.AbortController?new AbortController():null;
+  const r=routeOf(location.hash);state.view=r.view;document.body.classList.remove('sidebar-open');
   document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('active',b.dataset.view===r.view));
-  r.run().catch(e=>{if(app.querySelector('.login-card'))return;disposeCharts();app.innerHTML=`<section class="card"><h2>加载失败</h2><p class="hint">${e.message}</p><button class="secondary" onclick="location.reload()">重试</button></section>`})}
+  pageSkeleton();
+  r.run().catch(e=>{if(aborted(e))return;if(app.querySelector('.login-card'))return;disposeCharts();app.innerHTML=`<section class="card"><h2>加载失败</h2><p class="hint">${e.message}</p><button class="secondary" onclick="location.reload()">重试</button></section>`})}
 function navigate(view){const h='#/'+view;if(location.hash===h){render()}else{location.hash=h}}
 const goDoc=id=>{location.hash='#/doc/'+encodeURIComponent(id)};
 const goWs=id=>{location.hash='#/ws/'+encodeURIComponent(id)};
