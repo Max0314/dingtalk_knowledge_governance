@@ -301,7 +301,8 @@ def _live_workspace_counts(db: Session) -> dict[str, int]:
         .group_by(Document.workspace_id))}
 
 
-def coverage_summary(db: Session, context: dict[str, Any] | None = None) -> dict[str, int]:
+def coverage_summary(db: Session, context: dict[str, Any] | None = None,
+                     live_counts: dict[str, int] | None = None) -> dict[str, int]:
     """只算四个计数。知识库管理页此前为了这四个整数调用完整的 coverage()，
     连带构造每个知识库的完整明细再整包丢掉。
 
@@ -310,7 +311,9 @@ def coverage_summary(db: Session, context: dict[str, Any] | None = None) -> dict
     data = collected(db)
     context = context if context is not None else snapshot_context(db)
     excluded = {item.get("workspace_id") for item in context["definition"].get("excluded_workspaces", [])}
-    live_counts = _live_workspace_counts(db)
+    # The workspace registry already computed this exact GROUP BY for its
+    # document_count column. Reuse it instead of scanning documents twice.
+    live_counts = live_counts if live_counts is not None else _live_workspace_counts(db)
     summary = {"visible_workspaces": 0, "scanned": 0, "empty": 0, "excluded": 0}
     for workspace_id in db.scalars(select(Workspace.workspace_id)):
         summary["visible_workspaces"] += 1

@@ -395,7 +395,7 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         HistoricalFileNode.extension, HistoricalFileNode.url,
         HistoricalFileNode.source_created_at.label("created_at"),
         HistoricalFileNode.creator_user_id.label("creator"),
-    ).where(HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type != "folder",
+    ).where(HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type == "file",
             HistoricalFileNode.workspace_id.not_in(inactive_ws))
     live = select(
         Document.node_id, Document.workspace_id, Document.name,
@@ -623,7 +623,7 @@ def workspaces(query: str = "", level: str = "", department: str = "", creator: 
     return {"total": len(filtered), "total_all": len(items), "offset": offset, "limit": limit,
             "levels": [{"level": key, "label": WORKSPACE_LEVEL_LABELS.get(key, "其他"), "count": value}
                        for key, value in sorted(level_facets.items())],
-            "summary": metrics.coverage_summary(db, context),
+            "summary": metrics.coverage_summary(db, context, doc_counts),
             "org_context": context["definition"].get("org_context", {}),
             "items": filtered[offset:offset + limit]}
 

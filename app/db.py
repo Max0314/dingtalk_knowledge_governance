@@ -63,6 +63,12 @@ class WorkspaceRole(Base):
 
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (
+        # Unified-file listing: current rows are filtered by both flags and
+        # paged newest-first. Without this composite index MySQL filesorts the
+        # whole live mirror (~153k rows) for every page.
+        Index("ix_documents_current_created", "is_folder", "is_deleted", "source_created_at", "node_id"),
+    )
     node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
     # 目录架构：walk 遍历时可直接得到父节点；审计直建的文档先记 path、
@@ -261,6 +267,9 @@ class HistoricalFileNode(Base):
                       Index("ix_hfn_snapshot_creator", "snapshot_id", "creator_user_id"),
                       # newest-first paging of the merged document list
                       Index("ix_hfn_snapshot_created", "snapshot_id", "source_created_at"),
+                      # /api/v1/files filters one snapshot to file rows, then
+                      # pages newest-first before the live anti-join.
+                      Index("ix_hfn_snapshot_file_created", "snapshot_id", "node_type", "source_created_at", "node_id"),
                       # anti-join for baseline∪live dedup (metrics aggregation, /api/v1/files)
                       Index("ix_hfn_snapshot_node", "snapshot_id", "node_id"))
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -535,9 +544,11 @@ EXTRA_COLUMNS = {
 EXTRA_INDEXES = {
     "historical_file_nodes": {
         "ix_hfn_snapshot_node": "CREATE INDEX ix_hfn_snapshot_node ON historical_file_nodes (snapshot_id, node_id)",
+        "ix_hfn_snapshot_file_created": "CREATE INDEX ix_hfn_snapshot_file_created ON historical_file_nodes (snapshot_id, node_type, source_created_at, node_id)",
     },
     "documents": {
         "ix_documents_review_due_at": "CREATE INDEX ix_documents_review_due_at ON documents (review_due_at)",
+        "ix_documents_current_created": "CREATE INDEX ix_documents_current_created ON documents (is_folder, is_deleted, source_created_at, node_id)",
     },
 }
 
