@@ -416,13 +416,34 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
 
 
 def _near_event(iso_value: str, gmt_ms: int, tolerance_seconds: int = 900) -> bool:
+    """Whether a Wiki node timestamp corroborates an audit event.
+
+    The production Wiki ``batchQuery`` response has been observed to encode
+    Beijing wall-clock time with a trailing ``Z``: for example, an audit event
+    at ``13:20 UTC`` is returned by Wiki as ``21:20Z``.  Treating that marker
+    as UTC rejects the same node by eight hours and prevents the review from
+    ever reaching the body-fetch stage.  Keep the literal UTC interpretation
+    too, but accept the Beijing-wall-clock interpretation for that malformed
+    ``Z`` form only.  Explicit offsets remain authoritative.
+
+    This correction belongs only to the event/node corroboration gate.  It
+    deliberately does not rewrite the existing mirror timestamps, which would
+    make the next full scan report every stored document as changed.
+    """
     if not iso_value or not gmt_ms:
         return False
+    raw = str(iso_value).strip()
     try:
-        moment = datetime.fromisoformat(str(iso_value).replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=timezone.utc)
-        return abs(moment.timestamp() * 1000 - gmt_ms) <= tolerance_seconds * 1000
+        candidates = [moment]
+        if raw.endswith("Z"):
+            # DingTalk Wiki's malformed Z timestamp is a China Standard Time
+            # wall-clock value, not an actual UTC offset.
+            candidates.append(moment.replace(tzinfo=timezone(timedelta(hours=8))))
+        return any(abs(candidate.timestamp() * 1000 - gmt_ms) <= tolerance_seconds * 1000
+                   for candidate in candidates)
     except ValueError:
         return False
 

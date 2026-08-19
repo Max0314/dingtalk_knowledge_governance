@@ -765,6 +765,33 @@ def test_creation_event_rejects_payload_size_conflict(env):
         assert audit_bridge._event_matches_node(db, event, node) is False
 
 
+def test_creation_event_accepts_dingtalk_beijing_wall_clock_labeled_z(env):
+    """Production Wiki batchQuery emits Beijing time but labels it ``Z``.
+
+    The audit timestamp is authoritative UTC.  Without the compatibility
+    interpretation below, this exact same upload looks eight hours apart and
+    remains permanently pending before any body/model work can start.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    moment = datetime.fromtimestamp(DEFAULT_GMT / 1000, timezone.utc)
+    mislabeled = (moment + timedelta(hours=8)).strftime("%Y-%m-%dT%H:%MZ")
+    event = SimpleNamespace(action_view="知识库上传文件", extension="docx", size=0,
+                            gmt_create=DEFAULT_GMT, biz_id="99914000002")
+    node = {"node_id": "same-upload-beijing-clock", "extension": "docx", "size": 607350,
+            "created_at": mislabeled, "updated_at": mislabeled}
+    with SessionLocal() as db:
+        assert audit_bridge._event_matches_node(db, event, node) is True
+
+
+def test_explicit_utc_node_time_is_not_reinterpreted_as_beijing(env):
+    """Only DingTalk's malformed trailing-Z form gets the compatibility path."""
+    from datetime import datetime, timedelta, timezone
+
+    later = datetime.fromtimestamp((DEFAULT_GMT + 8 * 3600 * 1000) / 1000, timezone.utc)
+    assert audit_bridge._near_event(later.isoformat(), DEFAULT_GMT) is False
+
+
 def test_confirmed_finish_budget_rotates(env, monkeypatch):
     """codex 第七轮 P0：confirmed 收尾额度按最久未尝试轮转——文档迟迟
     不来的老事件不得堵死后来者。"""
