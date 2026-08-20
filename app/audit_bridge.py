@@ -710,7 +710,18 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if names is None:
                 unlocated += 1  # network failure: keep pending for retry
                 continue
-            hits = [node for node in nodes if node.get("name") in names]
+            # For ordinary uploaded files the Wiki name must repeat the exact
+            # storage-search name. Native documents are different: live
+            # batchQuery occasionally returns a display-normalized title while
+            # the dentry search carries the original exact title. The dentry
+            # UUID is the same Wiki node id, so for adoc the exact search hit
+            # plus node time/creator proof is authoritative; do not discard it
+            # merely because the duplicate display field differs.
+            native_doc = (event.extension or "").lower() == "adoc"
+            exact_ids = {d.get("dentry_uuid") for d in dentries
+                         if d.get("name") in names and d.get("dentry_uuid")}
+            hits = ([node for node in nodes if node.get("node_id") in exact_ids]
+                    if native_doc else [node for node in nodes if node.get("name") in names])
             workspaces = {node.get("workspace_id") for node in hits if node.get("workspace_id")}
             if not workspaces:
                 unlocated += 1  # 尚未进搜索索引：保持 pending，下一轮重试

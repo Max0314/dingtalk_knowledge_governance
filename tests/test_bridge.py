@@ -1477,6 +1477,49 @@ def test_native_adoc_creation_rejects_same_time_different_creator(env, monkeypat
         assert db.get(Document, "adoc-native-wrong-owner") is None
 
 
+def test_native_adoc_accepts_exact_dentry_hit_when_node_display_name_differs(env, monkeypatch):
+    """The dentry index is authoritative for a native document's title.
+
+    Wiki batchQuery may normalize the display name, but its node id, event
+    time and creator still corroborate the exact dentry hit.  Rejecting that
+    field-shape mismatch would leave a real online document permanently
+    unreviewed.
+    """
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class DisplayNameSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert space_ids is None
+            return [{"dentry_uuid": "adoc-native-display-name", "name": "审计原始标题"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "Wiki 显示标题（已规范化）", "workspace_id": WS,
+                     "node_id": "adoc-native-display-name", "extension": "adoc",
+                     "creator_id": "display-author", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", DisplayNameSearch)
+    org = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "", "bridge_sweep_max_governed": 0})
+    add_event("tb-native-adoc-display-name", "审计原始标题", "99268", extension="adoc", gmt=now_ms,
+              action_view="创建文档", operator="display-author")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-adoc-display-name"))
+        assert event.processed is True and event.matched_node_id == "adoc-native-display-name"
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == event.matched_node_id)).all()
+        for job in jobs:
+            db.delete(job)
+        db.delete(db.get(Document, event.matched_node_id))
+        db.commit()
+
+
 def test_native_adoc_locator_is_prioritized_over_attachment_backlog(env, monkeypatch):
     """A new online document must not wait behind the 20-item file locator cap."""
     import time as time_module
