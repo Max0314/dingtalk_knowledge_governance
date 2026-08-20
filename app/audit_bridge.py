@@ -470,6 +470,16 @@ def _event_matches_node(db: Session, event: FileAuditEvent, node: dict) -> bool:
     # the size. Node type is persisted from the wiki node, not this hint.
     if event.size and node.get("size") and int(event.size) != int(node["size"]):
         return False
+    # A creation event belongs to its creator.  The audit feed and the Wiki
+    # node API both provide the same numeric userId in production.  Make that
+    # a second independent proof when both sides carry it: identical titles
+    # created at nearly the same time are still not enough to attach one
+    # person's event to somebody else's online document.  A missing creator
+    # remains non-dispositive because older Wiki nodes occasionally omit it.
+    operator_id = getattr(event, "operator_user_id", "") or ""
+    if (_is_creation_event(event) and operator_id and node.get("creator_id")
+            and operator_id != str(node["creator_id"])):
+        return False
     if _near_event(node.get("created_at") or "", event.gmt_create):
         return True
     if allow_updated and _near_event(node.get("updated_at") or "", event.gmt_create):
@@ -636,11 +646,21 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
                   FileAuditEvent.gmt_create.desc(), FileAuditEvent.last_attempt_at.asc())
         .limit(WIKI_LOCATE_BUDGET)).all()
-    if settings.bridge_locator_enabled and settings.wiki_storage_space_id and candidates:
+    if settings.bridge_locator_enabled and candidates:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
-        locatable = [event for event in candidates
-                     if _action_kind(event) in ("review", "modify", "metadata")]
+        # Uploaded files belong to the configured shared storage space. Native
+        # DingTalk online documents (adoc) do not: their nodes are absent from
+        # that scoped storage index.  Search them globally, then retain the
+        # existing exact-name + event-time (+ creator for creation) proof
+        # before touching the mirror or review queue.  This is metadata-only;
+        # the document body is still fetched only by the review worker.
+        def _can_locate(event: FileAuditEvent) -> bool:
+            if _action_kind(event) not in ("review", "modify", "metadata"):
+                return False
+            return (event.extension or "").lower() == "adoc" or bool(settings.wiki_storage_space_id)
+
+        locatable = [event for event in candidates if _can_locate(event)]
         for event in candidates:
             event.last_attempt_at = now
 
@@ -649,7 +669,9 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             # directory path; the wiki batch query then names the workspace
             # each hit lives in. 两者都要带回：path 是目录归属的线索。
             names = _name_candidates(event)
-            dentries = await client.search_dentries(names[0], operator, [settings.wiki_storage_space_id])
+            native_doc = (event.extension or "").lower() == "adoc"
+            space_ids = None if native_doc else [settings.wiki_storage_space_id]
+            dentries = await client.search_dentries(names[0], operator, space_ids)
             exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
             nodes = await client.batch_query_wiki_nodes(exact_ids, operator) if exact_ids else []
             return event, names, dentries, nodes
@@ -717,6 +739,10 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                     summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
             if not event.processed:
                 _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
+        # Candidates whose body type lacks a locator (for example an uploaded
+        # file while the shared storage space is not configured) remain
+        # observable/pending exactly as before.
+        unlocated += len(candidates) - len(locatable)
     elif candidates:
         unlocated = len(candidates)
     if unlocated:

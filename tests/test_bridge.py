@@ -225,6 +225,7 @@ def test_locator_routes_precisely(env, monkeypatch):
             pass
 
         async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert space_ids == ["2932890480"]  # uploaded files stay in the configured storage scope
             return [{"dentry_uuid": "bridge-A", "name": "桥接测试文档.docx", "path": "/桥接测试库/桥接测试文档.docx"}]
 
         async def batch_query_wiki_nodes(self, node_ids, operator_id):
@@ -1411,16 +1412,18 @@ def test_native_adoc_uses_audit_extension_fallback_and_enters_review(env, monkey
             pass
 
         async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert space_ids is None  # native documents are not in the shared-storage scoped index
             return [{"dentry_uuid": "adoc-native-1", "name": "在线方案.adoc"}]
 
         async def batch_query_wiki_nodes(self, node_ids, operator_id):
             return [{"name": "在线方案.adoc", "workspace_id": WS, "node_id": "adoc-native-1",
-                     "created_at": gmt_iso(now_ms)}]  # extension intentionally absent
+                     "creator_id": "native-author", "created_at": gmt_iso(now_ms)}]  # extension intentionally absent
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", NativeDocSearch)
-    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    org = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "", "bridge_sweep_max_governed": 0})
     add_event("tb-native-adoc-1", "在线方案", "99265", extension="adoc", gmt=now_ms,
-              action_view="创建文档")
+              action_view="创建文档", operator="native-author")
     summary = run_bridge(org)
     assert summary["confirmed"] == 1 and summary.get("dead_letter", 0) == 0
     with SessionLocal() as db:
@@ -1434,6 +1437,44 @@ def test_native_adoc_uses_audit_extension_fallback_and_enters_review(env, monkey
             db.delete(job)
         db.delete(doc)
         db.commit()
+
+
+def test_native_adoc_creation_rejects_same_time_different_creator(env, monkeypatch):
+    """A same-name native document owned by another person must stay pending.
+
+    The native locator intentionally searches globally because adoc nodes do
+    not appear in the shared storage scope.  The creator check keeps that
+    broader search from binding an event to a colleague's concurrent document.
+    """
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class WrongCreatorSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert space_ids is None
+            return [{"dentry_uuid": "adoc-native-wrong-owner", "name": "同名在线文档"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "同名在线文档", "workspace_id": WS,
+                     "node_id": "adoc-native-wrong-owner", "extension": "adoc",
+                     "creator_id": "another-author", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", WrongCreatorSearch)
+    org = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "", "bridge_sweep_max_governed": 0})
+    add_event("tb-native-adoc-wrong-owner", "同名在线文档", "99266", extension="adoc", gmt=now_ms,
+              action_view="创建文档", operator="event-author")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 0 and summary["uncorroborated"] == 1
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-adoc-wrong-owner"))
+        assert event.processed is False and event.matched_node_id == ""
+        assert db.get(Document, "adoc-native-wrong-owner") is None
 
 
 def test_modify_event_never_overwrites_uploader(env, monkeypatch):
