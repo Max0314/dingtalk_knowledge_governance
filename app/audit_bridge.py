@@ -27,7 +27,7 @@ import logging
 import time
 import uuid as uuid_module
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, case, or_, select
 from sqlalchemy.orm import Session
 
 from datetime import datetime, timedelta, timezone
@@ -639,11 +639,21 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         # Plan A: old backlog is retained terminally by the bounded main pass;
         # never let it consume remote locator capacity before that happens.
         candidate_conditions.append(FileAuditEvent.gmt_create >= cutoff_ms)
+    # Native online documents cannot use the normal shared-storage lookup and
+    # historically accumulated behind high-volume attachment uploads. Give
+    # review/modify adoc events the first slots in the bounded locator; within
+    # each tier the established fair retry ordering remains unchanged.
+    native_review_priority = case(
+        (and_(FileAuditEvent.extension == "adoc",
+              FileAuditEvent.action_view.in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT))), 0),
+        else_=1,
+    )
     candidates = db.scalars(
         select(FileAuditEvent).where(*candidate_conditions)
         # Fresh, unattempted events are latency-sensitive; retry candidates
         # then rotate fairly by their oldest last attempt.
-        .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
+        .order_by(native_review_priority.asc(),
+                  FileAuditEvent.last_attempt_at.is_(None).desc(),
                   FileAuditEvent.gmt_create.desc(), FileAuditEvent.last_attempt_at.asc())
         .limit(WIKI_LOCATE_BUDGET)).all()
     if settings.bridge_locator_enabled and candidates:

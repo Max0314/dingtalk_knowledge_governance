@@ -1477,6 +1477,50 @@ def test_native_adoc_creation_rejects_same_time_different_creator(env, monkeypat
         assert db.get(Document, "adoc-native-wrong-owner") is None
 
 
+def test_native_adoc_locator_is_prioritized_over_attachment_backlog(env, monkeypatch):
+    """A new online document must not wait behind the 20-item file locator cap."""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class PrioritySearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            if keyword == "优先在线文档":
+                assert space_ids is None
+                return [{"dentry_uuid": "adoc-native-priority", "name": "优先在线文档"}]
+            return []
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "优先在线文档", "workspace_id": WS,
+                     "node_id": "adoc-native-priority", "extension": "adoc",
+                     "creator_id": "priority-author", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", PrioritySearch)
+    org = settings.model_copy(update={"bridge_locator_enabled": True, "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "", "bridge_sweep_max_governed": 0})
+    # These are newer but cannot be located without the shared storage config.
+    # The native document must nevertheless get a locator slot this cycle.
+    for index in range(audit_bridge.WIKI_LOCATE_BUDGET + 5):
+        add_event(f"tb-native-priority-file-{index}", f"附件{index}.docx", "99267", extension="docx",
+                  gmt=now_ms + index + 1)
+    add_event("tb-native-priority", "优先在线文档", "99267", extension="adoc", gmt=now_ms,
+              action_view="创建文档", operator="priority-author")
+    run_bridge(org)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-priority"))
+        assert event.processed is True and event.match_status == "confirmed"
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "adoc-native-priority")).all()
+        assert [job.trigger for job in jobs] == ["audit"]
+        for job in jobs:
+            db.delete(job)
+        db.delete(db.get(Document, "adoc-native-priority"))
+        db.commit()
+
+
 def test_modify_event_never_overwrites_uploader(env, monkeypatch):
     """归属保护（codex feb567a P1）：修改人是操作者不是上传人——已有文档的
     后续事件只记 last_modifier_key，上传人与部门归属保持不变。"""
