@@ -1,5 +1,6 @@
 import io
 import os
+from types import SimpleNamespace
 import zipfile
 
 os.environ["KG_DATABASE_URL"] = "sqlite:///./runtime/test_knowledge_governance.db"
@@ -37,6 +38,50 @@ def test_xlsx_extraction():
     assert "表头甲" in text and "数值乙" in text and "行内丙" in text
 
 
+def test_xls_extraction_stays_in_memory(monkeypatch):
+    import app.content as content_module
+
+    released: list[bool] = []
+
+    class Sheet:
+        nrows, ncols = 2, 2
+
+        @staticmethod
+        def cell_value(row, column):
+            return (("旧表头", "数量"), ("物料A", 3))[row][column]
+
+    class Workbook:
+        @staticmethod
+        def sheets():
+            return [Sheet()]
+
+        @staticmethod
+        def release_resources():
+            released.append(True)
+
+    monkeypatch.setattr(content_module.xlrd, "open_workbook",
+                        lambda *, file_contents, on_demand: Workbook())
+    text = extract_text("xls", b"synthetic-legacy-workbook")
+    assert "旧表头" in text and "物料A" in text and "3" in text
+    assert released == [True]
+
+
+def test_doc_extraction_uses_tmpfs_file_and_removes_it(monkeypatch):
+    import app.content as content_module
+
+    seen_paths: list[str] = []
+
+    def fake_run(args, **kwargs):
+        seen_paths.append(args[-1])
+        assert os.path.exists(args[-1])
+        assert args[:3] == ["antiword", "-m", "UTF-8.txt"]
+        return SimpleNamespace(returncode=0, stdout="旧版 Word 正文".encode("utf-8"))
+
+    monkeypatch.setattr(content_module.subprocess, "run", fake_run)
+    assert extract_text("doc", b"synthetic-legacy-word") == "旧版 Word 正文"
+    assert len(seen_paths) == 1 and not os.path.exists(seen_paths[0])
+
+
 def test_pptx_extraction():
     data = zip_bytes({"ppt/slides/slide1.xml":
                       "<p:sld xmlns:a='http://a' xmlns:p='http://p'><a:t>幻灯片标题</a:t></p:sld>"})
@@ -46,7 +91,6 @@ def test_pptx_extraction():
 def test_plain_text_and_fallbacks():
     assert extract_text("txt", "中文文本".encode("utf-8")) == "中文文本"
     assert extract_text("md", "中文gbk".encode("gb18030")) == "中文gbk"
-    assert extract_text("doc", b"legacy binary") == ""      # unsupported legacy format
     assert extract_text("docx", b"not a zip at all") == ""  # malformed archive degrades
 
 

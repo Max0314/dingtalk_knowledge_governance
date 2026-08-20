@@ -6,18 +6,24 @@ messages. Everything returned to callers is plain extracted text; callers
 persist only derived, structured results.
 
 Office formats are unpacked with the standard library (a .docx/.xlsx/.pptx
-is a zip of XML), PDF uses pypdf when available, plain-text families are
-decoded directly. DingTalk native .adoc documents use the official async
-DOCX-export API and are extracted from the in-memory export. Legacy .doc and
-unknown formats return empty text and the review is skipped.
+is a zip of XML); legacy .xls is parsed in memory with xlrd, while legacy
+.doc uses antiword with a short-lived /tmp file. PDF uses pypdf when
+available, and plain-text families are decoded directly. DingTalk native
+.adoc documents use the official async DOCX-export API and are extracted from
+the in-memory export. Unknown formats return empty text and the review is
+skipped.
 """
 from __future__ import annotations
 
 import io
+import os
 import re
+import subprocess
+import tempfile
 import zipfile
 
 from defusedxml import ElementTree
+import xlrd
 
 from .config import Settings
 from .db import Document
@@ -27,8 +33,10 @@ MAX_CHARS = 60000
 MAX_OFFICE_MEMBER_BYTES = 16 * 1024 * 1024
 MAX_OFFICE_XML_BYTES = 32 * 1024 * 1024
 PLAIN_TEXT_EXTENSIONS = {"txt", "md", "markdown", "csv", "html", "htm", "json", "xml", "log"}
-OFFICE_EXTENSIONS = {"docx", "xlsx", "pptx"}
+OFFICE_EXTENSIONS = {"doc", "docx", "xls", "xlsx", "pptx"}
 EXTRACTABLE_EXTENSIONS = PLAIN_TEXT_EXTENSIONS | OFFICE_EXTENSIONS | {"pdf"}
+LEGACY_DOC_TIMEOUT_SECONDS = 15
+MAX_XLS_CELLS = 200_000
 
 
 def _decode(data: bytes) -> str:
@@ -73,6 +81,40 @@ def _docx_text(data: bytes) -> str:
     return _strip_tags(xml_text)
 
 
+def _doc_text(data: bytes) -> str:
+    """Extract a legacy binary Word document without retaining it on disk.
+
+    antiword accepts paths only. Production containers mount /tmp as tmpfs;
+    the input is unlinked in ``finally`` immediately after extraction. The
+    command receives no user-controlled arguments and stdout is never logged
+    or persisted.
+    """
+    path = ""
+    try:
+        temp_dir = "/tmp" if os.path.isdir("/tmp") else None
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".doc", dir=temp_dir,
+                                         delete=False) as handle:
+            handle.write(data)
+            path = handle.name
+        result = subprocess.run(
+            ["antiword", "-m", "UTF-8.txt", path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=LEGACY_DOC_TIMEOUT_SECONDS,
+            check=False,
+        )
+        return _decode(result.stdout) if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 def _xlsx_text(data: bytes) -> str:
     parts: list[str] = []
     remaining = MAX_OFFICE_XML_BYTES
@@ -94,6 +136,36 @@ def _xlsx_text(data: bytes) -> str:
                     if node.tag.endswith("}t") and node.text:
                         parts.append(node.text)
     return "\n".join(parts)
+
+
+def _xls_text(data: bytes) -> str:
+    """Extract legacy workbook cell values in memory with bounded traversal."""
+    parts: list[str] = []
+    remaining = MAX_CHARS
+    cells_seen = 0
+    book = None
+    try:
+        book = xlrd.open_workbook(file_contents=data, on_demand=True)
+        for sheet in book.sheets():
+            for row_index in range(sheet.nrows):
+                for column_index in range(sheet.ncols):
+                    cells_seen += 1
+                    if cells_seen > MAX_XLS_CELLS or remaining <= 0:
+                        return "\n".join(parts)
+                    value = sheet.cell_value(row_index, column_index)
+                    if value in (None, ""):
+                        continue
+                    text = str(value).strip()
+                    if not text:
+                        continue
+                    parts.append(text[:remaining])
+                    remaining -= len(parts[-1]) + 1
+        return "\n".join(parts)
+    except (OSError, ValueError, xlrd.XLRDError):
+        return ""
+    finally:
+        if book is not None:
+            book.release_resources()
 
 
 def _pptx_text(data: bytes) -> str:
@@ -130,8 +202,12 @@ def extract_text(extension: str, data: bytes) -> str:
     try:
         if ext in PLAIN_TEXT_EXTENSIONS:
             text = _decode(data)
+        elif ext == "doc":
+            text = _doc_text(data)
         elif ext == "docx":
             text = _docx_text(data)
+        elif ext == "xls":
+            text = _xls_text(data)
         elif ext == "xlsx":
             text = _xlsx_text(data)
         elif ext == "pptx":
