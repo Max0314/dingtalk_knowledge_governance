@@ -24,7 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import Settings
-from .db import AuditDailyAgg, AuditState, FileAuditEvent, SessionLocal, utcnow
+from .db import AuditDailyAgg, AuditState, FileAuditEvent, SessionLocal, _audit_event_key, utcnow
 from .integrations import DingtalkClient, IntegrationError
 
 LOOKBACK_MS = 40 * 60 * 1000
@@ -87,12 +87,14 @@ async def _fetch_pages(settings: Settings, start_ms: int, end_ms: int) -> list[d
 
 def _ingest(db: Session, rows: list[dict]) -> dict:
     stored = reads = dupes = 0
-    known: set[str] = set()
+    known: dict[str, FileAuditEvent] = {}
     if rows:
-        ids = [str(r.get("bizId")) for r in rows if r.get("bizId") is not None]
-        for chunk_start in range(0, len(ids), 500):
-            chunk = ids[chunk_start:chunk_start + 500]
-            known.update(v[0] for v in db.execute(select(FileAuditEvent.biz_id).where(FileAuditEvent.biz_id.in_(chunk))))
+        keys = [_audit_event_key(r.get("bizId"), r.get("gmtCreate"), r.get("action"), r.get("actionView"))
+                for r in rows]
+        for chunk_start in range(0, len(keys), 500):
+            chunk = keys[chunk_start:chunk_start + 500]
+            for event in db.scalars(select(FileAuditEvent).where(FileAuditEvent.event_key.in_(chunk))).all():
+                known[event.event_key] = event
     agg: dict[tuple[str, str, str], int] = {}
     max_gmt = 0
     for row in rows:
@@ -108,20 +110,29 @@ def _ingest(db: Session, rows: list[dict]) -> dict:
                 agg[key] = agg.get(key, 0) + 1
             continue
         biz_id = str(row.get("bizId"))
-        if biz_id in known:
+        event_key = _audit_event_key(biz_id, gmt, row.get("action"), action_view)
+        if event_key in known:
+            # The schema may have gained fields after this immutable event was
+            # first stored. The overlap window doubles as safe enrichment.
+            existing = known[event_key]
+            workspace_name = str(row.get("workSpaceName") or "")[:255]
+            if not existing.workspace_name and workspace_name:
+                existing.workspace_name = workspace_name
             dupes += 1
             continue
-        known.add(biz_id)
         resource = str(row.get("resource") or "")[:512]
-        db.add(FileAuditEvent(
-            biz_id=biz_id, gmt_create=gmt,
+        event = FileAuditEvent(
+            event_key=event_key, biz_id=biz_id, gmt_create=gmt,
             operator_user_id=str(row.get("userId") or ""), operator_name=str(row.get("operatorName") or "")[:128],
             action=str(row.get("action") or ""), action_view=action_view[:64],
             module_view=module[:64], resource=resource,
             extension=_filename_extension(resource, row.get("resourceExtension")),
             size=int(row.get("resourceSize") or 0), target_space_id=str(row.get("targetSpaceId") or "")[:64],
+            workspace_name=str(row.get("workSpaceName") or "")[:255],
             ip_address=str(row.get("ipAddress") or "")[:64], platform=str(row.get("platformView") or "")[:32],
-        ))
+        )
+        db.add(event)
+        known[event_key] = event
         stored += 1
     for (day, module, action_view), count in agg.items():
         existing = db.scalar(select(AuditDailyAgg).where(AuditDailyAgg.day == day, AuditDailyAgg.module_view == module,

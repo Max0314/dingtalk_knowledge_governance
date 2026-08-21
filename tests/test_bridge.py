@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app import audit_bridge
-from app.audit_pull import _filename_extension
+from app.audit_pull import _filename_extension, _ingest
 from app.config import get_settings
 from app.db import Document, FileAuditEvent, ReviewInstance, ReviewJob, SessionLocal, SpaceMap, Workspace, init_db
 from app.fileclass import classify, review_classes
@@ -74,11 +74,12 @@ def env(monkeypatch):
 
 
 def add_event(biz_id, resource, space_id="2932890480", action_view="知识库上传文件",
-              module_view="团队空间", extension="docx", gmt=1786400000000, received=None, operator=""):
+              module_view="团队空间", extension="docx", gmt=1786400000000, received=None,
+              operator="", workspace_name=""):
     with SessionLocal() as db:
         kwargs = dict(biz_id=biz_id, gmt_create=gmt, action_view=action_view,
                       module_view=module_view, resource=resource, extension=extension,
-                      target_space_id=space_id)
+                      target_space_id=space_id, workspace_name=workspace_name)
         if received is not None:
             kwargs["received_at"] = received  # 重试窗口基准（默认=入库当下）
         if operator:
@@ -161,6 +162,32 @@ def locator_settings(settings):
 def test_audit_extension_prefers_filename_when_trail_metadata_is_wrong():
     assert _filename_extension("工具领取明细.xlsx", "adoc") == "xlsx"
     assert _filename_extension("无后缀在线文档", "adoc") == "adoc"
+
+
+def test_audit_ingest_preserves_same_biz_lifecycle_and_dedupes_overlap(env):
+    """bizId identifies a document; event_key identifies each operation."""
+    _settings, _walks, _ = env
+    rows = [
+        {"bizId": "tb-life-1", "gmtCreate": DEFAULT_GMT, "action": "create",
+         "actionView": "创建文档", "operateModuleView": "团队空间",
+         "resource": "无标题文档", "resourceExtension": "adoc",
+         "targetSpaceId": "99071", "workSpaceName": "桥接测试库"},
+        {"bizId": "tb-life-1", "gmtCreate": DEFAULT_GMT + 4_000, "action": "rename",
+         "actionView": "重命名", "operateModuleView": "团队空间",
+         "resource": "已重命名文档", "resourceExtension": "adoc",
+         "targetSpaceId": "99071", "workSpaceName": "桥接测试库"},
+    ]
+    with SessionLocal() as db:
+        first = _ingest(db, [{**row, "workSpaceName": ""} for row in rows])
+        db.commit()
+        second = _ingest(db, rows)
+        db.commit()
+        events = db.scalars(select(FileAuditEvent).where(
+            FileAuditEvent.biz_id == "tb-life-1").order_by(FileAuditEvent.gmt_create)).all()
+        assert first["stored"] == 2 and second["dupes"] == 2
+        assert [event.resource for event in events] == ["无标题文档", "已重命名文档"]
+        assert len({event.event_key for event in events}) == 2
+        assert all(event.workspace_name == "桥接测试库" for event in events)
 
 
 def test_pre_cutover_event_is_retained_without_locator_or_review(env, monkeypatch):
@@ -1478,7 +1505,7 @@ def test_native_adoc_creation_rejects_same_time_different_creator(env, monkeypat
 
 def test_native_locator_filters_proof_before_requiring_unique_title(env, monkeypatch):
     """Same-title history cannot block the one node proven by event time and
-    creator. The proof also learns the targeted workspace address."""
+    creator. targetSpaceId remains an unrelated shared-scope tally."""
     import time as time_module
 
     settings, walks, _ = env
@@ -1518,19 +1545,17 @@ def test_native_locator_filters_proof_before_requiring_unique_title(env, monkeyp
               gmt=now_ms, action_view="创建副本", operator="event-author")
     summary = run_bridge(org)
     assert summary["confirmed"] == 1
-    assert any(walk["workspace_id"] == WS and walk["mode"] == "bridge" for walk in walks)
     with SessionLocal() as db:
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-proof-order"))
         assert event.matched_node_id == "adoc-native-current" and event.resolution == "done"
-        mapping = db.get(SpaceMap, "99069")
-        assert mapping.workspace_id == WS and mapping.source == "learned"
+        assert walks == []
         db.query(ReviewJob).filter(ReviewJob.node_id == "adoc-native-current").delete(synchronize_session=False)
         db.query(Document).filter(Document.node_id == "adoc-native-current").delete(synchronize_session=False)
         db.commit()
 
 
-def test_mapped_native_event_walks_workspace_after_immediate_rename(env, monkeypatch):
-    """A learned space address must survive the audit title going stale.
+def test_workspace_named_native_event_walks_after_search_index_lag(env, monkeypatch):
+    """The audit workspace name routes a targeted walk when search lags.
 
     DingTalk can emit ``无标题文档`` and let the user rename the document before
     its search index is queried.  The audit row is only the doorbell here: the
@@ -1546,7 +1571,7 @@ def test_mapped_native_event_walks_workspace_after_immediate_rename(env, monkeyp
             pass
 
         async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
-            assert keyword == "无标题文档" and space_ids is None
+            assert keyword in ("无标题文档", "无标题文档.adoc") and space_ids is None
             return []
 
         async def batch_query_wiki_nodes(self, node_ids, operator_id):
@@ -1556,20 +1581,93 @@ def test_mapped_native_event_walks_workspace_after_immediate_rename(env, monkeyp
     with SessionLocal() as db:
         ws = db.get(Workspace, WS)
         ws.watch_seeded = True
-        db.merge(SpaceMap(space_id="99070", workspace_id=WS, source="learned"))
         db.commit()
     org = settings.model_copy(update={"bridge_locator_enabled": True,
                                       "dingtalk_sync_operator_id": "op",
                                       "wiki_storage_space_id": "",
                                       "bridge_sweep_max_governed": 0})
     add_event("tb-native-renamed-map", "无标题文档", "99070", extension="adoc",
-              gmt=now_ms, action_view="创建文档", operator="event-author")
+              gmt=now_ms, action_view="创建文档", operator="event-author",
+              workspace_name="桥接测试库")
     summary = run_bridge(org)
     assert summary["confirmed"] == 0 and summary["unlocated"] == 1
     assert any(walk["workspace_id"] == WS and walk["mode"] == "bridge" for walk in walks)
     with SessionLocal() as db:
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-renamed-map"))
         assert event.processed is False and event.matched_node_id == ""
+
+
+def test_realtime_bridge_persists_walk_for_dedicated_watcher(env):
+    settings, walks, _ = env
+    with SessionLocal() as db:
+        ws = db.get(Workspace, WS)
+        ws.watch_seeded = True
+        db.commit()
+    add_event("tb-realtime-queue", "搜索索引滞后", "99073", extension="adoc",
+              action_view="创建文档", workspace_name="桥接测试库")
+    with SessionLocal() as db:
+        summary = audit_bridge.process_audit_events(
+            db, settings.model_copy(update={"bridge_sweep_max_governed": 0}), drain_walks=False)
+        from app.db import BridgeWalk
+        assert summary["walks"] == [] and db.get(BridgeWalk, WS) is not None
+    with SessionLocal() as db:
+        drained = audit_bridge.drain_bridge_walks(db, settings)
+        assert drained["walks"][0]["workspace_id"] == WS
+    assert walks == [{"workspace_id": WS, "mode": "bridge"}]
+
+
+def test_same_biz_rename_lifecycle_locates_creation_by_latest_title(env, monkeypatch):
+    """A rename keeps bizId, so its latest title must locate the create row."""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class LifecycleSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert keyword == "测试稳稳地" and space_ids is None
+            return [{"dentry_uuid": "adoc-native-lifecycle", "name": "测试稳稳地"}]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "测试稳稳地", "workspace_id": WS,
+                     "node_id": "adoc-native-lifecycle", "extension": "adoc",
+                     "creator_id": "event-author", "created_at": gmt_iso(now_ms),
+                     "updated_at": gmt_iso(now_ms + 4_000)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", LifecycleSearch)
+    with SessionLocal() as db:
+        ws = db.get(Workspace, WS)
+        ws.watch_seeded = True
+        db.commit()
+    org = settings.model_copy(update={"bridge_locator_enabled": True,
+                                      "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "",
+                                      "bridge_sweep_max_governed": 0})
+    add_event("tb-native-lifecycle", "无标题文档(1)", "99072", extension="adoc",
+              gmt=now_ms, action_view="创建文档", operator="event-author",
+              workspace_name="桥接测试库")
+    add_event("tb-native-lifecycle", "测试稳稳地", "99072", extension="adoc",
+              gmt=now_ms + 4_000, action_view="重命名", operator="event-author",
+              workspace_name="桥接测试库")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 2
+    assert any(walk["workspace_id"] == WS for walk in walks)
+    with SessionLocal() as db:
+        events = db.scalars(select(FileAuditEvent).where(
+            FileAuditEvent.biz_id == "tb-native-lifecycle").order_by(FileAuditEvent.gmt_create)).all()
+        assert [(event.match_status, event.resolution) for event in events] == [
+            ("confirmed", "done"), ("confirmed", "metadata_applied")]
+        doc = db.get(Document, "adoc-native-lifecycle")
+        assert doc is not None and doc.name == "测试稳稳地"
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == doc.node_id)).all()
+        assert [job.trigger for job in jobs] == ["audit"]
+        for job in jobs:
+            db.delete(job)
+        db.delete(doc)
+        db.commit()
 
 
 def test_native_adoc_accepts_exact_dentry_hit_when_node_display_name_differs(env, monkeypatch):
@@ -1656,6 +1754,47 @@ def test_native_adoc_locator_is_prioritized_over_attachment_backlog(env, monkeyp
         for job in jobs:
             db.delete(job)
         db.delete(db.get(Document, "adoc-native-priority"))
+        db.commit()
+
+
+def test_attachment_keeps_reserved_locator_slot_during_native_backlog(env, monkeypatch):
+    """Native priority must not starve a fresh Word/Excel upload."""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class AttachmentSlotSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            if keyword == "保留名额.docx":
+                assert space_ids == ["2932890480"]
+                return [{"dentry_uuid": "attachment-reserved-slot", "name": keyword}]
+            return []
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [{"name": "保留名额.docx", "workspace_id": WS,
+                     "node_id": "attachment-reserved-slot", "extension": "docx",
+                     "creator_id": "attachment-author", "created_at": gmt_iso(now_ms)}]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", AttachmentSlotSearch)
+    org = locator_settings(settings).model_copy(update={"bridge_sweep_max_governed": 0})
+    for index in range(audit_bridge.WIKI_LOCATE_BUDGET + 5):
+        add_event(f"tb-attachment-slot-native-{index}", f"在线积压{index}", "99269",
+                  extension="adoc", gmt=now_ms + index + 1, action_view="创建文档")
+    add_event("99962009999", "保留名额.docx", "99269", extension="docx", gmt=now_ms,
+              operator="attachment-author")
+    run_bridge(org)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99962009999"))
+        assert event.processed is True and event.match_status == "confirmed"
+        jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "attachment-reserved-slot")).all()
+        assert [job.trigger for job in jobs] == ["audit"]
+        for job in jobs:
+            db.delete(job)
+        db.delete(db.get(Document, "attachment-reserved-slot"))
         db.commit()
 
 

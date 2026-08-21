@@ -5,7 +5,7 @@
 
 ## 已上线能力
 
-- **全库实时镜像**：watcher 按 `KG_WATCH_WORKSPACES`（`*` = 服务身份可见的全部知识库）分片轮巡；首轮只建镜像不评审存量，之后定向巡走发现的新增原生 `.adoc` 按权威 `nodeId` 入队，上传附件继续由审计链挂载数字下载键后入队，连续缺席软删除。分片间穿插评审任务、推送与审计拉取，长周期不饿死其他后台能力。
+- **全库实时镜像**：独立 watcher 按 `KG_WATCH_WORKSPACES`（`*` = 服务身份可见的全部知识库）分片轮巡；首轮只建镜像不评审存量，之后定向巡走发现的新增原生 `.adoc` 按权威 `nodeId` 入队，上传附件继续由审计链挂载数字下载键后入队，连续缺席软删除。审计/评审 worker 与慢巡走物理隔离，长周期不会阻塞新事件入队。
 - **AI 评审**：V1.1 规则引擎（7 维度 24 条，参数可配置）+ 可选大模型正文评审（`KG_MODEL_ALLOW_CONTENT_TRANSFER`），按上传人一级部门解析规则（部门覆盖 → 全局 → 内置），实例不可变、逐条留痕 `rule_config_ref`。上传文件通过钉钉存储下载，原生 `.adoc` 在线文档通过官方异步导出接口转为 DOCX 后在内存抽取；拿不到正文一律跳过评审和推送，只记录任务原因。数字员工（机器人）上传不自动参与评审（详情页手动重评为明确人为意图，放行）。
 - **评分规则配置页**：全局默认 + 各部门覆盖；全局管理员与部门维护人两级编辑权限，修改留历史可回滚。
 - **评审推送**：机器人单聊，通过/低分双文案（低分为说明语气，带分析页链接与试点尾注），按人静默去抖汇总（5 分钟静默/30 分钟兜底），`KG_NOTIFY_DEPARTMENTS` 按上传人部门灰度，`KG_NOTIFY_ON_PASS` 控制合格推送。
@@ -14,7 +14,7 @@
 
 ## 架构与平台约束
 
-- FastAPI（api 容器）+ 单 worker 轮询（无 Redis，队列即数据库表）；前端为 vendored ECharts 的原生 JS 单页（hash 路由）。
+- FastAPI（api 容器）+ 实时 worker（审计/评审/通知）+ watcher（定向与全量扫描）；无 Redis，两个后台角色通过 MySQL 队列表协作。前端为 vendored ECharts 的原生 JS 单页（hash 路由）。
 - 平台规则：应用栈不含数据库容器，`KG_DATABASE_URL` 指向外部 MySQL；正文只存在于评审进程内存/tmpfs，绝不落库、落盘、进日志。
 - 端口 39021，默认只绑定 127.0.0.1（本机 nginx 反代对外）；`KG_PUBLISH_BIND` 可显式放开。
 - 服务器访问 GitHub 受限，部署走服务器裸仓库双推：`git push origin main && git push neoflow main`，服务器 `git pull && docker compose up --build -d`。详见 [docs/deployment-guide.md](docs/deployment-guide.md)（脱敏版；真实凭据在仓库外的运维手册）。

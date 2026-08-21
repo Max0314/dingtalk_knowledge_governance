@@ -237,6 +237,33 @@ def test_sweep_stale_runs():
         db.commit()
 
 
+def test_realtime_sweep_preserves_live_scan_and_bridge_queue():
+    from app.db import BridgeWalk, ReviewJob
+    from app.service import sweep_stale_runs
+
+    init_db()
+    with SessionLocal() as db:
+        _ensure_demo_workspace(db)
+        db.merge(SyncRun(run_id="role-scan-1", status="running", mode="watch", workspace_id="ws-z"))
+        db.merge(BridgeWalk(workspace_id="role-walk-ws"))
+        db.query(ReviewJob).filter(ReviewJob.job_id == "role-review-1").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "role-review-doc").delete(synchronize_session=False)
+        db.add(Document(node_id="role-review-doc", workspace_id="demo-workspace",
+                        name="角色隔离评审.docx", extension="docx", file_class="document"))
+        db.add(ReviewJob(job_id="role-review-1", node_id="role-review-doc",
+                         trigger="audit", status="running"))
+        db.commit()
+        assert sweep_stale_runs(db, sync_runs=False, bridge_walks=False) == 1
+        assert db.get(SyncRun, "role-scan-1").status == "running"
+        assert db.get(BridgeWalk, "role-walk-ws") is not None
+        assert db.get(ReviewJob, "role-review-1").status == "pending"
+        sweep_stale_runs(db)
+        db.delete(db.get(SyncRun, "role-scan-1"))
+        db.delete(db.get(ReviewJob, "role-review-1"))
+        db.delete(db.get(Document, "role-review-doc"))
+        db.commit()
+
+
 def test_harvest_due_reviews_window_and_cap():
     """合并窗收割：到期收割、6 小时封顶强制收割、未到期不动；收割后窗口
     字段清零，任务 trigger=modify_merged。"""

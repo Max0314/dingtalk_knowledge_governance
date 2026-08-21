@@ -30,3 +30,13 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped
+
+  watcher:
+    build: .
+    command: ["python", "-m", "app.watcher"]
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    restart: unless-stopped

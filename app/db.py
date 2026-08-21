@@ -1,4 +1,6 @@
 import time
+import hashlib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine
@@ -348,8 +350,16 @@ class StreamEvent(Base):
 class FileAuditEvent(Base):
     """Write-type operations from the exclusive audit trail (pillar B CDC)."""
     __tablename__ = "file_audit_events"
+    __table_args__ = (
+        Index("ux_file_audit_event_key", "event_key", unique=True),
+        Index("ix_file_audit_events_biz_id", "biz_id"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    biz_id: Mapped[str] = mapped_column(String(64), unique=True)
+    # bizId is a stable DOCUMENT identity, not an event identity. DingTalk
+    # emits creation and rename rows with the same bizId. event_key dedupes
+    # overlap pulls while preserving that lifecycle.
+    event_key: Mapped[str] = mapped_column(String(64), default=lambda: uuid.uuid4().hex)
+    biz_id: Mapped[str] = mapped_column(String(64))
     gmt_create: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), index=True)
     operator_user_id: Mapped[str] = mapped_column(id_string(), index=True, default="")
     operator_name: Mapped[str] = mapped_column(String(128), default="")
@@ -360,6 +370,10 @@ class FileAuditEvent(Base):
     extension: Mapped[str] = mapped_column(String(32), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)
     target_space_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    # Human-readable Wiki workspace name carried by the audit source. Unlike
+    # targetSpaceId (an org-wide shared storage scope), this can be resolved
+    # exactly against the visible Wiki workspace registry.
+    workspace_name: Mapped[str] = mapped_column(String(255), default="", index=True)
     ip_address: Mapped[str] = mapped_column(String(64), default="")
     platform: Mapped[str] = mapped_column(String(32), default="")
     matched_node_id: Mapped[str] = mapped_column(id_string(), default="")  # filled by the future matcher
@@ -414,12 +428,11 @@ class AuditDailyAgg(Base):
 
 
 class SpaceMap(Base):
-    """Learned mapping from audit-trail numeric space ids to wiki workspaces.
+    """Legacy tally for audit-trail shared storage-space ids.
 
-    Audit events carry only a numeric storage-space id; the review pipeline
-    needs a workspaceId. Rows start unmapped (workspace_id="") and are filled
-    by the bridge's resource-name learner, a manual seed, or reconciliation —
-    the per-space event tally shows which unmapped spaces matter most.
+    Production proved targetSpaceId is org-wide and cannot identify one Wiki
+    workspace. workspace_id/name are retained for schema compatibility only;
+    routing uses FileAuditEvent.workspace_name instead.
     """
     __tablename__ = "space_map"
     space_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -528,7 +541,9 @@ EXTRA_COLUMNS = {
     "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
                           "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
                           "last_attempt_at": "DATETIME NULL",
-                          "retry_started_at": "DATETIME NULL"},
+                          "retry_started_at": "DATETIME NULL",
+                          "event_key": "VARCHAR(64) NOT NULL DEFAULT ''",
+                          "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''"},
     "bridge_walk_queue": {"last_attempt_at": "DATETIME NULL",
                           "failures": "INTEGER NOT NULL DEFAULT 0"},
     "documents": {"parent_node_id": "VARCHAR(128) NOT NULL DEFAULT ''",
@@ -564,6 +579,7 @@ def _ensure_columns() -> None:
             if column not in existing:
                 with engine.begin() as conn:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+    _ensure_audit_event_identity()
     # create_all only builds indexes for NEW tables; existing tables get
     # model-declared indexes here (idempotent by name).
     for table, indexes in EXTRA_INDEXES.items():
@@ -574,3 +590,98 @@ def _ensure_columns() -> None:
             if name not in existing_indexes:
                 with engine.begin() as conn:
                     conn.execute(text(ddl))
+
+
+def _audit_event_key(biz_id: object, gmt_create: object, action: object, action_view: object) -> str:
+    # action is accepted for call-site compatibility but deliberately omitted:
+    # the persisted action column is length-limited and must hash identically
+    # to the raw overlap row. bizId + timestamp + localized action name is the
+    # observed stable event identity.
+    canonical = "\x1f".join((str(biz_id or "")[:64], str(gmt_create or ""),
+                              str(action_view or "")[:64]))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _rebuild_sqlite_audit_events() -> None:
+    """Remove the legacy SQLite UNIQUE(biz_id) table constraint.
+
+    SQLite cannot drop an unnamed table-level unique constraint. The local
+    shared test database predates event_key, so rebuild this FK-free audit
+    table in place while preserving every row and its primary key.
+    """
+    from sqlalchemy import inspect, text
+
+    legacy = "file_audit_events_legacy_identity"
+    old_inspector = inspect(engine)
+    old_indexes = [idx["name"] for idx in old_inspector.get_indexes("file_audit_events") if idx.get("name")]
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE IF EXISTS {legacy}"))
+        conn.execute(text(f"ALTER TABLE file_audit_events RENAME TO {legacy}"))
+        # Named indexes keep their names after ALTER TABLE and would collide
+        # with the model-declared indexes on the replacement table.
+        for name in old_indexes:
+            conn.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+    FileAuditEvent.__table__.create(engine, checkfirst=False)
+    new_columns = {column.name for column in FileAuditEvent.__table__.columns}
+    legacy_columns = {column["name"] for column in inspect(engine).get_columns(legacy)}
+    common = [column.name for column in FileAuditEvent.__table__.columns
+              if column.name in new_columns and column.name in legacy_columns]
+    quoted = ", ".join(f'"{name}"' for name in common)
+    with engine.begin() as conn:
+        conn.execute(text(f'INSERT INTO file_audit_events ({quoted}) SELECT {quoted} FROM {legacy}'))
+        conn.execute(text(f"DROP TABLE {legacy}"))
+
+
+def _ensure_audit_event_identity() -> None:
+    """Migrate bizId from event-unique to lifecycle correlation identity."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if not inspector.has_table("file_audit_events"):
+        return
+    with engine.begin() as conn:
+        if engine.dialect.name == "mysql":
+            # One set-based update keeps the 42k-row production migration well
+            # below the schema-lock timeout and matches _audit_event_key.
+            conn.execute(text(
+                "UPDATE file_audit_events SET event_key = SHA2(CONCAT("
+                "LEFT(COALESCE(biz_id, ''), 64), CHAR(31), "
+                "COALESCE(CAST(gmt_create AS CHAR), ''), CHAR(31), "
+                "LEFT(COALESCE(action_view, ''), 64)), 256) "
+                "WHERE event_key IS NULL OR event_key = ''"
+            ))
+        else:
+            rows = conn.execute(text(
+                "SELECT id, biz_id, gmt_create, action, action_view FROM file_audit_events "
+                "WHERE event_key IS NULL OR event_key = ''"
+            )).mappings().all()
+            if rows:
+                conn.execute(text("UPDATE file_audit_events SET event_key=:event_key WHERE id=:id"), [
+                    {"id": row["id"], "event_key": _audit_event_key(
+                        row["biz_id"], row["gmt_create"], row["action"], row["action_view"])}
+                    for row in rows
+                ])
+
+    inspector = inspect(engine)
+    legacy_unique = [constraint for constraint in inspector.get_unique_constraints("file_audit_events")
+                     if constraint.get("column_names") == ["biz_id"]]
+    legacy_unique += [index for index in inspector.get_indexes("file_audit_events")
+                      if index.get("unique") and index.get("column_names") == ["biz_id"]]
+    if engine.dialect.name == "sqlite" and legacy_unique:
+        _rebuild_sqlite_audit_events()
+        return
+    if engine.dialect.name == "mysql" and legacy_unique:
+        names = {item.get("name") for item in legacy_unique if item.get("name")}
+        with engine.begin() as conn:
+            quote = conn.dialect.identifier_preparer.quote
+            for name in names:
+                conn.execute(text(f"ALTER TABLE file_audit_events DROP INDEX {quote(name)}"))
+
+    indexes = {index["name"]: index for index in inspect(engine).get_indexes("file_audit_events")}
+    with engine.begin() as conn:
+        if "ux_file_audit_event_key" not in indexes:
+            conn.execute(text("CREATE UNIQUE INDEX ux_file_audit_event_key ON file_audit_events (event_key)"))
+        if "ix_file_audit_events_biz_id" not in indexes:
+            conn.execute(text("CREATE INDEX ix_file_audit_events_biz_id ON file_audit_events (biz_id)"))
+        if "ix_file_audit_events_workspace_name" not in indexes:
+            conn.execute(text("CREATE INDEX ix_file_audit_events_workspace_name ON file_audit_events (workspace_name)"))

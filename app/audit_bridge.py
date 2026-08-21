@@ -10,15 +10,15 @@ storage-space id, so the event does NOT say in *which* library. 2026-08-14
      移动 -> 只更新元数据；删除/恢复 -> 仅本地匹配（bizId/历史确认映射）
      做软删/恢复，恢复不评审；协作/分享/权限等纯协同动作 -> 直接终态忽略，
      不消耗任何定位额度。
-  2. locator：按文件名走存储搜索 + wiki 批量节点查询拿精确 node id，并与
-     节点载荷时间/大小互证（"系统不认识" ≠ 新节点）。
+  2. locator：bizId 串联创建/重命名生命周期，以最新标题走存储搜索 + wiki
+     批量节点查询拿精确 node id，并与节点载荷时间/大小互证。
   3. 确认后直接建档/更新该节点（一个事件只动一个节点，零整库遍历）。
      完成语义：评审类/修改类事件以"下载键在文档上"为 done；元数据/删除/
      恢复/忽略各有专属终态，绝不伪装成 done。
 
-space_map remains as an observability tally. Cost model: no wiki writes ->
-no locator calls; the legacy sweep walk only fires at pilot scale
-(governed <= bridge_sweep_max_governed).
+targetSpaceId is only an org-wide storage-scope tally; workSpaceName uniquely
+resolves the Wiki workspace. Cost model: no wiki writes -> no locator calls;
+slow targeted walks are persisted for the dedicated watcher process.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ import logging
 import time
 import uuid as uuid_module
 
-from sqlalchemy import and_, case, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from datetime import datetime, timedelta, timezone
@@ -45,6 +45,7 @@ BATCH = 500
 # 每轮远程定位的事件上限与时间预算。名称搜索与节点查询都受并发上限约束，
 # 使高频上传不会积压，同时不会独占 worker 或压垮钉钉接口。
 WIKI_LOCATE_BUDGET = 20
+WIKI_LOCATE_NATIVE_RESERVED = 15
 WIKI_LOCATE_CONCURRENCY = 5
 LOCATE_TIME_BUDGET_SECONDS = 30
 # 每轮桥接巡走的库数上限；没走到的库留在持久化队列里下一轮续走。
@@ -92,11 +93,29 @@ def _is_wiki_write(event: FileAuditEvent) -> bool:
     return "知识库" in (event.action_view or "") or (event.module_view or "") == "团队空间"
 
 
-def _name_candidates(event: FileAuditEvent) -> list[str]:
-    names = [event.resource]
-    if event.extension and not event.resource.endswith("." + event.extension):
-        names.append(f"{event.resource}.{event.extension}")
-    return [name for name in names if name]
+def _name_candidates(db: Session, event: FileAuditEvent) -> list[str]:
+    """Current and historical titles for one stable DingTalk document.
+
+    bizId is shared by create/rename rows. Prefer the newest audit title so a
+    document renamed immediately after creation can be located by its live
+    name, while retaining older titles as bounded fallbacks.
+    """
+    lifecycle = db.execute(
+        select(FileAuditEvent.resource, FileAuditEvent.extension)
+        .where(FileAuditEvent.biz_id == event.biz_id)
+        .order_by(FileAuditEvent.gmt_create.desc(), FileAuditEvent.id.desc())
+        .limit(10)
+    ).all() if event.biz_id else []
+    pairs = lifecycle or [(event.resource, event.extension)]
+    names: list[str] = []
+    for resource, extension in pairs:
+        resource = resource or ""
+        extension = extension or ""
+        for name in (resource, f"{resource}.{extension}" if resource and extension
+                     and not resource.lower().endswith("." + extension.lower()) else ""):
+            if name and name not in names:
+                names.append(name)
+    return names
 
 
 def _extension_mismatch(event: FileAuditEvent, node: dict) -> bool:
@@ -112,7 +131,7 @@ def _latest_snapshot_id(db: Session) -> str:
 
 def _unique_node_match(db: Session, event: FileAuditEvent, snapshot_id: str) -> str:
     """node_id when the resource name matches exactly one known node."""
-    names = _name_candidates(event)
+    names = _name_candidates(db, event)
     if not names:
         return ""
     nodes = {doc.node_id for doc in db.scalars(
@@ -138,30 +157,36 @@ def _tally_space(db: Session, event: FileAuditEvent) -> None:
     entry.last_event_gmt = max(entry.last_event_gmt or 0, event.gmt_create or 0)
 
 
-def _learn_space_mapping(db: Session, event: FileAuditEvent, workspace_id: str) -> bool:
-    """Remember the storage-space -> Wiki-workspace address after node proof.
+def _workspace_from_event(db: Session, event: FileAuditEvent) -> Workspace | None:
+    """Resolve the exact Wiki workspace named by the audit row.
 
-    DingTalk exposes these as different identifier namespaces, so equality is
-    neither expected nor required.  A corroborated node is the evidence.  A
-    conflicting existing mapping is left untouched and must never schedule a
-    walk into the newly observed workspace.
+    targetSpaceId is an org-wide shared storage scope and must never be mapped
+    one-to-one to a Wiki workspace. The raw workSpaceName, however, was live
+    verified to resolve uniquely against the visible Wiki registry.
     """
-    if not event.target_space_id or not workspace_id:
-        return False
-    entry = db.get(SpaceMap, event.target_space_id)
-    if entry is None:
-        entry = SpaceMap(space_id=event.target_space_id)
-        db.add(entry)
-        db.flush()
-    if entry.workspace_id and entry.workspace_id != workspace_id:
-        return False
-    entry.workspace_id = workspace_id
-    workspace = db.get(Workspace, workspace_id)
-    if workspace is not None:
-        entry.workspace_name = workspace.name
-    if entry.source != "manual":
-        entry.source = "learned"
-    return True
+    workspace_name = (event.workspace_name or "").strip()
+    if not workspace_name:
+        return None
+    matches = db.scalars(select(Workspace).where(
+        Workspace.name == workspace_name,
+        Workspace.is_active.is_(True),
+    ).limit(2)).all()
+    return matches[0] if len(matches) == 1 else None
+
+
+def _confirmed_lifecycle_node(db: Session, event: FileAuditEvent) -> str:
+    """Reuse an authoritative node already proven for the same bizId."""
+    if not event.biz_id:
+        return ""
+    nodes = {row[0] for row in db.execute(
+        select(FileAuditEvent.matched_node_id).where(
+            FileAuditEvent.biz_id == event.biz_id,
+            FileAuditEvent.id != event.id,
+            FileAuditEvent.match_status == "confirmed",
+            FileAuditEvent.matched_node_id != "",
+        ).limit(2)
+    ).all()}
+    return nodes.pop() if len(nodes) == 1 else ""
 
 
 def _governed_workspaces(db: Session) -> list[str]:
@@ -356,11 +381,13 @@ def _resolve_node_locally(db: Session, event: FileAuditEvent) -> str:
     数字 bizId，但与文档下载键匹配数为 0——删除流水的 bizId 与上传的下载键
     不在同一命名空间，即时软删基本不会命中，真实删除权威=每月 10/24 全量
     核对的 watch_misses。本函数保留为尽力而为；匹配不上保持 pending 到 48h
-    死信可观测。绝不按文件名猜（同名多节点删错档案不可接受）。"稳定标识
-    重构"待原始审计流水核实后另行处理（biz_id 唯一键改动风险见 memory）。
+    死信可观测。绝不按文件名猜（同名多节点删错档案不可接受）。
 
-    注意：不查"同 bizId 的历史已确认事件"——file_audit_events.biz_id 是
-    唯一键（入库去重），同库不可能存在第二条同 bizId 行，那是死路。"""
+    同一 bizId 的创建/重命名/删除是同一文档生命周期；若其中一条已经由
+    Wiki 元数据确认，可安全复用其 nodeId。"""
+    lifecycle_node = _confirmed_lifecycle_node(db, event)
+    if lifecycle_node:
+        return lifecycle_node
     if (event.biz_id or "").isdigit():
         node_id = db.scalar(select(Document.node_id)
                             .where(Document.storage_dentry_id == event.biz_id).limit(1))
@@ -593,7 +620,7 @@ def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, sum
         summary["matched"] += 1
 
 
-def process_audit_events(db: Session, settings: Settings) -> dict:
+def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool = True) -> dict:
     """One bridge cycle.「完成才消费」生命周期：wiki 事件唯有 locator 确认
     节点、文档入镜像、正文适配器具备定位条件才算 done；到期未确认转 dead_letter_*
     可观测死信。定位按"最久未尝试"轮转取额（公平），巡走走持久化队列
@@ -616,14 +643,13 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         kind = _action_kind(event)
         if (kind in ("review", "modify")
                 and (event.extension or "").lower() == "adoc"
-                and event.target_space_id):
-            mapping = db.get(SpaceMap, event.target_space_id)
-            mapped_workspace = db.get(Workspace, mapping.workspace_id) if mapping and mapping.workspace_id else None
-            if mapped_workspace is not None and mapped_workspace.watch_seeded:
+                and event.workspace_name):
+            audit_workspace = _workspace_from_event(db, event)
+            if audit_workspace is not None and audit_workspace.watch_seeded:
                 # The audit event is the doorbell; the targeted Wiki walk owns
                 # document identity.  This also catches a native document that
                 # was renamed immediately after creation.
-                _enqueue_walk(db, mapping.workspace_id, queued)
+                _enqueue_walk(db, audit_workspace.workspace_id, queued)
         if kind == "ignore":
             # 协作/分享/权限等纯协同动作：终态忽略，零定位消费（codex P0-1）
             _finish(db, event, "ignored_action")
@@ -638,7 +664,13 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         if kind in ("delete", "restore"):
             _handle_delete_restore(db, settings, event, kind, summary)
             continue  # 已删节点搜索拿不到，绝不进远程定位；未匹配保持 pending
-        _provisional_match(db, event, snapshot_id, summary)  # 仅诊断参考，不再触发整库门铃
+        lifecycle_node = _confirmed_lifecycle_node(db, event)
+        if lifecycle_node:
+            event.matched_node_id = lifecycle_node
+            event.match_status = "confirmed"
+            summary["matched"] += 1
+        else:
+            _provisional_match(db, event, snapshot_id, summary)  # 仅诊断参考，不再触发整库门铃
         _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
@@ -679,19 +711,25 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
     # historically accumulated behind high-volume attachment uploads. Give
     # review/modify adoc events the first slots in the bounded locator; within
     # each tier the established fair retry ordering remains unchanged.
-    native_review_priority = case(
-        (and_(FileAuditEvent.extension == "adoc",
-              FileAuditEvent.action_view.in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT))), 0),
-        else_=1,
-    )
-    candidates = db.scalars(
-        select(FileAuditEvent).where(*candidate_conditions)
-        # Fresh, unattempted events are latency-sensitive; retry candidates
-        # then rotate fairly by their oldest last attempt.
-        .order_by(native_review_priority.asc(),
-                  FileAuditEvent.last_attempt_at.is_(None).desc(),
-                  FileAuditEvent.gmt_create.desc(), FileAuditEvent.last_attempt_at.asc())
-        .limit(WIKI_LOCATE_BUDGET)).all()
+    native_review = and_(FileAuditEvent.extension == "adoc",
+                         FileAuditEvent.action_view.in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT)))
+    locate_order = (FileAuditEvent.last_attempt_at.is_(None).desc(),
+                    FileAuditEvent.last_attempt_at.asc(), FileAuditEvent.gmt_create.desc())
+    native_candidates = db.scalars(
+        select(FileAuditEvent).where(*candidate_conditions, native_review)
+        .order_by(*locate_order).limit(WIKI_LOCATE_NATIVE_RESERVED)).all()
+    other_candidates = db.scalars(
+        select(FileAuditEvent).where(*candidate_conditions, ~native_review)
+        .order_by(*locate_order).limit(WIKI_LOCATE_BUDGET - WIKI_LOCATE_NATIVE_RESERVED)).all()
+    candidates = native_candidates + other_candidates
+    if len(candidates) < WIKI_LOCATE_BUDGET:
+        selected_ids = [event.id for event in candidates]
+        fill_conditions = list(candidate_conditions)
+        if selected_ids:
+            fill_conditions.append(FileAuditEvent.id.not_in(selected_ids))
+        candidates += db.scalars(
+            select(FileAuditEvent).where(*fill_conditions)
+            .order_by(*locate_order).limit(WIKI_LOCATE_BUDGET - len(candidates))).all()
     if settings.bridge_locator_enabled and candidates:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
@@ -714,10 +752,15 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             # Storage search returns dentryUuids (== wiki nodeIds) plus the
             # directory path; the wiki batch query then names the workspace
             # each hit lives in. 两者都要带回：path 是目录归属的线索。
-            names = _name_candidates(event)
+            names = _name_candidates(db, event)
             native_doc = (event.extension or "").lower() == "adoc"
             space_ids = None if native_doc else [settings.wiki_storage_space_id]
-            dentries = await client.search_dentries(names[0], operator, space_ids)
+            dentries: list[dict] = []
+            for name in names[:3]:
+                found = await client.search_dentries(name, operator, space_ids)
+                dentries.extend(found)
+                if any(row.get("name") == name and row.get("dentry_uuid") for row in found):
+                    break
             exact_ids = [d["dentry_uuid"] for d in dentries if d.get("name") in names and d.get("dentry_uuid")]
             nodes = await client.batch_query_wiki_nodes(exact_ids, operator) if exact_ids else []
             return event, names, dentries, nodes
@@ -778,21 +821,12 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
                 event.matched_node_id = confirmed_id
                 event.match_status = "confirmed"
                 summary["confirmed"] += 1
-                native_doc = (event.extension or "").lower() == "adoc"
-                mapping_learned = _learn_space_mapping(db, event, hit.get("workspace_id") or "")
                 # 直接建档/更新——不再把整个知识库放进巡走队列
                 # （2026-08-14 流程定稿：一个事件只动一个节点）。
                 hit_path = next((d.get("path") or "" for d in dentries
                                  if d.get("dentry_uuid") == confirmed_id), "")
                 doc = _upsert_audit_document(db, settings, event, hit, hit_path)
                 summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
-                mapped_workspace = db.get(Workspace, hit.get("workspace_id") or "")
-                if (mapping_learned and native_doc and mapped_workspace is not None
-                        and mapped_workspace.watch_seeded):
-                    # A native event can be followed by a rename whose audit
-                    # title is no longer searchable.  Walk this already-seeded
-                    # workspace once; its new node ids queue themselves.
-                    _enqueue_walk(db, hit.get("workspace_id") or "", queued)
                 # 完成语义按类型收口：上传文件须有数字下载键，原生
                 # .adoc 由 node id 导出正文；元数据类只更新镜像。
                 kind = _action_kind(event)
@@ -838,8 +872,9 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             summary["dead_letter"] = summary.get("dead_letter", 0) + 1
     summary["pending_retry"] = sum(1 for event in expiry_pool.values() if not event.processed)
     db.commit()
-    _drain_walk_queue(db, settings, summary)
-    db.commit()
+    if drain_walks:
+        _drain_walk_queue(db, settings, summary)
+        db.commit()
     return summary
 
 
@@ -869,6 +904,14 @@ def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
         summary["walks"].append({"workspace_id": row.workspace_id, "run_id": run.run_id, "mode": run.mode,
                                  "status": run.status, "new": run.documents_new,
                                  "changed": run.documents_changed, "error_code": run.error_code})
+
+
+def drain_bridge_walks(db: Session, settings: Settings) -> dict:
+    """Run queued targeted walks in the dedicated watcher process."""
+    summary: dict = {"walks": []}
+    _drain_walk_queue(db, settings, summary)
+    db.commit()
+    return summary
 
 
 def bridge_status(db: Session) -> dict:

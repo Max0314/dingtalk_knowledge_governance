@@ -747,24 +747,30 @@ def mark_scan_cycle_complete(db: Session, settings: Settings,
     db.commit()
 
 
-def sweep_stale_runs(db: Session) -> int:
-    """Boot-time zombie sweep (single worker: anything still "running" at boot
-    is a leftover, not live work). Three kinds:
+def sweep_stale_runs(db: Session, *, sync_runs: bool = True,
+                     review_jobs: bool = True, bridge_walks: bool = True) -> int:
+    """Boot-time zombie sweep scoped to the calling worker's ownership.
+
+    The realtime and scan processes run concurrently, so neither may mark the
+    other's live rows stale. Defaults retain the legacy all-in-one behavior
+    for maintenance scripts and tests. Three kinds:
 
     - SyncRun running -> failed/interrupted_by_restart（2026-08-13 起）；
     - ReviewJob running -> 重新置 pending（codex 第九轮 P0：部署/崩溃打断
       模型评审会让任务永久 running，合并窗也被它卡住永不补评。重新排队
       即便上次已出过实例，正文指纹去重也不会重复出分）；
-    - BridgeWalk 残留队列出清：直建流程下走整库只剩试点级兜底，跨重启的
-      旧行（如已删库 P-06）只会反复 404 烧预算。"""
-    stale = db.scalars(select(SyncRun).where(SyncRun.status == "running")).all()
+    - BridgeWalk 可由显式维护调用清理；生产 watcher 启动保留持久队列。"""
+    stale = (db.scalars(select(SyncRun).where(SyncRun.status == "running")).all()
+             if sync_runs else [])
     for run in stale:
         run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
-    zombie_jobs = db.scalars(select(ReviewJob).where(ReviewJob.status == "running")).all()
+    zombie_jobs = (db.scalars(select(ReviewJob).where(ReviewJob.status == "running")).all()
+                   if review_jobs else [])
     for job in zombie_jobs:
         job.status = "pending"
-    for row in db.scalars(select(BridgeWalk)).all():
-        db.delete(row)
+    if bridge_walks:
+        for row in db.scalars(select(BridgeWalk)).all():
+            db.delete(row)
     db.commit()
     return len(stale) + len(zombie_jobs)
 
