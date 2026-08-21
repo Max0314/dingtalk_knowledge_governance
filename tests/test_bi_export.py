@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 
@@ -8,13 +10,15 @@ os.environ["KG_DATABASE_URL"] = "sqlite:///./runtime/test_knowledge_governance.d
 os.environ["KG_DEMO_MODE"] = "true"
 
 from app.config import get_settings
-from app.db import EmployeeMap, SessionLocal, UploaderMonthStat
+from app import metrics
+from app.db import Document, EmployeeMap, ReviewInstance, SessionLocal, UploaderMonthStat, Workspace
 from app.main import app
 
 
 HEADERS = {"X-API-Key": "export-test-key"}
 SNAPSHOT_ID = "zz-bi-export-test"
 MONTH = "2026-08"
+DASHBOARD_MONTH = "2041-08"
 
 
 def _configure(monkeypatch, *, enabled: str = "true", keys: str = "export-test-key") -> None:
@@ -110,6 +114,76 @@ def _clean_export_facts() -> None:
         db.commit()
 
 
+def _seed_dashboard_reviews() -> None:
+    with SessionLocal() as db:
+        db.query(ReviewInstance).filter(ReviewInstance.node_id.like("export-dashboard-%")).delete(
+            synchronize_session=False
+        )
+        db.query(Document).filter(Document.node_id.like("export-dashboard-%")).delete(synchronize_session=False)
+        db.query(Workspace).filter(Workspace.workspace_id.like("export-dashboard-%")).delete(
+            synchronize_session=False
+        )
+        db.add_all(
+            [
+                Workspace(workspace_id="export-dashboard-product", name="产品治理库"),
+                Workspace(workspace_id="export-dashboard-rd", name="研发治理库"),
+                Document(
+                    node_id="export-dashboard-product-doc",
+                    workspace_id="export-dashboard-product",
+                    name="private-document-name-never-exported",
+                    source_created_at="2041-08-18T08:00:00+08:00",
+                    uploader_key="export-a",
+                ),
+                Document(
+                    node_id="export-dashboard-rd-doc",
+                    workspace_id="export-dashboard-rd",
+                    name="another-private-document-name",
+                    source_created_at="2041-08-19T08:00:00+08:00",
+                    uploader_key="export-alias",
+                ),
+                ReviewInstance(
+                    review_instance_id="export-dashboard-old-review",
+                    node_id="export-dashboard-product-doc",
+                    ai_score=40,
+                    verdict="return",
+                    review_scope="full_content",
+                    created_at=datetime(2041, 8, 1, tzinfo=timezone.utc),
+                ),
+                ReviewInstance(
+                    review_instance_id="export-dashboard-product-review",
+                    node_id="export-dashboard-product-doc",
+                    ai_score=92,
+                    verdict="pass",
+                    review_scope="full_content",
+                    created_at=datetime(2041, 8, 20, tzinfo=timezone.utc),
+                ),
+                ReviewInstance(
+                    review_instance_id="export-dashboard-rd-review",
+                    node_id="export-dashboard-rd-doc",
+                    ai_score=55,
+                    verdict="return",
+                    review_scope="full_content",
+                    created_at=datetime(2041, 8, 21, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+        db.commit()
+    metrics.invalidate_cache()
+
+
+def _clean_dashboard_reviews() -> None:
+    with SessionLocal() as db:
+        db.query(ReviewInstance).filter(ReviewInstance.node_id.like("export-dashboard-%")).delete(
+            synchronize_session=False
+        )
+        db.query(Document).filter(Document.node_id.like("export-dashboard-%")).delete(synchronize_session=False)
+        db.query(Workspace).filter(Workspace.workspace_id.like("export-dashboard-%")).delete(
+            synchronize_session=False
+        )
+        db.commit()
+    metrics.invalidate_cache()
+
+
 def test_export_upload_facts_are_paginated_and_safe(monkeypatch):
     _configure(monkeypatch)
     monkeypatch.setenv("KG_ROBOT_USER_IDS", "export-robot")
@@ -164,6 +238,62 @@ def test_export_upload_facts_are_paginated_and_safe(monkeypatch):
             assert first["uploadedFileCount"] == 7
             assert spaces.json()["pagination"] == {"page": 1, "pageSize": 1, "total": 2, "totalPages": 2}
     finally:
+        _clean_export_facts()
+        monkeypatch.delenv("KG_ROBOT_USER_IDS", raising=False)
+        get_settings.cache_clear()
+
+
+def test_export_dashboard_v2_is_aggregate_only_and_uses_latest_reviews(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setenv("KG_ROBOT_USER_IDS", "export-robot")
+    get_settings.cache_clear()
+    try:
+        with TestClient(app) as client:
+            _seed_export_facts()
+            _seed_dashboard_reviews()
+
+            response = client.get(
+                "/api/export/v1/knowledge-governance/dashboard",
+                params={"months": 6},
+                headers=HEADERS,
+            )
+
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["meta"]["contractVersion"] == 2
+            assert payload["data"]["metricScope"] == "uploaded_files_and_latest_ai_reviews"
+            assert payload["data"]["summary"]["reviewedDocumentCount"] >= 2
+            assert payload["data"]["summary"]["passCount"] >= 1
+            assert payload["data"]["summary"]["returnCount"] >= 1
+
+            august = next(row for row in payload["data"]["monthly"] if row["month"] == DASHBOARD_MONTH)
+            assert august["reviewedDocumentCount"] >= 2
+            assert august["averageAiScore"] == 73.5
+            assert august["passCount"] == 1
+            assert august["returnCount"] == 1
+
+            employee = next(
+                row
+                for row in payload["data"]["employees"]
+                if row["employeeKey"] == "union-export-a" and row["month"] == DASHBOARD_MONTH
+            )
+            assert employee["reviewedDocumentCount"] == 2
+            assert employee["averageAiScore"] == 73.5
+            assert employee["uploadedFileCount"] == 0
+
+            product = next(row for row in payload["data"]["workspaces"] if row["workspaceId"] == "export-dashboard-product")
+            assert product["averageAiScore"] == 92.0
+            assert product["passCount"] == 1
+
+            serialized = json.dumps(payload, ensure_ascii=False)
+            assert "private-document-name-never-exported" not in serialized
+            assert "another-private-document-name" not in serialized
+            assert "export-dashboard-product-doc" not in serialized
+            assert '"sourceUserId"' not in serialized
+            assert '"uploaderKey"' not in serialized
+            assert '"nodeId"' not in serialized
+    finally:
+        _clean_dashboard_reviews()
         _clean_export_facts()
         monkeypatch.delenv("KG_ROBOT_USER_IDS", raising=False)
         get_settings.cache_clear()

@@ -13,15 +13,16 @@ import re
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from . import metrics
 from .config import Settings
-from .db import EmployeeMap, UploaderMonthStat, Workspace
+from .db import Document, EmployeeMap, ReviewInstance, UploaderMonthStat, Workspace
 
 
 CONTRACT_VERSION = 1
+DASHBOARD_CONTRACT_VERSION = 2
 TIMEZONE = "Asia/Shanghai"
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
@@ -122,9 +123,9 @@ def _as_of(db: Session) -> str | None:
     return value.isoformat()
 
 
-def _meta(db: Session, snapshot_id: str) -> dict[str, Any]:
+def _meta(db: Session, snapshot_id: str, *, contract_version: int = CONTRACT_VERSION) -> dict[str, Any]:
     return {
-        "contractVersion": CONTRACT_VERSION,
+        "contractVersion": contract_version,
         "timezone": TIMEZONE,
         "sourceSnapshotId": snapshot_id or None,
         "dataStatus": "live_derived",
@@ -231,6 +232,287 @@ def monthly_employee_workspaces(db: Session, month: str) -> tuple[list[dict[str,
     items = list(facts.values())
     items.sort(key=lambda item: (-item["uploadedFileCount"], item["employeeKey"], item["workspaceId"]))
     return items, _meta(db, snapshot_id)
+
+
+def _latest_review_subquery():
+    """One latest AI review per current file, with no document payload fields."""
+    ranked = (
+        select(
+            ReviewInstance.node_id.label("node_id"),
+            ReviewInstance.ai_score.label("ai_score"),
+            ReviewInstance.verdict.label("verdict"),
+            ReviewInstance.created_at.label("reviewed_at"),
+            Document.workspace_id.label("workspace_id"),
+            Document.uploader_key.label("uploader_key"),
+            func.row_number().over(
+                partition_by=ReviewInstance.node_id,
+                order_by=ReviewInstance.created_at.desc(),
+            ).label("rank"),
+        )
+        .join(Document, Document.node_id == ReviewInstance.node_id)
+        .where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
+        .subquery()
+    )
+    return select(
+        ranked.c.node_id,
+        ranked.c.ai_score,
+        ranked.c.verdict,
+        ranked.c.reviewed_at,
+        ranked.c.workspace_id,
+        ranked.c.uploader_key,
+    ).where(ranked.c.rank == 1).subquery()
+
+
+def _quality_columns(latest):
+    return (
+        func.count().label("reviewed_count"),
+        func.avg(latest.c.ai_score).label("average_score"),
+        func.sum(case((latest.c.verdict == "pass", 1), else_=0)).label("pass_count"),
+        func.sum(case((latest.c.verdict == "manual_review", 1), else_=0)).label("manual_review_count"),
+        func.sum(case((latest.c.verdict == "return", 1), else_=0)).label("return_count"),
+    )
+
+
+def _quality_payload(row: Any) -> dict[str, Any]:
+    reviewed_count = int(row.reviewed_count or 0)
+    average_score = row.average_score
+    return {
+        "reviewedDocumentCount": reviewed_count,
+        "averageAiScore": round(float(average_score), 1) if average_score is not None else None,
+        "passCount": int(row.pass_count or 0),
+        "manualReviewCount": int(row.manual_review_count or 0),
+        "returnCount": int(row.return_count or 0),
+    }
+
+
+def _empty_quality_payload() -> dict[str, Any]:
+    return {
+        "reviewedDocumentCount": 0,
+        "averageAiScore": None,
+        "passCount": 0,
+        "manualReviewCount": 0,
+        "returnCount": 0,
+    }
+
+
+def _review_qualities_by_month(db: Session, latest) -> dict[str, dict[str, Any]]:
+    month_key = func.substr(latest.c.reviewed_at, 1, 7).label("month")
+    rows = db.execute(
+        select(month_key, *_quality_columns(latest))
+        .group_by(month_key)
+        .order_by(month_key)
+    ).all()
+    return {str(row.month): _quality_payload(row) for row in rows if str(row.month or "").strip()}
+
+
+def _employee_quality_facts(db: Session, latest, months: set[str]) -> list[dict[str, Any]]:
+    if not months:
+        return []
+    month_key = func.substr(latest.c.reviewed_at, 1, 7).label("month")
+    statement = (
+        select(month_key, EmployeeMap.employee_key.label("employee_key"), *_quality_columns(latest))
+        .join(EmployeeMap, EmployeeMap.user_id == latest.c.uploader_key)
+        .where(
+            EmployeeMap.matched.is_(True),
+            EmployeeMap.include_official.is_(True),
+            EmployeeMap.employee_key != "",
+            month_key.in_(months),
+        )
+        .group_by(month_key, EmployeeMap.employee_key)
+        .order_by(month_key, EmployeeMap.employee_key)
+    )
+    robots = metrics.robot_ids()
+    if robots:
+        statement = statement.where(
+            latest.c.uploader_key.not_in(robots),
+            EmployeeMap.employee_key.not_in(robots),
+        )
+    return [
+        {
+            "month": str(row.month),
+            "employeeKey": str(row.employee_key),
+            **_quality_payload(row),
+        }
+        for row in db.execute(statement).all()
+        if str(row.month or "").strip() and str(row.employee_key or "").strip()
+    ]
+
+
+def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the aggregate-only V2 contract consumed by BI Center.
+
+    This endpoint deliberately exports workspace names and opaque employee keys
+    only.  Document names, node IDs, source user IDs, URLs, bodies, findings,
+    and cached organisation fields remain inside this service.
+    """
+    safe_months = max(1, min(int(months or 6), 24))
+    increments = metrics.monthly_increments(db)
+    latest = _latest_review_subquery()
+    quality_by_month = _review_qualities_by_month(db, latest)
+    upload_by_month = {
+        str(row.get("month") or ""): row
+        for row in increments.get("rows") or []
+        if str(row.get("month") or "").strip()
+    }
+    available_months = sorted(set(upload_by_month) | set(quality_by_month))
+    selected_months = available_months[-safe_months:]
+    selected_set = set(selected_months)
+    current_month = selected_months[-1] if selected_months else ""
+
+    quality_rows = []
+    for month in selected_months:
+        upload = upload_by_month.get(month) or {}
+        quality = quality_by_month.get(month) or {}
+        quality_rows.append(
+            {
+                "month": month,
+                "uploadedFileCount": int(upload.get("total") or 0),
+                "bulkUploadedFileCount": int(upload.get("bulk_import") or 0),
+                "routineUploadedFileCount": int(upload.get("routine") or 0),
+                **{
+                    key: quality.get(key, 0 if key.endswith("Count") else None)
+                    for key in (
+                        "reviewedDocumentCount",
+                        "averageAiScore",
+                        "passCount",
+                        "manualReviewCount",
+                        "returnCount",
+                    )
+                },
+            }
+        )
+
+    global_quality_row = db.execute(select(*_quality_columns(latest))).one()
+    global_quality = _quality_payload(global_quality_row)
+    total_files = int(increments.get("total_files") or 0)
+    global_quality["reviewCoverageRate"] = round(
+        global_quality["reviewedDocumentCount"] * 100 / total_files,
+        1,
+    ) if total_files else 0.0
+
+    workspace_names = {
+        str(row.workspace_id): str(row.name or "")
+        for row in db.execute(select(Workspace.workspace_id, Workspace.name)).all()
+    }
+    workspace_quality_rows = db.execute(
+        select(latest.c.workspace_id.label("workspace_id"), *_quality_columns(latest))
+        .group_by(latest.c.workspace_id)
+    ).all()
+    workspace_quality = {str(row.workspace_id): _quality_payload(row) for row in workspace_quality_rows}
+    collected = metrics.collected(db)
+    workspace_rows = []
+    for workspace_id, file_count in (collected.get("space_totals") or {}).items():
+        safe_workspace_id = str(workspace_id or "")
+        if not safe_workspace_id:
+            continue
+        quality = workspace_quality.get(safe_workspace_id) or _empty_quality_payload()
+        total = int(file_count or 0)
+        workspace_rows.append(
+            {
+                "workspaceId": safe_workspace_id,
+                "workspaceName": workspace_names.get(safe_workspace_id) or "未命名知识库",
+                "fileCount": total,
+                "currentMonthNewFileCount": int(
+                    ((collected.get("space_months") or {}).get(safe_workspace_id) or {}).get(current_month, 0)
+                ),
+                "reviewCoverageRate": round(quality["reviewedDocumentCount"] * 100 / total, 1) if total else 0.0,
+                **quality,
+            }
+        )
+    workspace_rows.sort(
+        key=lambda item: (
+            -int(item["returnCount"]),
+            float(item["reviewCoverageRate"]),
+            -int(item["fileCount"]),
+            item["workspaceName"],
+        )
+    )
+
+    employee_facts: dict[tuple[str, str], dict[str, Any]] = {}
+    for month in selected_months:
+        _, source_rows = _source_rows(db, month)
+        for row in source_rows:
+            if not _is_official(row, metrics.robot_ids()):
+                continue
+            key = (month, str(row["employee_key"]))
+            fact = employee_facts.setdefault(
+                key,
+                {
+                    "month": month,
+                    "employeeKey": str(row["employee_key"]),
+                    "uploadedFileCount": 0,
+                    "workspaceCount": 0,
+                    "reviewedDocumentCount": 0,
+                    "averageAiScore": None,
+                    "passCount": 0,
+                    "manualReviewCount": 0,
+                    "returnCount": 0,
+                    "_workspaceIds": set(),
+                    "_scoreTotal": 0.0,
+                },
+            )
+            fact["uploadedFileCount"] += int(row["file_count"] or 0)
+            if row["workspace_id"]:
+                fact["_workspaceIds"].add(str(row["workspace_id"]))
+    for quality in _employee_quality_facts(db, latest, selected_set):
+        key = (quality["month"], quality["employeeKey"])
+        fact = employee_facts.setdefault(
+            key,
+            {
+                "month": quality["month"],
+                "employeeKey": quality["employeeKey"],
+                "uploadedFileCount": 0,
+                "workspaceCount": 0,
+                "reviewedDocumentCount": 0,
+                "averageAiScore": None,
+                "passCount": 0,
+                "manualReviewCount": 0,
+                "returnCount": 0,
+                "_workspaceIds": set(),
+                "_scoreTotal": 0.0,
+            },
+        )
+        reviewed_count = int(quality["reviewedDocumentCount"] or 0)
+        fact["reviewedDocumentCount"] += reviewed_count
+        fact["passCount"] += int(quality["passCount"] or 0)
+        fact["manualReviewCount"] += int(quality["manualReviewCount"] or 0)
+        fact["returnCount"] += int(quality["returnCount"] or 0)
+        if quality["averageAiScore"] is not None:
+            fact["_scoreTotal"] += float(quality["averageAiScore"]) * reviewed_count
+    employee_rows = []
+    for fact in employee_facts.values():
+        fact["workspaceCount"] = len(fact.pop("_workspaceIds"))
+        score_total = float(fact.pop("_scoreTotal"))
+        reviewed_count = int(fact["reviewedDocumentCount"] or 0)
+        if reviewed_count:
+            fact["averageAiScore"] = round(score_total / reviewed_count, 1)
+        employee_rows.append(fact)
+    employee_rows.sort(key=lambda item: (item["month"], item["employeeKey"]))
+
+    current_quality = quality_by_month.get(current_month) or {}
+    current_upload = upload_by_month.get(current_month) or {}
+    workspace_count = int(db.scalar(select(func.count()).select_from(Workspace)) or 0)
+    data = {
+        "metricScope": "uploaded_files_and_latest_ai_reviews",
+        "latestMonth": current_month or None,
+        "availableMonths": available_months,
+        "summary": {
+            "workspaceCount": workspace_count,
+            "totalFileCount": total_files,
+            "currentMonthNewFileCount": int(current_upload.get("total") or 0),
+            "currentMonthAverageAiScore": current_quality.get("averageAiScore"),
+            "currentMonthReviewedDocumentCount": int(current_quality.get("reviewedDocumentCount") or 0),
+            **global_quality,
+        },
+        "monthly": quality_rows,
+        "workspaces": workspace_rows,
+        "employees": employee_rows,
+    }
+    return data, _meta(
+        db,
+        _snapshot_id(db),
+        contract_version=DASHBOARD_CONTRACT_VERSION,
+    )
 
 
 def paginate(items: list[dict[str, Any]], page: int, page_size: int) -> tuple[list[dict[str, Any]], dict[str, int]]:

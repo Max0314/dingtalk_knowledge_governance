@@ -176,6 +176,17 @@ def bi_export_monthly_employee_workspaces(request: Request, month: str = "", pag
         return _bi_export_error(error)
 
 
+@app.get("/api/export/v1/knowledge-governance/dashboard")
+def bi_export_dashboard(request: Request, months: int = Query(default=6, ge=1, le=24),
+                        db: Session = Depends(db_session)):
+    try:
+        bi_export.authorize(request, get_settings())
+        data, meta = bi_export.dashboard(db, months)
+        return {"ok": True, "data": data, "meta": meta}
+    except bi_export.ExportApiError as error:
+        return _bi_export_error(error)
+
+
 @app.get("/api/v1/dashboard/overview")
 def dashboard(db: Session = Depends(db_session)):
     """The overview page's only request. Everything it returns is rendered;

@@ -1,4 +1,4 @@
-# BI Center 知识库上传事实导出契约 V1
+# BI Center 知识库治理导出契约
 
 ## 目标和边界
 
@@ -7,7 +7,8 @@
 - 接口只读；不会触发钉钉请求、评审、同步或正文读取。
 - 不返回正文、附件、文档标题、文档 URL、源 UserID、姓名、部门或业务组。
 - 员工明细只返回 `matched && includeInOfficialStats=true` 的 `employeeKey=UnionID`；`bi_center` 必须按请求月份使用自己的组织快照归属部门和业务组。
-- V1 的度量范围是上传文件。评审完成、人工审核、预览和下载行为不在本版本中，不能据此推导“访问最频繁的知识库”。
+- V1 的度量范围是上传文件。评审完成、人工审核、预览和下载行为不在 V1 月度事实中，不能据此推导“访问最频繁的知识库”。
+- V2 新增的是全员质量看板聚合；只输出知识库名称、月份和正式员工 `employeeKey` 的统计，不输出文档、节点、URL、源 UserID、姓名、部门或业务组。
 
 “常用知识库”在 V1 中的准确含义是指定周期内**上传文件最多的知识库**。BI 将员工×知识库×月事实累加后，按 `uploadedFileCount` 降序即可得到 Top N。
 
@@ -31,6 +32,7 @@ KG_BI_EXPORT_MAX_PAGE_SIZE=200
 | `GET /api/export/v1/knowledge-governance/monthly-summary?month=YYYY-MM` | 一个自然月的全量观测、正式员工和排除诊断汇总。 |
 | `GET /api/export/v1/knowledge-governance/monthly-employees?month=YYYY-MM&page=1&pageSize=200` | 正式员工×月上传事实。 |
 | `GET /api/export/v1/knowledge-governance/monthly-employee-workspaces?month=YYYY-MM&page=1&pageSize=200` | 正式员工×知识库×月上传事实。 |
+| `GET /api/export/v1/knowledge-governance/dashboard?months=1..24` | V2 全员知识库质量看板聚合。 |
 
 月份必须为 `YYYY-MM`，最大页长受 `KG_BI_EXPORT_MAX_PAGE_SIZE` 限制（上限 500）。分页响应遵循硬件平台既有形式：`{ok,data,pagination,meta}`。
 
@@ -60,6 +62,19 @@ KG_BI_EXPORT_MAX_PAGE_SIZE=200
 ```
 
 `monthly-employees` 的事实字段为 `month`、`employeeKey`、`uploadedFileCount`、`workspaceCount`。同一员工存在多个钉钉源账号时，会先按同一个 `employeeKey` 合并。机器人、未匹配、非正式统计人员不会出现在明细，但会计入 `monthly-summary.data.diagnostics` 的排除计数。
+
+## V2 质量看板聚合
+
+`dashboard` 的 `meta.contractVersion` 固定为 `2`。`data` 包含：
+
+- `summary`：知识库数、去重文件总量、本月新增、评审覆盖率、当前月完成评审的平均分和结论计数；
+- `monthly`：最近 `months` 个可用月份的日常/批量新增、当月完成的最新评审平均分，以及通过、待人工审核、退回计数；
+- `workspaces`：每个知识库的文件数、本月新增、评审覆盖率、最新平均分和风险（退回）文档数；
+- `employees`：`month + employeeKey` 的匿名上传与质量事实，供 BI Center 以其月度员工目录汇总部门和业务组。
+
+文件新增按钉钉 `source_created_at` 归属（Asia/Shanghai）。质量统计只取每个当前文件的**最新** AI 评审实例，并按该实例完成时间归属月份。评审未覆盖、正文不可用和未入队文档不伪造成有分数的评审记录。
+
+V2 不提供文档钻取接口；BI Center 面向全员的页面不得借此返回文档标题、钉钉链接、原始创建人、评审发现项或正文。
 
 ## 数据来源和一致性
 
