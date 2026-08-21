@@ -17,8 +17,9 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from . import metrics
-from .config import Settings
+from .config import Settings, get_settings
 from .db import Document, EmployeeMap, ReviewInstance, UploaderMonthStat, Workspace
+from .service import review_excluded_levels, workspace_level
 
 
 CONTRACT_VERSION = 1
@@ -234,7 +235,7 @@ def monthly_employee_workspaces(db: Session, month: str) -> tuple[list[dict[str,
     return items, _meta(db, snapshot_id)
 
 
-def _latest_review_subquery():
+def _latest_review_subquery(eligible_workspace_ids: set[str]):
     """One latest AI review per current file, with no document payload fields."""
     ranked = (
         select(
@@ -253,7 +254,11 @@ def _latest_review_subquery():
             ).label("rank"),
         )
         .join(Document, Document.node_id == ReviewInstance.node_id)
-        .where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
+        .where(
+            Document.is_folder.is_(False),
+            Document.is_deleted.is_(False),
+            Document.workspace_id.in_(eligible_workspace_ids),
+        )
         .subquery()
     )
     return select(
@@ -353,14 +358,38 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
     and cached organisation fields remain inside this service.
     """
     safe_months = max(1, min(int(months or 6), 24))
+    excluded_levels = review_excluded_levels(get_settings())
+    workspace_names = {
+        str(row.workspace_id): str(row.name or "")
+        for row in db.execute(
+            select(Workspace.workspace_id, Workspace.name).where(Workspace.is_active.is_(True))
+        ).all()
+        if workspace_level(str(row.name or "")) not in excluded_levels
+    }
+    eligible_workspace_ids = set(workspace_names)
     increments = metrics.monthly_increments(db)
-    latest = _latest_review_subquery()
+    collected = metrics.collected(db)
+    latest = _latest_review_subquery(eligible_workspace_ids)
     quality_by_month = _review_qualities_by_month(db, latest)
-    upload_by_month = {
+    all_upload_by_month = {
         str(row.get("month") or ""): row
         for row in increments.get("rows") or []
         if str(row.get("month") or "").strip()
     }
+    eligible_month_totals: dict[str, int] = {}
+    for workspace_id in eligible_workspace_ids:
+        for month, count in ((collected.get("space_months") or {}).get(workspace_id) or {}).items():
+            eligible_month_totals[str(month)] = eligible_month_totals.get(str(month), 0) + int(count or 0)
+    upload_by_month = {}
+    for month, total in eligible_month_totals.items():
+        all_upload = all_upload_by_month.get(month) or {}
+        bulk = min(total, int(all_upload.get("bulk_import") or 0))
+        upload_by_month[month] = {
+            "month": month,
+            "total": total,
+            "bulk_import": bulk,
+            "routine": max(0, total - bulk),
+        }
     available_months = sorted(set(upload_by_month) | set(quality_by_month))
     selected_months = available_months[-safe_months:]
     selected_set = set(selected_months)
@@ -392,26 +421,25 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
 
     global_quality_row = db.execute(select(*_quality_columns(latest))).one()
     global_quality = _quality_payload(global_quality_row)
-    total_files = int(increments.get("total_files") or 0)
+    total_files = sum(
+        int(count or 0)
+        for workspace_id, count in (collected.get("space_totals") or {}).items()
+        if str(workspace_id) in eligible_workspace_ids
+    )
     global_quality["reviewCoverageRate"] = round(
         global_quality["reviewedDocumentCount"] * 100 / total_files,
         1,
     ) if total_files else 0.0
 
-    workspace_names = {
-        str(row.workspace_id): str(row.name or "")
-        for row in db.execute(select(Workspace.workspace_id, Workspace.name)).all()
-    }
     workspace_quality_rows = db.execute(
         select(latest.c.workspace_id.label("workspace_id"), *_quality_columns(latest))
         .group_by(latest.c.workspace_id)
     ).all()
     workspace_quality = {str(row.workspace_id): _quality_payload(row) for row in workspace_quality_rows}
-    collected = metrics.collected(db)
     workspace_rows = []
     for workspace_id, file_count in (collected.get("space_totals") or {}).items():
         safe_workspace_id = str(workspace_id or "")
-        if not safe_workspace_id:
+        if not safe_workspace_id or safe_workspace_id not in eligible_workspace_ids:
             continue
         quality = workspace_quality.get(safe_workspace_id) or _empty_quality_payload()
         total = int(file_count or 0)
@@ -440,7 +468,7 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
     for month in selected_months:
         _, source_rows = _source_rows(db, month)
         for row in source_rows:
-            if not _is_official(row, robots):
+            if not _is_official(row, robots) or str(row["workspace_id"] or "") not in eligible_workspace_ids:
                 continue
             key = (month, str(row["employee_key"]))
             fact = employee_facts.setdefault(
@@ -499,7 +527,7 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
 
     current_quality = quality_by_month.get(current_month) or {}
     current_upload = upload_by_month.get(current_month) or {}
-    workspace_count = int(db.scalar(select(func.count()).select_from(Workspace)) or 0)
+    workspace_count = len(eligible_workspace_ids)
     data = {
         "metricScope": "uploaded_files_and_latest_ai_reviews",
         "latestMonth": current_month or None,

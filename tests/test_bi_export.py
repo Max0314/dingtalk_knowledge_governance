@@ -127,6 +127,7 @@ def _seed_dashboard_reviews() -> None:
             [
                 Workspace(workspace_id="export-dashboard-product", name="产品治理库"),
                 Workspace(workspace_id="export-dashboard-rd", name="研发治理库"),
+                Workspace(workspace_id="export-dashboard-personal", name="I-个人测试库"),
                 Document(
                     node_id="export-dashboard-product-doc",
                     workspace_id="export-dashboard-product",
@@ -140,6 +141,13 @@ def _seed_dashboard_reviews() -> None:
                     name="another-private-document-name",
                     source_created_at="2041-08-19T08:00:00+08:00",
                     uploader_key="export-alias",
+                ),
+                Document(
+                    node_id="export-dashboard-personal-doc",
+                    workspace_id="export-dashboard-personal",
+                    name="personal-private-document-never-exported",
+                    source_created_at="2041-08-19T09:00:00+08:00",
+                    uploader_key="export-a",
                 ),
                 ReviewInstance(
                     review_instance_id="export-dashboard-old-review",
@@ -164,6 +172,14 @@ def _seed_dashboard_reviews() -> None:
                     verdict="return",
                     review_scope="full_content",
                     created_at=datetime(2041, 8, 21, tzinfo=timezone.utc),
+                ),
+                ReviewInstance(
+                    review_instance_id="export-dashboard-personal-review",
+                    node_id="export-dashboard-personal-doc",
+                    ai_score=10,
+                    verdict="return",
+                    review_scope="full_content",
+                    created_at=datetime(2041, 8, 22, tzinfo=timezone.utc),
                 ),
             ]
         )
@@ -288,6 +304,9 @@ def test_export_dashboard_v2_is_aggregate_only_and_uses_latest_reviews(monkeypat
             serialized = json.dumps(payload, ensure_ascii=False)
             assert "private-document-name-never-exported" not in serialized
             assert "another-private-document-name" not in serialized
+            assert "personal-private-document-never-exported" not in serialized
+            assert "I-个人测试库" not in serialized
+            assert "export-dashboard-personal" not in serialized
             assert "export-dashboard-product-doc" not in serialized
             assert '"sourceUserId"' not in serialized
             assert '"uploaderKey"' not in serialized
