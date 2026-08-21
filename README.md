@@ -14,7 +14,7 @@
 
 ## 架构与平台约束
 
-- FastAPI（api 容器）+ 实时 worker（审计/评审/通知）+ watcher（定向与全量扫描）；无 Redis，两个后台角色通过 MySQL 队列表协作。前端为 vendored ECharts 的原生 JS 单页（hash 路由）。
+- FastAPI（api 容器）+ 实时 worker（审计/评审/通知）+ watcher（定向与全量扫描）；无 Redis，两个后台角色通过 MySQL 队列表协作。审计源按配置周期拉取，已入库事件的有界定位默认每 30 秒重试，二者互不阻塞。前端为 vendored ECharts 的原生 JS 单页（hash 路由）。
 - 平台规则：应用栈不含数据库容器，`KG_DATABASE_URL` 指向外部 MySQL；正文只存在于评审进程内存/tmpfs，绝不落库、落盘、进日志。
 - 端口 39021，默认只绑定 127.0.0.1（本机 nginx 反代对外）；`KG_PUBLISH_BIND` 可显式放开。
 - 服务器访问 GitHub 受限，部署走服务器裸仓库双推：`git push origin main && git push neoflow main`，服务器 `git pull && docker compose up --build -d`。详见 [docs/deployment-guide.md](docs/deployment-guide.md)（脱敏版；真实凭据在仓库外的运维手册）。

@@ -42,6 +42,7 @@ def main() -> None:
     # storage-key and change-signal source, and must not queue behind a long
     # walk or a batch of model reviews (codex 2026-08-13 finding).
     next_audit_at = time.time() + 5 if settings.audit_pull_enabled else None
+    next_bridge_at = time.time() + 6 if settings.bridge_enabled else None
     while True:
         if next_audit_at is not None and time.time() >= next_audit_at:
             try:
@@ -50,17 +51,18 @@ def main() -> None:
                 logger.info("audit pull: %s", audit)
             except Exception:
                 logger.exception("audit pull failed")
-            if settings.bridge_enabled:
-                try:
-                    with SessionLocal() as db:
-                        # Slow targeted walks are persisted for app.watcher;
-                        # realtime audit ingestion never executes a full tree.
-                        bridge = process_audit_events(db, settings, drain_walks=False)
-                    if bridge["wiki_events"] or bridge["walks"]:
-                        logger.info("audit bridge: %s", bridge)
-                except Exception:
-                    logger.exception("audit bridge failed")
             next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
+        if next_bridge_at is not None and time.time() >= next_bridge_at:
+            try:
+                with SessionLocal() as db:
+                    # Slow targeted walks are persisted for app.watcher;
+                    # realtime audit ingestion never executes a full tree.
+                    bridge = process_audit_events(db, settings, drain_walks=False)
+                if bridge["wiki_events"] or bridge["walks"]:
+                    logger.info("audit bridge: %s", bridge)
+            except Exception:
+                logger.exception("audit bridge failed")
+            next_bridge_at = time.time() + max(15, settings.bridge_interval_seconds)
         with SessionLocal() as db:
             harvested = harvest_due_reviews(db, settings)  # 修改合并窗到点的文档入队
             if harvested:

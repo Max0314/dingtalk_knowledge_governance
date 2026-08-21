@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # Audit-event -> workspace bridge: wiki write events ring the doorbell and
     # a debounced targeted walk of the touched workspace does node-exact diffs.
     bridge_enabled: bool = False
+    # Audit ingestion can stay at a conservative 10-minute cadence, but rows
+    # already in the database must not wait another 10 minutes for each fair
+    # locator turn. The bridge is bounded (20 metadata lookups, no tree walk
+    # in the realtime worker), so retry it independently and frequently.
+    bridge_interval_seconds: int = 30
     bridge_debounce_seconds: int = 900
     # Unlocated events sweep ALL governed workspaces only below this count;
     # at org scale the regular watcher rotation is the discovery fallback.

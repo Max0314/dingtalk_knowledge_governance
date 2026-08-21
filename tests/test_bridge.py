@@ -1670,6 +1670,46 @@ def test_same_biz_rename_lifecycle_locates_creation_by_latest_title(env, monkeyp
         db.commit()
 
 
+def test_same_biz_lifecycle_reuses_confirmed_node_outside_main_batch(env, monkeypatch):
+    """A recent rename must not wait behind an old BATCH-sized retry backlog."""
+    settings, _, _ = env
+    with SessionLocal() as db:
+        for stale in db.scalars(select(FileAuditEvent).where(
+                FileAuditEvent.event_key.in_(("confirmed-lifecycle-create",
+                                              "confirmed-lifecycle-rename")))).all():
+            db.delete(stale)
+        stale_doc = db.get(Document, "confirmed-lifecycle-node")
+        if stale_doc is not None:
+            db.delete(stale_doc)
+        db.flush()
+        db.add(Document(node_id="confirmed-lifecycle-node", workspace_id=WS,
+                        name="最终名称.adoc", extension="adoc", file_class="native_doc"))
+        db.add(FileAuditEvent(event_key="confirmed-lifecycle-create", biz_id="same-lifecycle-biz",
+                              gmt_create=DEFAULT_GMT, resource="初始名称", extension="adoc",
+                              action_view="创建文档", matched_node_id="confirmed-lifecycle-node",
+                              match_status="confirmed", processed=True, resolution="done"))
+        db.add(FileAuditEvent(event_key="confirmed-lifecycle-rename", biz_id="same-lifecycle-biz",
+                              gmt_create=DEFAULT_GMT + 1, resource="最终名称", extension="adoc",
+                              action_view="重命名", processed=False))
+        db.commit()
+
+    monkeypatch.setattr(audit_bridge, "BATCH", 0)
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", _RaisingSearchClient)
+    with SessionLocal() as db:
+        summary = audit_bridge.process_audit_events(db, settings, drain_walks=False)
+        rename = db.scalar(select(FileAuditEvent).where(
+            FileAuditEvent.event_key == "confirmed-lifecycle-rename"))
+        assert summary["lifecycle_reused"] == 1
+        assert rename.match_status == "confirmed"
+        assert rename.matched_node_id == "confirmed-lifecycle-node"
+        assert rename.processed is True and rename.resolution == "metadata_applied"
+        for event in db.scalars(select(FileAuditEvent).where(
+                FileAuditEvent.biz_id == "same-lifecycle-biz")).all():
+            db.delete(event)
+        db.delete(db.get(Document, "confirmed-lifecycle-node"))
+        db.commit()
+
+
 def test_native_adoc_accepts_exact_dentry_hit_when_node_display_name_differs(env, monkeypatch):
     """The dentry index is authoritative for a native document's title.
 

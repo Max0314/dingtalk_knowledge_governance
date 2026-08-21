@@ -675,6 +675,29 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     db.commit()
     pending_wiki = [event for event in wiki_events if not event.processed]
 
+    # A document's create/rename/move lifecycle shares one bizId. Once any
+    # row has an authoritative node, finish its sibling rows globally instead
+    # of leaving a recent rename behind the oldest BATCH-sized retry window or
+    # spending another remote search slot on identity we already know.
+    confirmed_biz_ids = select(FileAuditEvent.biz_id).where(
+        FileAuditEvent.match_status == "confirmed", FileAuditEvent.matched_node_id != "")
+    lifecycle_pending = db.scalars(
+        select(FileAuditEvent)
+        .where(FileAuditEvent.processed.is_(False),
+               FileAuditEvent.match_status != "confirmed",
+               FileAuditEvent.biz_id.in_(confirmed_biz_ids))
+        .order_by(FileAuditEvent.gmt_create.desc())
+        .limit(CONFIRM_FINISH_BUDGET)).all()
+    for event in lifecycle_pending:
+        lifecycle_node = _confirmed_lifecycle_node(db, event)
+        if not lifecycle_node:
+            continue
+        event.matched_node_id = lifecycle_node
+        event.match_status = "confirmed"
+        summary["matched"] += 1
+        summary["lifecycle_reused"] = summary.get("lifecycle_reused", 0) + 1
+        _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
+
     # confirmed-pending 全局收尾（codex 第六轮 P0）：等文档入镜像的已确认
     # 事件不能只靠 BATCH 窗口推进——纯 DB 操作按全局取额完成。取额按
     # 最久未尝试轮转（codex 第七轮 P0）：50 个"文档迟迟不来"的老事件
