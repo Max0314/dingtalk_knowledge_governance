@@ -31,7 +31,10 @@ from .db import AuthSession, SessionLocal, utcnow
 COOKIE_NAME = "kg_session"
 SESSION_TTL = timedelta(days=7)
 STATE_TTL_SECONDS = 600
-PUBLIC_API_PATHS = ("/api/health", "/api/auth/")
+# Export endpoints have their own mandatory X-API-Key guard.  They must bypass
+# the browser-cookie guard so bi_center can pull them headlessly, but no export
+# handler is allowed to omit its separate guard.
+PUBLIC_API_PATHS = ("/api/health", "/api/auth/", "/api/export/")
 
 
 def _sign(settings: Settings, payload: str) -> str:

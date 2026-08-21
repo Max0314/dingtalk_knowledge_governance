@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     dingtalk_doc_content_url_template: str = Field(default="", validation_alias="DINGTALK_DOC_CONTENT_URL_TEMPLATE")
     bi_center_base_url: str = Field(default="", validation_alias="BI_CENTER_BASE_URL")
     bi_center_internal_token: str = Field(default="", validation_alias="BI_CENTER_INTERNAL_TOKEN")
+    # Read-only export consumed by bi_center.  It is deliberately independent
+    # from BI_CENTER_INTERNAL_TOKEN, which authenticates the opposite
+    # direction (this service -> bi_center employee-directory contract).
+    bi_export_enabled: bool = False
+    bi_export_api_keys: str = ""
+    bi_export_max_page_size: int = 200
     model_api_key: str = ""
     model_allow_content_transfer: bool = False
     # Push stays off until the robot permission is granted and a test send passes.
