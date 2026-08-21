@@ -138,6 +138,32 @@ def _tally_space(db: Session, event: FileAuditEvent) -> None:
     entry.last_event_gmt = max(entry.last_event_gmt or 0, event.gmt_create or 0)
 
 
+def _learn_space_mapping(db: Session, event: FileAuditEvent, workspace_id: str) -> bool:
+    """Remember the storage-space -> Wiki-workspace address after node proof.
+
+    DingTalk exposes these as different identifier namespaces, so equality is
+    neither expected nor required.  A corroborated node is the evidence.  A
+    conflicting existing mapping is left untouched and must never schedule a
+    walk into the newly observed workspace.
+    """
+    if not event.target_space_id or not workspace_id:
+        return False
+    entry = db.get(SpaceMap, event.target_space_id)
+    if entry is None:
+        entry = SpaceMap(space_id=event.target_space_id)
+        db.add(entry)
+        db.flush()
+    if entry.workspace_id and entry.workspace_id != workspace_id:
+        return False
+    entry.workspace_id = workspace_id
+    workspace = db.get(Workspace, workspace_id)
+    if workspace is not None:
+        entry.workspace_name = workspace.name
+    if entry.source != "manual":
+        entry.source = "learned"
+    return True
+
+
 def _governed_workspaces(db: Session) -> list[str]:
     return [row[0] for row in db.execute(select(Document.workspace_id).distinct()).all() if row[0]]
 
@@ -236,10 +262,10 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     每月 10/24 全量核对补准。"""
     workspace_id = node.get("workspace_id") or ""
     if workspace_id and db.get(Workspace, workspace_id) is None:
-        # 未补种的新库连注册行都没有：建占位（名称由月度核对刷新）。标记
-        # watch_seeded=True 以免把 worker 拉回连续轮巡——其存量本就交给
-        # 月度核对。
-        db.add(Workspace(workspace_id=workspace_id, name=workspace_id, watch_seeded=True))
+        # 未补种的新库连注册行都没有：建占位（名称由首次完整巡走
+        # 刷新）。必须保持 unseeded，否则后续定向巡走会把该库存量误当
+        # 新增入队。
+        db.add(Workspace(workspace_id=workspace_id, name=workspace_id, watch_seeded=False))
         db.flush()
     doc = db.get(Document, node["node_id"])
     is_new = doc is None
@@ -588,6 +614,16 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
         summary["wiki_events"] += 1
         wiki_events.append(event)
         kind = _action_kind(event)
+        if (kind in ("review", "modify")
+                and (event.extension or "").lower() == "adoc"
+                and event.target_space_id):
+            mapping = db.get(SpaceMap, event.target_space_id)
+            mapped_workspace = db.get(Workspace, mapping.workspace_id) if mapping and mapping.workspace_id else None
+            if mapped_workspace is not None and mapped_workspace.watch_seeded:
+                # The audit event is the doorbell; the targeted Wiki walk owns
+                # document identity.  This also catches a native document that
+                # was renamed immediately after creation.
+                _enqueue_walk(db, mapping.workspace_id, queued)
         if kind == "ignore":
             # 协作/分享/权限等纯协同动作：终态忽略，零定位消费（codex P0-1）
             _finish(db, event, "ignored_action")
@@ -726,38 +762,49 @@ def process_audit_events(db: Session, settings: Settings) -> dict:
             if not workspaces:
                 unlocated += 1  # 尚未进搜索索引：保持 pending，下一轮重试
                 continue
-            node_ids = {node["node_id"] for node in hits if node.get("node_id")}
+            # Multiple historical documents may share the same title.  Apply
+            # event time/creator/size proof first, then require uniqueness.  The
+            # previous reverse order rejected a valid copy even when exactly
+            # one of two title hits belonged to this event.
+            proven_hits = [node for node in hits if _event_matches_node(db, event, node)]
+            node_ids = {node["node_id"] for node in proven_hits if node.get("node_id")}
             if len(node_ids) == 1:
                 confirmed_id = next(iter(node_ids))
-                hit = next(node for node in hits if node.get("node_id") == confirmed_id)
-                # 搜索唯一还不够：须与节点载荷/镜像互证（同名新文件未入索引
-                # 时，唯一命中的很可能是旧节点）。互证失败保持 pending。
-                if _event_matches_node(db, event, hit):
-                    if _extension_mismatch(event, hit):
-                        summary["extension_mismatch_confirmed"] = summary.get("extension_mismatch_confirmed", 0) + 1
-                    if event.matched_node_id != confirmed_id:
-                        summary["matched"] += 1
-                    event.matched_node_id = confirmed_id
-                    event.match_status = "confirmed"
-                    summary["confirmed"] += 1
-                    # 直接建档/更新——不再把整个知识库放进巡走队列
-                    # （2026-08-14 流程定稿：一个事件只动一个节点）。
-                    hit_path = next((d.get("path") or "" for d in dentries
-                                     if d.get("dentry_uuid") == confirmed_id), "")
-                    doc = _upsert_audit_document(db, settings, event, hit, hit_path)
-                    summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
-                    # 完成语义按类型收口：上传文件须有数字下载键，原生
-                    # .adoc 由 node id 导出正文；元数据类只更新镜像。
-                    kind = _action_kind(event)
-                    if kind == "metadata":
-                        _finish(db, event, "metadata_applied")
-                    elif _body_fetch_ready(doc):
-                        _finish(db, event, "done")
-                    elif not (event.biz_id or "").isdigit():
-                        _finish(db, event, "dead_letter_no_numeric_biz_id")
-                        summary["dead_letter"] = summary.get("dead_letter", 0) + 1
-                else:
-                    summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
+                hit = next(node for node in proven_hits if node.get("node_id") == confirmed_id)
+                if _extension_mismatch(event, hit):
+                    summary["extension_mismatch_confirmed"] = summary.get("extension_mismatch_confirmed", 0) + 1
+                if event.matched_node_id != confirmed_id:
+                    summary["matched"] += 1
+                event.matched_node_id = confirmed_id
+                event.match_status = "confirmed"
+                summary["confirmed"] += 1
+                native_doc = (event.extension or "").lower() == "adoc"
+                mapping_learned = _learn_space_mapping(db, event, hit.get("workspace_id") or "")
+                # 直接建档/更新——不再把整个知识库放进巡走队列
+                # （2026-08-14 流程定稿：一个事件只动一个节点）。
+                hit_path = next((d.get("path") or "" for d in dentries
+                                 if d.get("dentry_uuid") == confirmed_id), "")
+                doc = _upsert_audit_document(db, settings, event, hit, hit_path)
+                summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
+                mapped_workspace = db.get(Workspace, hit.get("workspace_id") or "")
+                if (mapping_learned and native_doc and mapped_workspace is not None
+                        and mapped_workspace.watch_seeded):
+                    # A native event can be followed by a rename whose audit
+                    # title is no longer searchable.  Walk this already-seeded
+                    # workspace once; its new node ids queue themselves.
+                    _enqueue_walk(db, hit.get("workspace_id") or "", queued)
+                # 完成语义按类型收口：上传文件须有数字下载键，原生
+                # .adoc 由 node id 导出正文；元数据类只更新镜像。
+                kind = _action_kind(event)
+                if kind == "metadata":
+                    _finish(db, event, "metadata_applied")
+                elif _body_fetch_ready(doc):
+                    _finish(db, event, "done")
+                elif not (event.biz_id or "").isdigit():
+                    _finish(db, event, "dead_letter_no_numeric_biz_id")
+                    summary["dead_letter"] = summary.get("dead_letter", 0) + 1
+            elif hits:
+                summary["uncorroborated"] = summary.get("uncorroborated", 0) + 1
             if not event.processed:
                 _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
         # Candidates whose body type lacks a locator (for example an uploaded

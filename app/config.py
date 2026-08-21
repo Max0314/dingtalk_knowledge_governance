@@ -30,8 +30,9 @@ class Settings(BaseSettings):
     stream_enabled: bool = False
     # Targeted workspace watcher: comma-separated workspace ids, exact names or
     # name fragments (resolved against the operator's workspace list). The
-    # first complete walk of a workspace only seeds the mirror; later walks
-    # enqueue reviews for new/changed files and soft-delete missing ones.
+    # first complete walk of a workspace only seeds the mirror; later targeted
+    # walks enqueue genuinely new native adoc nodes by authoritative nodeId.
+    # Uploaded files still wait for the audit trail's numeric download key.
     watch_workspaces: str = ""
     watch_interval_seconds: int = 300
     # Workspaces walked per worker slice; between slices the loop drains

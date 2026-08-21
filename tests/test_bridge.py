@@ -834,9 +834,8 @@ def test_confirmed_finish_budget_rotates(env, monkeypatch):
 
 
 def test_audit_event_direct_upserts_new_document(env, monkeypatch):
-    """2026-08-14 流程定稿：事件确认后直接建档——新库自动注册占位
-    （不拉回连续轮巡）、path 落库、目录待定、键挂上、评审入队，
-    全程零整库巡走。"""
+    """A new workspace is registered unseeded: its confirmed document is
+    reviewed directly, while later stock is absorbed by a seed walk."""
     import time as time_module
 
     settings, walks, _ = env
@@ -866,7 +865,7 @@ def test_audit_event_direct_upserts_new_document(env, monkeypatch):
         assert doc is not None and doc.storage_dentry_id == "99941000001"
         assert doc.path == "/新库/子目录/全新直建.docx" and doc.directory_pending is True
         workspace = db.get(Workspace, "brand-new-ws")
-        assert workspace is not None and workspace.watch_seeded  # 不拉回连续轮巡
+        assert workspace is not None and workspace.watch_seeded is False
         jobs = db.scalars(select(ReviewJob).where(ReviewJob.node_id == "fresh-node-1")).all()
         assert [job.trigger for job in jobs] == ["audit"]
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99941000001"))
@@ -1475,6 +1474,102 @@ def test_native_adoc_creation_rejects_same_time_different_creator(env, monkeypat
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-adoc-wrong-owner"))
         assert event.processed is False and event.matched_node_id == ""
         assert db.get(Document, "adoc-native-wrong-owner") is None
+
+
+def test_native_locator_filters_proof_before_requiring_unique_title(env, monkeypatch):
+    """Same-title history cannot block the one node proven by event time and
+    creator. The proof also learns the targeted workspace address."""
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class DuplicateTitleSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert space_ids is None
+            return [
+                {"dentry_uuid": "adoc-native-current", "name": "月度方案.adoc"},
+                {"dentry_uuid": "adoc-native-history", "name": "月度方案.adoc"},
+            ]
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            return [
+                {"name": "月度方案.adoc", "workspace_id": WS,
+                 "node_id": "adoc-native-current", "extension": "adoc",
+                 "creator_id": "event-author", "created_at": gmt_iso(now_ms)},
+                {"name": "月度方案.adoc", "workspace_id": WS,
+                 "node_id": "adoc-native-history", "extension": "adoc",
+                 "creator_id": "another-author", "created_at": "2026-01-01T00:00:00+00:00"},
+            ]
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", DuplicateTitleSearch)
+    with SessionLocal() as db:
+        ws = db.get(Workspace, WS)
+        ws.watch_seeded = True
+        db.commit()
+    org = settings.model_copy(update={"bridge_locator_enabled": True,
+                                      "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "",
+                                      "bridge_sweep_max_governed": 0})
+    add_event("tb-native-proof-order", "月度方案", "99069", extension="adoc",
+              gmt=now_ms, action_view="创建副本", operator="event-author")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 1
+    assert any(walk["workspace_id"] == WS and walk["mode"] == "bridge" for walk in walks)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-proof-order"))
+        assert event.matched_node_id == "adoc-native-current" and event.resolution == "done"
+        mapping = db.get(SpaceMap, "99069")
+        assert mapping.workspace_id == WS and mapping.source == "learned"
+        db.query(ReviewJob).filter(ReviewJob.node_id == "adoc-native-current").delete(synchronize_session=False)
+        db.query(Document).filter(Document.node_id == "adoc-native-current").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_mapped_native_event_walks_workspace_after_immediate_rename(env, monkeypatch):
+    """A learned space address must survive the audit title going stale.
+
+    DingTalk can emit ``无标题文档`` and let the user rename the document before
+    its search index is queried.  The audit row is only the doorbell here: the
+    mapped, already-seeded Wiki workspace supplies the authoritative node id.
+    """
+    import time as time_module
+
+    settings, walks, _ = env
+    now_ms = int(time_module.time() * 1000)
+
+    class RenamedNativeSearch:
+        def __init__(self, _settings):
+            pass
+
+        async def search_dentries(self, keyword, operator_id, space_ids=None, max_results=20):
+            assert keyword == "无标题文档" and space_ids is None
+            return []
+
+        async def batch_query_wiki_nodes(self, node_ids, operator_id):
+            raise AssertionError("no stale-title hit should reach batchQuery")
+
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", RenamedNativeSearch)
+    with SessionLocal() as db:
+        ws = db.get(Workspace, WS)
+        ws.watch_seeded = True
+        db.merge(SpaceMap(space_id="99070", workspace_id=WS, source="learned"))
+        db.commit()
+    org = settings.model_copy(update={"bridge_locator_enabled": True,
+                                      "dingtalk_sync_operator_id": "op",
+                                      "wiki_storage_space_id": "",
+                                      "bridge_sweep_max_governed": 0})
+    add_event("tb-native-renamed-map", "无标题文档", "99070", extension="adoc",
+              gmt=now_ms, action_view="创建文档", operator="event-author")
+    summary = run_bridge(org)
+    assert summary["confirmed"] == 0 and summary["unlocated"] == 1
+    assert any(walk["workspace_id"] == WS and walk["mode"] == "bridge" for walk in walks)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-renamed-map"))
+        assert event.processed is False and event.matched_node_id == ""
 
 
 def test_native_adoc_accepts_exact_dentry_hit_when_node_display_name_differs(env, monkeypatch):

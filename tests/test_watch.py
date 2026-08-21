@@ -89,8 +89,8 @@ def test_watch_full_lifecycle(settings):
         for node_id in ("watch-A", "watch-B", "watch-D"):
             assert jobs_for(db, node_id) == []  # seeding must not flood the queue
 
-    # New file after the seed: mirrored with parent, NO review — 评审唯一
-    # 入口是审计事件链（2026-08-14 流程定稿），巡走只维护镜像与目录。
+    # Uploaded attachments still wait for the audit numeric storage key; the
+    # watcher cannot fetch their body from nodeId alone.
     FakeClient.nodes["C"] = node("watch-C")
     added = cycle(settings)
     assert added["runs"][0]["mode"] == "watch" and added["runs"][0]["documents_new"] == 1
@@ -99,7 +99,7 @@ def test_watch_full_lifecycle(settings):
         assert db.get(Document, "watch-C").parent_node_id == "root"
         assert db.get(Document, "watch-B").parent_node_id == "watch-D"  # 遍历补准目录
 
-    # Source update -> mirror refresh only, still no review job.
+    # Source update remains mirror-only here; edits use the audit merge window.
     FakeClient.nodes["B"]["updated_at"] = "2026-08-07T10:30:00"
     changed = cycle(settings)
     assert changed["runs"][0]["documents_changed"] == 1
@@ -129,6 +129,37 @@ def test_watch_full_lifecycle(settings):
 def test_watch_unresolved_target_reported(settings):
     result = cycle(settings.model_copy(update={"watch_workspaces": "不存在的库"}))
     assert result["resolved"] == [] and result["unresolved"] == ["不存在的库"] and result["runs"] == []
+
+
+def test_seeded_watch_enqueues_new_native_adoc_by_node_id(settings):
+    """A post-seed native document is body-ready by authoritative nodeId and
+    must not depend on the audit trail's stale creation title."""
+    live = settings.model_copy(update={"audit_review_since": "2026-08-20T00:00:00+08:00"})
+    FakeClient.nodes = {"A": node("watch-A")}
+    cycle(live)  # stock seed: no review
+    FakeClient.nodes["N"] = node("watch-native-new", name="重命名后的在线文档.adoc",
+                                 extension="adoc", created_at="2026-08-21T09:46Z",
+                                 updated_at="2026-08-21T09:46Z")
+    added = cycle(live)
+    assert added["runs"][0]["documents_new"] == 1
+    with SessionLocal() as db:
+        doc = db.get(Document, "watch-native-new")
+        assert doc.file_class == "native_doc" and doc.storage_dentry_id == ""
+        assert [job.trigger for job in jobs_for(db, "watch-native-new")] == ["watch"]
+
+
+def test_seeded_watch_keeps_pre_cutover_native_node_mirror_only(settings):
+    """Plan A remains intact if an old node becomes visible after seed."""
+    live = settings.model_copy(update={"audit_review_since": "2026-08-20T00:00:00+08:00"})
+    FakeClient.nodes = {"A": node("watch-A")}
+    cycle(live)
+    FakeClient.nodes["OLD"] = node("watch-native-old", name="历史在线文档.adoc",
+                                   extension="adoc", created_at="2026-08-01T09:00Z",
+                                   updated_at="2026-08-01T09:00Z")
+    cycle(live)
+    with SessionLocal() as db:
+        assert db.get(Document, "watch-native-old") is not None
+        assert jobs_for(db, "watch-native-old") == []
 
 
 def test_walk_falls_back_to_listing_when_detail_fails(settings, monkeypatch):
@@ -172,12 +203,11 @@ def test_interrupted_seed_stays_seed_and_absorbs_stock(settings):
     second = cycle(settings)
     assert second["runs"][0]["mode"] == "watch"
     with SessionLocal() as db:
-        assert jobs_for(db, "watch-C") == []  # 巡走不评审（审计链专责）
+        assert jobs_for(db, "watch-C") == []  # attachment still needs audit storage key
 
 
-def test_walks_never_enqueue_reviews_even_past_cutoff(settings):
-    """2026-08-14 流程定稿：巡走（含补种）对任何文件都不触发评审——上线后
-    新增由审计事件链直建并评审；巡走发现的只算"审计漏捕"，只观测不补评。"""
+def test_seed_walk_never_enqueues_reviews_even_past_cutoff(settings):
+    """The first complete walk always absorbs stock, including recent rows."""
     live = settings.model_copy(update={"review_since": "2026-08-10"})
     FakeClient.nodes = {"S": node("watch-stock", created_at="2026-08-07T09:00:00"),
                         "N": node("watch-fresh", created_at="2026-08-12T09:00:00")}
@@ -188,9 +218,8 @@ def test_walks_never_enqueue_reviews_even_past_cutoff(settings):
         assert jobs_for(db, "watch-fresh") == []
 
 
-def test_walks_stay_mirror_only_across_cutoff_boundaries(settings):
-    """2026-08-14 流程定稿回归：无论创建/修改时间落在上线时刻前后，
-    巡走都只维护镜像，绝不入队评审（评审专属审计链）。"""
+def test_seed_walk_stays_mirror_only_across_cutoff_boundaries(settings):
+    """Cutoff never turns a seed run into a stock backfill."""
     live = settings.model_copy(update={"review_since": "2026-08-12T08:00:00Z"})
     FakeClient.nodes = {
         "E": node("watch-early", created_at="2026-08-12T07:59:00"),
@@ -339,5 +368,5 @@ def test_watch_skips_unreviewable_file_classes(settings):
     with SessionLocal() as db:
         assert db.get(Document, "watch-pic").file_class == "image"
         assert db.get(Document, "watch-log").file_class == "engineering"
-        # 巡走一律不评审：文件类别仅供审计链入队时判断
+        # Attachments and unreviewable classes do not use native nodeId export.
         assert jobs_for(db, "watch-pic") == [] and jobs_for(db, "watch-doc2") == []

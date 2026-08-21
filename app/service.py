@@ -321,10 +321,15 @@ def harvest_due_reviews(db: Session, settings: Settings) -> int:
 async def _upsert_document(db: Session, settings: Settings, run: SyncRun, workspace_id: str, item: dict,
                            enqueue: bool, trigger_new: str, trigger_change: str,
                            parent_node_id: str = "") -> None:
-    """Persist one listed node. Walks are mirror-only (2026-08-14 流程定稿)：
-    评审只由审计事件链触发；全量核对发现的新增/变化只更新镜像与目录，
-    绝不补评审（审计漏捕另行观测）。``enqueue`` 参数保留签名兼容，恒不
-    入队。
+    """Persist one listed node.
+
+    A completed seed remains mirror-only, so stock can never flood the review
+    queue.  On later targeted walks, however, a genuinely new native ``adoc``
+    node is already the authoritative document identity and is body-ready by
+    ``node_id``.  Queue it directly instead of making a lossy audit title (for
+    example ``无标题文档`` before an immediate rename) prove the same identity
+    again.  Uploaded attachments still require the audit trail's numeric
+    storage key and therefore stay on the audit path.
 
     ``item`` is a ``normalize_node`` dict — the source timestamps live under
     ``created_at``/``updated_at`` (mapping them onto ``source_*`` columns here
@@ -355,10 +360,11 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     if doc.is_deleted:  # seen again — a recycle-bin restore, not a new document
         doc.is_deleted = False
     doc.watch_misses = 0
+    source_creator = item.get("creator_id") or ""
     if is_new or changed:
         # 个别节点没有创建人 id（2026-08-14 生产实测三个库因此整轮回滚）：
         # None 必须钳成空串，后续 .isdigit()/机器人判定才不炸。
-        doc.uploader_key = item.get("creator_id") or doc.uploader_key or ""
+        doc.uploader_key = source_creator or doc.uploader_key or ""
         # bi_center is the single source of organization truth. Never infer a
         # department locally. The old wiki namespace reports creators as
         # UnionIDs, the new one as numeric userIds — send the matching key.
@@ -373,9 +379,24 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    # 2026-08-14 流程定稿：全量/增量遍历一律不触发评审——评审唯一入口是
-    # 审计事件链（桥接确认后直建/更新文档并入队）。月度核对发现的上线后
-    # 新增视为"审计漏捕"，只观测不补评（status_brief 有对应口径）。
+    if enqueue and is_new and (doc.extension or "").lower() == "adoc":
+        cutoff = settings.audit_review_since or settings.review_since
+        after_cutoff = not cutoff or _at_or_after(doc.source_created_at, cutoff)
+        eligible = (
+            after_cutoff
+            and not doc.is_folder
+            and doc.file_class in review_classes(settings.review_classes)
+            and not is_robot_uploader(settings, source_creator, doc.uploader_key, doc.uploader_name)
+            and not is_review_excluded_workspace(db, settings, workspace_id)
+        )
+        if eligible:
+            active = db.scalar(select(ReviewJob).where(
+                ReviewJob.node_id == doc.node_id,
+                ReviewJob.status.in_(("pending", "running")),
+            ).limit(1))
+            if active is None:
+                db.add(ReviewJob(job_id=str(uuid.uuid4()), node_id=doc.node_id,
+                                 trigger=trigger_new, requested_by="system"))
 
 
 async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incremental") -> SyncRun:
@@ -388,7 +409,7 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
             while True:
                 page = await client.list_nodes(workspace_id, settings.dingtalk_sync_operator_id, parent_node_id, next_token)
                 for item in page["items"]:
-                    await _upsert_document(db, settings, run, workspace_id, item, enqueue=True,
+                    await _upsert_document(db, settings, run, workspace_id, item, enqueue=False,
                                            trigger_new="sync", trigger_change="sync_change",
                                            parent_node_id=parent_node_id)
                     if item["has_children"]:
@@ -482,9 +503,10 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
 async def watch_workspace(db: Session, settings: Settings, workspace_id: str, space: dict | None = None,
                           mode: str = "watch") -> SyncRun:
     """One complete walk of one workspace. The first walk (empty mirror) seeds
-    without queueing reviews — 482 pre-existing files must not flood the queue
-    on day one; every later walk queues reviews for new/changed files and
-    counts absences toward soft deletion.
+    without queueing reviews — pre-existing files must not flood the queue.
+    Later targeted walks queue genuinely new native adoc nodes by nodeId;
+    uploaded attachments still wait for their audit storage key. All walks
+    count absences toward soft deletion.
 
     ``space`` is the normalized workspace listing item; when given, the walk
     trusts its rootNodeId instead of calling the detail endpoint, which fails
@@ -514,6 +536,10 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
             if not raw:
                 raise IntegrationError("workspace_not_visible", "工作区不在操作者可见列表中。", 404)
         ws = db.get(Workspace, workspace_id)
+        # Older direct-audit upserts used name==id + watch_seeded=True as a
+        # placeholder.  Treat those rows as unseeded once so a targeted walk
+        # cannot mistake the rest of that workspace's stock for fresh nodes.
+        placeholder_unseeded = bool(ws is not None and ws.name == ws.workspace_id)
         if not ws:
             ws = Workspace(workspace_id=workspace_id, name=raw.get("name", "") or workspace_id)
             db.add(ws)
@@ -530,7 +556,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         run.workspaces_seen = 1
         # 显式补种标记：只有"完整走完"的 seed 轮才置位。用"镜像非空"推断会把
         # 中途被重启打断的库误判为已补种，下一轮把剩余存量全当新增灌进评审。
-        seeding = not bool(ws.watch_seeded)
+        seeding = placeholder_unseeded or not bool(ws.watch_seeded)
         if seeding:
             run.mode = f"{mode}_seed"
         seen: set[str] = set()
