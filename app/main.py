@@ -7,11 +7,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
-from . import metrics, orgmap
+from . import bi_export, metrics, orgmap
 from .config import get_settings
 from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
@@ -111,6 +111,69 @@ class RuleEditorsRequest(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "dingtalk_knowledge_governance", "document_body_persistence": "disabled"}
+
+
+def _bi_export_error(error: bi_export.ExportApiError) -> JSONResponse:
+    return JSONResponse(status_code=error.status_code, content={"ok": False, "error": error.code})
+
+
+def _bi_export_page(value: str, page_size: str) -> tuple[int, int]:
+    settings = get_settings()
+    maximum = max(1, min(int(settings.bi_export_max_page_size or 200), 500))
+    return (
+        bi_export.validate_page(value, name="page", minimum=1, maximum=1_000_000),
+        bi_export.validate_page(page_size, name="pageSize", minimum=1, maximum=maximum),
+    )
+
+
+@app.get("/api/export/v1/knowledge-governance/latest")
+def bi_export_latest(request: Request, db: Session = Depends(db_session)):
+    try:
+        bi_export.authorize(request, get_settings())
+        data, meta = bi_export.latest(db)
+        return {"ok": True, "data": data, "meta": meta}
+    except bi_export.ExportApiError as error:
+        return _bi_export_error(error)
+
+
+@app.get("/api/export/v1/knowledge-governance/monthly-summary")
+def bi_export_monthly_summary(request: Request, month: str = "", db: Session = Depends(db_session)):
+    try:
+        bi_export.authorize(request, get_settings())
+        data, meta = bi_export.monthly_summary(db, bi_export.validate_month(month))
+        return {"ok": True, "data": data, "meta": meta}
+    except bi_export.ExportApiError as error:
+        return _bi_export_error(error)
+
+
+@app.get("/api/export/v1/knowledge-governance/monthly-employees")
+def bi_export_monthly_employees(request: Request, month: str = "", page: str = "1",
+                                page_size: str = Query(default="200", alias="pageSize"),
+                                db: Session = Depends(db_session)):
+    try:
+        bi_export.authorize(request, get_settings())
+        month = bi_export.validate_month(month)
+        page_number, parsed_page_size = _bi_export_page(page, page_size)
+        items, meta = bi_export.monthly_employees(db, month)
+        data, pagination = bi_export.paginate(items, page_number, parsed_page_size)
+        return {"ok": True, "data": data, "pagination": pagination, "meta": meta}
+    except bi_export.ExportApiError as error:
+        return _bi_export_error(error)
+
+
+@app.get("/api/export/v1/knowledge-governance/monthly-employee-workspaces")
+def bi_export_monthly_employee_workspaces(request: Request, month: str = "", page: str = "1",
+                                           page_size: str = Query(default="200", alias="pageSize"),
+                                           db: Session = Depends(db_session)):
+    try:
+        bi_export.authorize(request, get_settings())
+        month = bi_export.validate_month(month)
+        page_number, parsed_page_size = _bi_export_page(page, page_size)
+        items, meta = bi_export.monthly_employee_workspaces(db, month)
+        data, pagination = bi_export.paginate(items, page_number, parsed_page_size)
+        return {"ok": True, "data": data, "pagination": pagination, "meta": meta}
+    except bi_export.ExportApiError as error:
+        return _bi_export_error(error)
 
 
 @app.get("/api/v1/dashboard/overview")
