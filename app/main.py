@@ -1197,6 +1197,11 @@ def index(request: Request):
 
 @app.get("/{path:path}")
 def static_files(request: Request, path: str):
+    # API typos must fail as API calls. Returning the SPA shell with HTTP 200
+    # makes server-to-server clients treat a misspelled contract route as a
+    # successful JSON response until parsing fails much later.
+    if path.startswith("api/"):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
     candidate = ROOT / "static" / path
     if candidate.is_file() and candidate.resolve().is_relative_to((ROOT / "static").resolve()): return _static_response(request, candidate)
     return _static_response(request, ROOT / "static" / "index.html")

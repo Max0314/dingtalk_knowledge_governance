@@ -41,7 +41,13 @@ def authorize(request, settings: Settings) -> None:
     if not allowed:
         raise ExportApiError(503, "export_not_configured")
     provided = str(request.headers.get("x-api-key") or "").strip()
-    if not provided or not any(hmac.compare_digest(provided, item) for item in allowed):
+    # bytes keeps compare_digest constant-time for every UTF-8 value; its str
+    # form rejects non-ASCII input with TypeError and would turn a bad header
+    # into a 500 instead of the intended 401.
+    provided_bytes = provided.encode("utf-8")
+    if not provided or not any(
+        hmac.compare_digest(provided_bytes, item.encode("utf-8")) for item in allowed
+    ):
         raise ExportApiError(401, "unauthorized")
 
 

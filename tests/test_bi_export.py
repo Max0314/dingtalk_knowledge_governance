@@ -120,6 +120,7 @@ def test_export_upload_facts_are_paginated_and_safe(monkeypatch):
 
             latest = client.get("/api/export/v1/knowledge-governance/latest", headers=HEADERS)
             assert latest.status_code == 200
+            assert latest.headers["cache-control"] == "no-store"
             assert latest.json()["data"]["latestMonth"] == MONTH
             assert latest.json()["meta"]["contractVersion"] == 1
 
@@ -176,6 +177,12 @@ def test_export_guard_and_request_validation(monkeypatch):
             assert client.get(
                 "/api/export/v1/knowledge-governance/latest", headers={"X-API-Key": "wrong"}
             ).status_code == 401
+            # The namespace itself fails closed: an accidentally added route
+            # cannot bypass the Key merely because it has no local guard yet.
+            assert client.get("/api/export/v1/not-defined").status_code == 401
+            unknown = client.get("/api/export/v1/not-defined", headers=HEADERS)
+            assert unknown.status_code == 404
+            assert unknown.headers["cache-control"] == "no-store"
             invalid_month = client.get(
                 "/api/export/v1/knowledge-governance/monthly-summary",
                 params={"month": "2026-13"},

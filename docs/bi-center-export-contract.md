@@ -21,7 +21,7 @@ KG_BI_EXPORT_MAX_PAGE_SIZE=200
 
 调用方必须带 `X-API-Key`。该密钥与 `BI_CENTER_INTERNAL_TOKEN` 相互独立：后者仅用于知识库服务调用 `bi_center` 的员工目录接口。
 
-导出路由不需要浏览器 Cookie，但每个路由均强制校验 API Key。关闭功能返回 `404 export_disabled`；未配置密钥返回 `503 export_not_configured`；密钥错误返回 `401 unauthorized`。
+导出路由不需要浏览器 Cookie，但整个 `/api/export/` 命名空间由中间件统一强制校验 API Key，各处理器再做一次防御性校验；未来新增路由不会因为漏写依赖而意外公开。所有响应均带 `Cache-Control: no-store`。关闭功能返回 `404 export_disabled`；未配置密钥返回 `503 export_not_configured`；密钥错误返回 `401 unauthorized`。
 
 ## 路由
 

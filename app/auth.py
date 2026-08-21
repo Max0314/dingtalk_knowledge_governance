@@ -31,10 +31,9 @@ from .db import AuthSession, SessionLocal, utcnow
 COOKIE_NAME = "kg_session"
 SESSION_TTL = timedelta(days=7)
 STATE_TTL_SECONDS = 600
-# Export endpoints have their own mandatory X-API-Key guard.  They must bypass
-# the browser-cookie guard so bi_center can pull them headlessly, but no export
-# handler is allowed to omit its separate guard.
-PUBLIC_API_PATHS = ("/api/health", "/api/auth/", "/api/export/")
+# The export namespace is handled explicitly at the top of the middleware so
+# it can bypass browser cookies without entering this public-session allowlist.
+PUBLIC_API_PATHS = ("/api/health", "/api/auth/")
 
 
 def _sign(settings: Settings, payload: str) -> str:
@@ -144,6 +143,23 @@ async def guard_middleware(request: Request, call_next):
     """401 for /api/* without a valid session. Static assets stay public."""
     settings = get_settings()
     path = request.url.path
+    if path.startswith("/api/export/"):
+        # Fail closed for the whole namespace. Route-local checks remain as
+        # defence in depth, but a future export handler cannot accidentally
+        # become public merely because its author forgot that dependency.
+        from . import bi_export
+        try:
+            bi_export.authorize(request, settings)
+        except bi_export.ExportApiError as error:
+            response = JSONResponse(status_code=error.status_code,
+                                    content={"ok": False, "error": error.code})
+            response.headers["Cache-Control"] = "no-store"
+            return response
+        response = await call_next(request)
+        # Employee/workspace facts are authenticated but still sensitive;
+        # prevent browsers and intermediary proxies from retaining them.
+        response.headers["Cache-Control"] = "no-store"
+        return response
     if settings.auth_enabled and path.startswith("/api/") and not any(path.startswith(p) for p in PUBLIC_API_PATHS):
         user = resolve_session(request.cookies.get(COOKIE_NAME, ""))
         if not user:

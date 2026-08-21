@@ -319,6 +319,7 @@ def test_model_score_recomputes_verdict(monkeypatch):
             db.add(Document(node_id="content-2", workspace_id="content-ws", name="判级测试_V1.0.docx",
                             extension="docx", file_class="document"))
         # 共享测试库跑第二遍时正文与上轮一致：清指纹绕过 content_unchanged 去重
+        db.flush()
         db.get(Document, "content-2").content_fingerprint = ""
         db.commit()
         settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
@@ -357,6 +358,7 @@ def test_genre_demotes_document_rules_to_advisory(monkeypatch):
         if not db.get(Document, "content-3"):
             db.add(Document(node_id="content-3", workspace_id="content-ws", name="登录流程测试用例.docx",
                             extension="docx", file_class="document"))
+        db.flush()
         db.get(Document, "content-3").content_fingerprint = ""
         db.commit()
         settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
@@ -387,6 +389,7 @@ def test_run_review_uses_extracted_content(monkeypatch):
         if not db.get(Document, "content-1"):
             db.add(Document(node_id="content-1", workspace_id="content-ws", name="抽取测试_V1.0.docx",
                             extension="docx", file_class="document"))
+        db.flush()
         db.get(Document, "content-1").content_fingerprint = ""
         db.commit()
         instance = run_review(db, get_settings(), "content-1", "test")
