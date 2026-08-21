@@ -246,7 +246,10 @@ def _latest_review_subquery():
             Document.uploader_key.label("uploader_key"),
             func.row_number().over(
                 partition_by=ReviewInstance.node_id,
-                order_by=ReviewInstance.created_at.desc(),
+                order_by=(
+                    ReviewInstance.created_at.desc(),
+                    ReviewInstance.review_instance_id.desc(),
+                ),
             ).label("rank"),
         )
         .join(Document, Document.node_id == ReviewInstance.node_id)
@@ -305,7 +308,12 @@ def _review_qualities_by_month(db: Session, latest) -> dict[str, dict[str, Any]]
     return {str(row.month): _quality_payload(row) for row in rows if str(row.month or "").strip()}
 
 
-def _employee_quality_facts(db: Session, latest, months: set[str]) -> list[dict[str, Any]]:
+def _employee_quality_facts(
+    db: Session,
+    latest,
+    months: set[str],
+    robots: set[str],
+) -> list[dict[str, Any]]:
     if not months:
         return []
     month_key = func.substr(latest.c.reviewed_at, 1, 7).label("month")
@@ -321,7 +329,6 @@ def _employee_quality_facts(db: Session, latest, months: set[str]) -> list[dict[
         .group_by(month_key, EmployeeMap.employee_key)
         .order_by(month_key, EmployeeMap.employee_key)
     )
-    robots = metrics.robot_ids()
     if robots:
         statement = statement.where(
             latest.c.uploader_key.not_in(robots),
@@ -358,6 +365,7 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
     selected_months = available_months[-safe_months:]
     selected_set = set(selected_months)
     current_month = selected_months[-1] if selected_months else ""
+    robots = metrics.robot_ids()
 
     quality_rows = []
     for month in selected_months:
@@ -432,7 +440,7 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
     for month in selected_months:
         _, source_rows = _source_rows(db, month)
         for row in source_rows:
-            if not _is_official(row, metrics.robot_ids()):
+            if not _is_official(row, robots):
                 continue
             key = (month, str(row["employee_key"]))
             fact = employee_facts.setdefault(
@@ -454,7 +462,7 @@ def dashboard(db: Session, months: int) -> tuple[dict[str, Any], dict[str, Any]]
             fact["uploadedFileCount"] += int(row["file_count"] or 0)
             if row["workspace_id"]:
                 fact["_workspaceIds"].add(str(row["workspace_id"]))
-    for quality in _employee_quality_facts(db, latest, selected_set):
+    for quality in _employee_quality_facts(db, latest, selected_set, robots):
         key = (quality["month"], quality["employeeKey"])
         fact = employee_facts.setdefault(
             key,
