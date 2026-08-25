@@ -205,12 +205,18 @@ def dashboard(db: Session = Depends(db_session)):
     # 存成 pass 的历史），不再参与平均分。口径不变，但取最新和求均值都下推到
     # SQL：这里原先把整张 review_instances（含 dimensions/findings 两个 JSON
     # 列）拉进 Python 只为算两个平均分，正是 metrics._collect 警告过的反模式。
-    ranked = select(
-        ReviewInstance.ai_score.label("ai_score"),
-        ReviewInstance.created_at.label("created_at"),
-        func.row_number().over(partition_by=ReviewInstance.node_id,
-                               order_by=ReviewInstance.created_at.desc()).label("rank"),
-    ).subquery()
+    ranked = (
+        select(
+            ReviewInstance.ai_score.label("ai_score"),
+            ReviewInstance.created_at.label("created_at"),
+            func.row_number().over(partition_by=ReviewInstance.node_id,
+                                   order_by=ReviewInstance.created_at.desc()).label("rank"),
+        )
+        .join(Document, Document.node_id == ReviewInstance.node_id)
+        .join(Workspace, Workspace.workspace_id == Document.workspace_id)
+        .where(Workspace.is_active.is_(True))
+        .subquery()
+    )
     latest = select(ranked.c.ai_score, ranked.c.created_at).where(ranked.c.rank == 1).subquery()
     average, month_average = db.execute(select(
         func.avg(latest.c.ai_score),
