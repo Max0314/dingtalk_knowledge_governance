@@ -51,7 +51,7 @@ def node(node_id, parent="root", **extra):
 @pytest.fixture()
 def settings(monkeypatch):
     monkeypatch.setattr(service, "DingtalkClient", FakeClient)
-    service._watch_cache.update(at=0.0, key="", resolved=[], unresolved=[])
+    service._watch_cache.update(at=0.0, key="", resolved=[], unresolved=[], ignored=[])
     init_db()
     with SessionLocal() as db:
         node_ids = [row[0] for row in db.execute(select(Document.node_id).where(Document.workspace_id == WS))]
@@ -129,6 +129,39 @@ def test_watch_full_lifecycle(settings):
 def test_watch_unresolved_target_reported(settings):
     result = cycle(settings.model_copy(update={"watch_workspaces": "不存在的库"}))
     assert result["resolved"] == [] and result["unresolved"] == ["不存在的库"] and result["runs"] == []
+
+
+def test_watch_targets_ignore_configured_name_prefix(settings, monkeypatch):
+    import asyncio
+
+    class PrefixClient(FakeClient):
+        async def list_workspaces(self, operator_id, next_token="", max_results=30):
+            return {"items": [
+                {"workspace_id": "normal", "name": "P-01-正常知识库", "root_node_id": "root"},
+                {"workspace_id": "cd", "name": "CD_P-06-通信_光猫", "root_node_id": "root"},
+            ], "next_token": ""}
+
+    monkeypatch.setattr(service, "DingtalkClient", PrefixClient)
+    scoped = settings.model_copy(update={"watch_workspaces": "*", "ignored_workspace_prefixes": "CD_"})
+    targets = asyncio.run(service.resolve_watch_targets(scoped, force=True))
+    assert [target["workspace_id"] for target in targets["resolved"]] == ["normal"]
+    assert targets["ignored"] == ["CD_P-06-通信_光猫"]
+
+
+def test_ignored_prefix_deactivates_existing_workspace_and_unblocks_seed(settings):
+    scoped = settings.model_copy(update={"ignored_workspace_prefixes": "CD_"})
+    with SessionLocal() as db:
+        db.merge(Workspace(workspace_id="cd-ignored", name="CD_历史库", watch_seeded=False,
+                           is_active=True, unreachable_misses=1))
+        for workspace in db.scalars(select(Workspace).where(Workspace.workspace_id != "cd-ignored")).all():
+            workspace.watch_seeded = True
+        db.commit()
+        service.watch_scan_decision(db, scoped)
+        workspace = db.get(Workspace, "cd-ignored")
+        assert workspace.is_active is False and workspace.unreachable_misses == 0
+        assert service._seeding_pending(db) == 0
+        db.delete(workspace)
+        db.commit()
 
 
 def test_seeded_watch_enqueues_new_native_adoc_by_node_id(settings):

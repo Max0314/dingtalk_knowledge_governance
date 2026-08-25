@@ -37,7 +37,7 @@ from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, Histo
                  ReviewJob, SpaceMap, Workspace, utcnow)
 from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError
-from .service import MODIFY_MERGE_WINDOW_SECONDS, watch_workspace
+from .service import MODIFY_MERGE_WINDOW_SECONDS, watch_workspace, workspace_name_is_ignored
 
 logger = logging.getLogger("kg.bridge")
 
@@ -190,7 +190,10 @@ def _confirmed_lifecycle_node(db: Session, event: FileAuditEvent) -> str:
 
 
 def _governed_workspaces(db: Session) -> list[str]:
-    return [row[0] for row in db.execute(select(Document.workspace_id).distinct()).all() if row[0]]
+    return [row[0] for row in db.execute(
+        select(Document.workspace_id).join(Workspace, Workspace.workspace_id == Document.workspace_id)
+        .where(Workspace.is_active.is_(True)).distinct()
+    ).all() if row[0]]
 
 
 def _attach_numeric_id(db: Session, event: FileAuditEvent, doc: Document | None = None) -> bool:
@@ -638,6 +641,10 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
         if not _is_wiki_write(event):
             event.processed = True
             continue
+        if workspace_name_is_ignored(settings, event.workspace_name):
+            _finish(db, event, "ignored_workspace_prefix")
+            summary["ignored_workspaces"] = summary.get("ignored_workspaces", 0) + 1
+            continue
         summary["wiki_events"] += 1
         wiki_events.append(event)
         kind = _action_kind(event)
@@ -919,7 +926,7 @@ def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
         _last_walk[row.workspace_id] = time.time()
         row.last_attempt_at = utcnow()
         run = asyncio.run(watch_workspace(db, settings, row.workspace_id, mode="bridge"))
-        if run.status == "succeeded":
+        if run.status in ("succeeded", "skipped"):
             db.delete(row)
         else:
             row.failures += 1

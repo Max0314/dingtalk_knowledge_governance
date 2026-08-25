@@ -423,6 +423,8 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
             page = await client.list_workspaces(settings.dingtalk_sync_operator_id, workspace_next_token)
             run.workspaces_seen += len(page["items"])
             for raw in page["items"]:
+                if workspace_name_is_ignored(settings, raw.get("name", "")):
+                    continue
                 ws = db.get(Workspace, raw["workspace_id"])
                 if not ws:
                     ws = Workspace(workspace_id=raw["workspace_id"], name=raw["name"])
@@ -449,8 +451,39 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
 # changed and deleted files without any DingTalk-side configuration.
 # ---------------------------------------------------------------------------
 
-_watch_cache: dict = {"at": 0.0, "key": "", "resolved": [], "unresolved": []}
+_watch_cache: dict = {"at": 0.0, "key": "", "resolved": [], "unresolved": [], "ignored": []}
 WATCH_RESOLUTION_TTL_SECONDS = 3600
+
+
+def ignored_workspace_prefixes(settings: Settings) -> tuple[str, ...]:
+    """Configured name prefixes that must stay outside the governance scope."""
+    return tuple(prefix.strip() for prefix in settings.ignored_workspace_prefixes.split(",") if prefix.strip())
+
+
+def workspace_name_is_ignored(settings: Settings, name: str) -> bool:
+    return bool(name) and any(name.startswith(prefix) for prefix in ignored_workspace_prefixes(settings))
+
+
+def apply_ignored_workspace_prefixes(db: Session, settings: Settings) -> int:
+    """Deactivate already-mirrored excluded workspaces without deleting history.
+
+    ``is_active=False`` is the established current-view boundary: metrics and
+    unified document queries exclude it on their live and baseline arms. A
+    later removal of the prefix lets a successful walk reactivate the space.
+    """
+    changed = 0
+    for workspace in db.scalars(select(Workspace).where(Workspace.is_active.is_(True))).all():
+        if workspace_name_is_ignored(settings, workspace.name):
+            workspace.is_active = False
+            workspace.unreachable_misses = 0
+            changed += 1
+    if changed:
+        db.commit()
+        # Cached metrics merge historical and live rows, so an exclusion must
+        # be visible immediately rather than after a document happens to move.
+        from . import metrics
+        metrics.invalidate_cache()
+    return changed
 
 
 async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict:
@@ -461,10 +494,11 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
     round."""
     tokens = [token.strip() for token in settings.watch_workspaces.split(",") if token.strip()]
     if not tokens:
-        return {"resolved": [], "unresolved": []}
-    key = "|".join(tokens)
+        return {"resolved": [], "unresolved": [], "ignored": []}
+    key = "|".join(tokens) + "||" + "|".join(ignored_workspace_prefixes(settings))
     if not force and _watch_cache["key"] == key and time.time() - _watch_cache["at"] < WATCH_RESOLUTION_TTL_SECONDS and _watch_cache["resolved"]:
-        return {"resolved": _watch_cache["resolved"], "unresolved": _watch_cache["unresolved"]}
+        return {"resolved": _watch_cache["resolved"], "unresolved": _watch_cache["unresolved"],
+                "ignored": _watch_cache.get("ignored", [])}
     client = DingtalkClient(settings)
     spaces: list[dict] = []
     next_token = ""
@@ -476,6 +510,7 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
             break
     resolved: list[dict] = []
     unresolved: list[str] = []
+    ignored: list[str] = []
     seen_ids: set[str] = set()
     for token in tokens:
         if token == "*":
@@ -491,13 +526,16 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
             if space["workspace_id"] in seen_ids:
                 continue
             seen_ids.add(space["workspace_id"])
+            if workspace_name_is_ignored(settings, space.get("name", "")):
+                ignored.append(space.get("name", "") or space["workspace_id"])
+                continue
             # Keep the whole normalized listing item: the detail endpoint fails
             # for some (personal) spaces, so the walk must reuse rootNodeId and
             # metadata from the listing — exactly what the baseline scanner does.
             resolved.append({"token": token, "workspace_id": space["workspace_id"], "name": space.get("name", ""),
                              "space": space})
-    _watch_cache.update(at=time.time(), key=key, resolved=resolved, unresolved=unresolved)
-    return {"resolved": resolved, "unresolved": unresolved}
+    _watch_cache.update(at=time.time(), key=key, resolved=resolved, unresolved=unresolved, ignored=ignored)
+    return {"resolved": resolved, "unresolved": unresolved, "ignored": ignored}
 
 
 async def watch_workspace(db: Session, settings: Settings, workspace_id: str, space: dict | None = None,
@@ -535,6 +573,12 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
                         break
             if not raw:
                 raise IntegrationError("workspace_not_visible", "工作区不在操作者可见列表中。", 404)
+        if workspace_name_is_ignored(settings, raw.get("name", "")):
+            run.workspace_name = raw.get("name", "")
+            run.workspaces_seen = 1
+            run.status, run.error_code, run.finished_at = "skipped", "workspace_prefix_ignored", utcnow()
+            db.commit()
+            return run
         ws = db.get(Workspace, workspace_id)
         # Older direct-audit upserts used name==id + watch_seeded=True as a
         # placeholder.  Treat those rows as unseeded once so a targeted walk
@@ -717,6 +761,7 @@ def watch_scan_decision(db: Session, settings: Settings) -> str:
     """"scan" = 需要推进全量巡走；"idle" = 本期计划已完成，只等下个计划日。
     首轮补种未完成时始终 scan（2026-08-14 决策：补种完成后停止连续轮巡，
     全量扫描固定每月 10/24 日；期间的变化发现交给审计增量拉取 + 桥接）。"""
+    apply_ignored_workspace_prefixes(db, settings)
     if _seeding_pending(db):
         return "scan"
     return "idle" if _watch_plan(db).completed_for == current_scan_due(settings) else "scan"

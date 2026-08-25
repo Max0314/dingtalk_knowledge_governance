@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from . import metrics
 from .config import Settings, get_settings
 from .db import Document, EmployeeMap, ReviewInstance, UploaderMonthStat, Workspace
-from .service import review_excluded_levels, workspace_level
+from .service import review_excluded_levels, workspace_level, workspace_name_is_ignored
 
 
 CONTRACT_VERSION = 1
@@ -92,7 +92,10 @@ def _source_rows(db: Session, month: str) -> tuple[str, list[dict[str, Any]]]:
         .where(UploaderMonthStat.snapshot_id == snapshot_id, UploaderMonthStat.month == month)
     )
     rows = []
+    settings = get_settings()
     for row in db.execute(statement):
+        if workspace_name_is_ignored(settings, str(row.workspace_name or "")):
+            continue
         rows.append(
             {
                 "source_user_id": str(row.creator_user_id or ""),

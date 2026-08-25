@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # walks enqueue genuinely new native adoc nodes by authoritative nodeId.
     # Uploaded files still wait for the audit trail's numeric download key.
     watch_workspaces: str = ""
+    # Comma-separated workspace-name prefixes excluded from collection. An
+    # excluded workspace is not seeded, watched, bridged or included in the
+    # current governance view; its historical rows remain auditable.
+    ignored_workspace_prefixes: str = ""
     watch_interval_seconds: int = 300
     # Workspaces walked per worker slice; between slices the loop drains
     # review jobs / notifications / audit pull, so a 140-workspace cycle

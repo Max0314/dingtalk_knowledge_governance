@@ -194,7 +194,7 @@ def dashboard(db: Session = Depends(db_session)):
     by an unindexed column) and `coverage_summary` (the full per-workspace
     list, of which 4 integers were kept) — neither was ever read by app.js.
     """
-    workspaces = db.scalar(select(func.count()).select_from(Workspace)) or 0
+    workspaces = db.scalar(select(func.count()).select_from(Workspace).where(Workspace.is_active.is_(True))) or 0
     increments = metrics.monthly_increments(db)
     now = datetime.now(timezone.utc)
     # Naive-UTC bounds, matching how the rest of the service compares stored

@@ -40,6 +40,7 @@ def _change_stamp(db: Session) -> tuple:
         db.scalar(select(func.count()).select_from(HistoricalFileNode)) or 0,
         db.scalar(select(func.count()).select_from(Document)) or 0,
         db.scalar(select(func.max(Document.discovered_at))),
+        db.scalar(select(func.count()).select_from(Workspace).where(Workspace.is_active.is_(True))) or 0,
     )
 
 
