@@ -4,14 +4,16 @@ os.environ["KG_DATABASE_URL"] = "sqlite:///./runtime/test_knowledge_governance.d
 os.environ["KG_DEMO_MODE"] = "true"
 
 from types import SimpleNamespace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
 
-from app import audit_bridge
+from app import audit_bridge, audit_pull
 from app.audit_pull import _filename_extension, _ingest
 from app.config import get_settings
-from app.db import Document, FileAuditEvent, ReviewInstance, ReviewJob, SessionLocal, SpaceMap, Workspace, init_db
+from app.db import (_audit_event_key, Document, FileAuditEvent, ReviewInstance, ReviewJob,
+                    SessionLocal, SpaceMap, Workspace, init_db)
 from app.fileclass import classify, review_classes
 
 WS = "bridge-ws"
@@ -188,6 +190,91 @@ def test_audit_ingest_preserves_same_biz_lifecycle_and_dedupes_overlap(env):
         assert [event.resource for event in events] == ["无标题文档", "已重命名文档"]
         assert len({event.event_key for event in events}) == 2
         assert all(event.workspace_name == "桥接测试库" for event in events)
+
+
+def test_audit_ingest_dedupes_numeric_zero_biz_id(env):
+    """DingTalk emits numeric bizId=0 for some membership audit rows."""
+    gmt = DEFAULT_GMT + 12_345
+    action_view = "知识库移除成员"
+    event_key = _audit_event_key("0", gmt, "29", action_view)
+    with SessionLocal() as db:
+        try:
+            db.query(FileAuditEvent).filter(FileAuditEvent.event_key == event_key).delete(
+                synchronize_session=False)
+            db.add(FileAuditEvent(event_key=event_key, biz_id="0", gmt_create=gmt,
+                                  action="29", action_view=action_view,
+                                  module_view="共享文件夹"))
+            db.commit()
+
+            summary = _ingest(db, [{"bizId": 0, "gmtCreate": gmt, "action": "29",
+                                    "actionView": action_view, "operateModuleView": "共享文件夹"}])
+            db.commit()
+
+            assert summary["stored"] == 0
+            assert summary["dupes"] == 1
+            assert db.query(FileAuditEvent).filter(FileAuditEvent.event_key == event_key).count() == 1
+        finally:
+            db.rollback()
+            db.query(FileAuditEvent).filter(FileAuditEvent.event_key == event_key).delete(
+                synchronize_session=False)
+            db.commit()
+
+
+def test_audit_pull_commits_ingestion_before_alarm(monkeypatch):
+    events: list[str] = []
+    state = SimpleNamespace(last_gmt_create=1, last_run_at=None, last_rows=0)
+
+    class FakeDb:
+        def commit(self):
+            events.append("commit")
+
+    async def fake_fetch(_settings, _start_ms, _end_ms):
+        return []
+
+    monkeypatch.setattr(audit_pull, "_state", lambda _db: state)
+    monkeypatch.setattr(audit_pull, "_fetch_pages", fake_fetch)
+    monkeypatch.setattr(audit_pull, "_ingest", lambda _db, _rows: {
+        "stored": 0, "reads": 0, "dupes": 0, "max_gmt": 0})
+    monkeypatch.setattr(audit_pull, "_maybe_alarm", lambda _db, _settings, _state: events.append("alarm"))
+
+    audit_pull.run_audit_pull(FakeDb(), get_settings())
+
+    assert events == ["commit", "alarm"]
+
+
+def test_audit_alarm_reserves_dedupe_slot_before_send(monkeypatch):
+    events: list[str] = []
+    now_cst = datetime(2026, 8, 27, 10, 0, tzinfo=timezone(timedelta(hours=8)))
+    now_utc = now_cst.astimezone(timezone.utc)
+    state = SimpleNamespace(last_gmt_create=int(now_cst.timestamp() * 1000) - 31 * 60 * 1000,
+                            silence_alerted_at=None)
+
+    class FixedDatetime:
+        @staticmethod
+        def now(_tz):
+            return now_cst
+
+    class FakeDb:
+        def commit(self):
+            events.append("commit")
+
+    class FakeClient:
+        def __init__(self, _settings):
+            pass
+
+        async def send_robot_markdown(self, _targets, _title, _body):
+            events.append("send")
+
+    monkeypatch.setattr(audit_pull, "datetime", FixedDatetime)
+    monkeypatch.setattr(audit_pull.time, "time", now_cst.timestamp)
+    monkeypatch.setattr(audit_pull, "utcnow", lambda: now_utc)
+    monkeypatch.setattr(audit_pull, "DingtalkClient", FakeClient)
+    settings = get_settings().model_copy(update={"audit_alert_user_id": "operator"})
+
+    audit_pull._maybe_alarm(FakeDb(), settings, state)
+
+    assert events == ["commit", "send"]
+    assert state.silence_alerted_at == now_utc
 
 
 def test_pre_cutover_event_is_retained_without_locator_or_review(env, monkeypatch):

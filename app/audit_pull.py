@@ -89,7 +89,13 @@ def _ingest(db: Session, rows: list[dict]) -> dict:
     stored = reads = dupes = 0
     known: dict[str, FileAuditEvent] = {}
     if rows:
-        keys = [_audit_event_key(r.get("bizId"), r.get("gmtCreate"), r.get("action"), r.get("actionView"))
+        # Normalize exactly as the insert path below.  DingTalk sometimes
+        # returns numeric ``bizId=0`` for membership operations; passing that
+        # raw value to _audit_event_key treats it as falsey, while the insert
+        # path stores/hashes the string "0".  The mismatch bypassed overlap
+        # dedupe and made a pre-existing event fail the whole transaction.
+        keys = [_audit_event_key(str(r.get("bizId")), int(r.get("gmtCreate") or 0),
+                                 r.get("action"), str(r.get("actionView") or ""))
                 for r in rows]
         for chunk_start in range(0, len(keys), 500):
             chunk = keys[chunk_start:chunk_start + 500]
@@ -158,14 +164,19 @@ def _maybe_alarm(db: Session, settings: Settings, state: AuditState) -> None:
     target = settings.audit_alert_user_id
     if not target:
         return
+    # Reserve the four-hour slot before crossing the external side-effect
+    # boundary.  If sending fails, release it so the next pull can retry.
+    # run_audit_pull has already committed audit ingestion at this point.
+    state.silence_alerted_at = utcnow()
+    db.commit()
     try:
         asyncio.run(DingtalkClient(settings).send_robot_markdown(
             [target], "审计流水静默告警",
             f"### 审计流水静默告警\n工作时段内已连续 **{int(silent_minutes)} 分钟** 未收到任何文件操作记录。\n\n"
             "请检查专属钉钉管理后台的文件审计开关是否被关闭（专属安全 → 专属审计平台）。"))
-        state.silence_alerted_at = utcnow()
     except Exception:
-        pass
+        state.silence_alerted_at = None
+        db.commit()
 
 
 def run_audit_pull(db: Session, settings: Settings) -> dict:
@@ -181,8 +192,11 @@ def run_audit_pull(db: Session, settings: Settings) -> dict:
         state.last_gmt_create = summary["max_gmt"]
     state.last_run_at = utcnow()
     state.last_rows = len(rows)
-    _maybe_alarm(db, settings, state)
+    # Never emit an alarm for a pull whose audit rows/cursor could still roll
+    # back.  The old order sent the robot message first, then lost both cursor
+    # and silence_alerted_at when an unrelated event insert failed.
     db.commit()
+    _maybe_alarm(db, settings, state)
     return {"rows": len(rows), **summary}
 
 
