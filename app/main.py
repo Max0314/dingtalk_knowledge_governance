@@ -266,13 +266,21 @@ def metrics_coverage(db: Session = Depends(db_session)):
 @app.get("/api/v1/metrics/increments/tree")
 def metrics_increments_tree(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                             month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                            scope: str = Query(default="", pattern=r"^$|^rd_system$"),
                             department: str = "", biz_group: str = "", person: str = "",
                             db: Session = Depends(db_session)):
     """Drillable increment composition: no params -> years (recent first);
     year -> its months; month -> its days. People filters narrow the
     population via the bi_center employee cache."""
-    return metrics.increments_tree(db, year=year, month=month, department=department,
-                                   biz_group=biz_group, person=person)
+    try:
+        return metrics.increments_tree(db, year=year, month=month, department=department,
+                                       biz_group=biz_group, person=person, scope=scope)
+    except metrics.OrganizationScopeCacheMissingError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "organization_scope_cache_missing",
+            "message": "研发体系月度组织缓存未就绪，请联系管理员同步后重试。",
+            "missing_months": exc.missing_months,
+        }) from exc
 
 
 @app.get("/api/v1/metrics/workspaces/{workspace_id}/months")

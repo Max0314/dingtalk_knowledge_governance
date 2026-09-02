@@ -443,6 +443,58 @@ class BiCenterClient:
         data = body.get("data", {}) or {}
         return data.get("results", data.get("items", body.get("items", [])))
 
+    async def employee_directory_month_page(self, month_key: str, limit: int = 500,
+                                            offset: int = 0) -> dict[str, Any]:
+        """Read one authoritative monthly directory page from bi_center.
+
+        bi_center owns snapshot fallback and the ``isRdSystem`` policy.  The
+        caller stores the returned resolved month instead of reimplementing
+        either rule locally.
+        """
+        if not self.configured():
+            raise IntegrationError(
+                "bi_center_not_configured",
+                "未配置 BI_CENTER_BASE_URL 或 BI_CENTER_INTERNAL_TOKEN。",
+                503,
+            )
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{self.settings.bi_center_base_url.rstrip('/')}/api/internal/v1/employee-directory/monthly",
+                params={"month": month_key, "limit": max(1, min(limit, 500)), "offset": max(0, offset)},
+                headers={"Authorization": f"Bearer {self.settings.bi_center_internal_token}"},
+            )
+        if response.is_error:
+            message = "bi_center 月度组织目录读取失败。"
+            try:
+                detail = response.json().get("detail")
+                if isinstance(detail, dict):
+                    message = str(detail.get("message") or message)
+                elif detail:
+                    message = str(detail)
+            except (ValueError, AttributeError):
+                pass
+            raise IntegrationError(
+                "bi_center_monthly_directory_failed",
+                f"{message}（HTTP {response.status_code}）",
+                response.status_code,
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise IntegrationError(
+                "bi_center_monthly_directory_invalid",
+                "bi_center 月度组织目录响应不是有效 JSON。",
+            ) from exc
+        if isinstance(body, dict) and body.get("code") not in (None, 0):
+            raise IntegrationError(
+                "bi_center_monthly_directory_failed",
+                str(body.get("message") or "bi_center 月度组织目录读取失败。"),
+            )
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        if not isinstance(data, dict):
+            raise IntegrationError("bi_center_monthly_directory_invalid", "bi_center 月度组织目录响应格式无效。")
+        return data
+
     async def check(self) -> dict[str, Any]:
         if not self.configured():
             return {"status": "not_configured", "message": "未配置 BI_CENTER_BASE_URL 或 BI_CENTER_INTERNAL_TOKEN。"}

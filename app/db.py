@@ -323,6 +323,30 @@ class EmployeeMap(Base):
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class EmployeeOrgMonth(Base):
+    """Read-only bi_center monthly organization snapshot cache.
+
+    ``employee_key`` is UnionID.  The R&D-system flag is supplied by
+    bi_center; this service deliberately does not copy department-name rules.
+    Rows contain organization metadata only, never document content.
+    """
+    __tablename__ = "employee_org_month_cache"
+    __table_args__ = (
+        UniqueConstraint("month", "employee_key", name="uq_employee_org_month"),
+        Index("ix_employee_org_month_scope", "month", "is_rd_system"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    month: Mapped[str] = mapped_column(String(7), index=True)
+    employee_key: Mapped[str] = mapped_column(id_string(), index=True)
+    department_name: Mapped[str] = mapped_column(String(255), default="")
+    biz_group_name: Mapped[str] = mapped_column(String(255), default="")
+    is_rd_system: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolved_snapshot_month: Mapped[str] = mapped_column(String(7), default="")
+    directory_version: Mapped[str] = mapped_column(String(64), default="")
+    policy_version: Mapped[str] = mapped_column(String(64), default="")
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class AuthSession(Base):
     """Server-side login sessions. Only the SHA-256 of the cookie token is stored."""
     __tablename__ = "auth_sessions"

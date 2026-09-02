@@ -128,7 +128,7 @@ async function renderOverviewTrend(){const title=document.querySelector('#trendT
 
 async function increments(){
   const controller=navAbort;
-  const st=state.inc=state.inc||{year:'',month:'',fDept:'',fGroup:'',fPerson:'',orgDept:'',orgGroup:'',orgPerson:null,orgQ:'',excl:true};
+  const st=state.inc=state.inc||{year:'',month:'',scope:'',fDept:'',fGroup:'',fPerson:'',orgDept:'',orgGroup:'',orgPerson:null,orgQ:'',excl:true};
   if(state.incPreset){Object.assign(st,state.incPreset);state.incPreset=null}
   const [d,meta]=await Promise.all([
     api('/api/v1/metrics/monthly-increments'),
@@ -151,13 +151,13 @@ async function increments(){
   `<button class="secondary" id="csvBtn">导出 CSV</button>`);
   document.querySelector('#csvBtn').onclick=()=>{const t=st._tree;if(!t)return;const lvlName={year:'年份',month:'月份',day:'日期'}[t.level];
     const lines=[`${lvlName},全量新增,批量导入,日常新增`].concat(t.rows.map(r=>`${r.key},${r.total},${r.bulk},${r.routine}`));
-    const blob=new Blob(['﻿'+lines.join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`知识库增量构成-${t.level==='year'?'按年':t.level==='month'?(st.year||st.month.slice(0,4)):st.month}.csv`;a.click();URL.revokeObjectURL(a.href)};
+    const blob=new Blob(['﻿'+lines.join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`知识库增量构成-${st.scope==='rd_system'?'研发体系七部门-':''}${t.level==='year'?'按年':t.level==='month'?(st.year||st.month.slice(0,4)):st.month}.csv`;a.click();URL.revokeObjectURL(a.href)};
   await Promise.all([renderTreeSection(),renderOrgSection()])}
 
 function refreshIncSections(){return Promise.all([renderTreeSection(),renderOrgSection()])}
 
 async function renderTreeSection(){const st=state.inc,card=document.querySelector('#treeCard');if(!card)return;
-  const treeParams=new URLSearchParams({year:st.month?'':st.year,month:st.month,department:st.fDept,biz_group:st.fGroup,person:st.fPerson});
+  const treeParams=new URLSearchParams({year:st.month?'':st.year,month:st.month,scope:st.scope||'',department:st.fDept,biz_group:st.fGroup,person:st.fPerson});
   const tree=await api('/api/v1/metrics/increments/tree?'+treeParams);st._tree=tree;
   if(!document.querySelector('#treeCard'))return;
   const lvl=tree.level,lvlName={year:'年份',month:'月份',day:'日期'}[lvl];
@@ -168,13 +168,14 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
   const chartRows=sorted.map(r=>({month:lvl==='year'?r.key+'年':lvl==='month'?r.key.slice(5)+'月':r.key.slice(8)+'日',total:r.total,bulk_import:r.bulk,routine:r.routine}));
   card.innerHTML=`<div class="card-head"><h2>增量构成</h2><span class="hint">点击柱状图或表格行下钻：年 → 月 → 日 · 点击图表空白处回退</span></div>
     <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">${crumbs}<span style="flex:1"></span>
+      <button class="${st.scope==='rd_system'?'primary':'secondary'}" id="rd-scope" aria-pressed="${st.scope==='rd_system'}">${st.scope==='rd_system'?'✓ 仅统计研发体系七部门':'统计研发体系七部门'}</button>
       <input class="input" id="tf-dept" list="dl-dept" placeholder="部门" value="${st.fDept}" style="width:130px">
       <input class="input" id="tf-group" list="dl-group" placeholder="业务组" value="${st.fGroup}" style="width:115px">
       <input class="input" id="tf-person" list="dl-person" placeholder="成员" value="${st.fPerson}" style="width:105px">
       <datalist id="dl-dept"></datalist><datalist id="dl-group"></datalist><datalist id="dl-person"></datalist>
       <button class="primary" id="tf-go">筛选</button>${(st.fDept||st.fGroup||st.fPerson)?'<button class="secondary" id="tf-clear">清除</button>':''}
     </div>
-    ${tree.filter_label?`<p class="hint" style="margin:0 0 8px">当前筛选：${tree.filter_label}</p>`:''}
+    <p class="hint" style="margin:0 0 8px">当前统计范围：${tree.scope_label}${tree.filter_label?` · 筛选：${tree.filter_label}`:''}</p>
     <div id="incChart" class="chart"></div>
     <div class="table-wrap" style="margin-top:8px"><table class="data-table"><thead><tr><th>${lvlName}</th><th class="num">全量新增</th><th class="num">批量导入</th><th class="num">日常新增</th></tr></thead><tbody>${treeRows}</tbody></table></div>`;
   renderChart('incChart',stackedOption(chartRows,{zoom:chartRows.length>18}));
@@ -183,6 +184,8 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
     onBack:lvl==='year'?null:()=>{if(lvl==='day'){st.year=st.month.slice(0,4);st.month=''}else{st.year='';st.month=''}refreshIncSections()}});
   card.querySelectorAll('[data-tdrill]').forEach(r=>r.onclick=()=>{const k=r.dataset.tdrill;if(lvl==='year'){st.year=k;st.month=''}else if(lvl==='month'){st.month=k}refreshIncSections()});
   card.querySelectorAll('[data-tcrumb]').forEach(b=>b.onclick=()=>{const c=b.dataset.tcrumb;if(c==='root'){st.year='';st.month=''}else if(c==='year'){if(st.month)st.year=st.month.slice(0,4);st.month=''}refreshIncSections()});
+  card.querySelector('#rd-scope').onclick=async()=>{const previous=st.scope;st.scope=previous==='rd_system'?'':'rd_system';
+    try{await renderTreeSection()}catch(e){st.scope=previous;toast(e.message)}};
   card.querySelector('#tf-go').onclick=()=>{st.fDept=card.querySelector('#tf-dept').value.trim();st.fGroup=card.querySelector('#tf-group').value.trim();st.fPerson=card.querySelector('#tf-person').value.trim();renderTreeSection()};
   card.querySelectorAll('#tf-dept,#tf-group,#tf-person').forEach(i=>{
     i.onkeydown=e=>{if(e.key==='Enter')card.querySelector('#tf-go').click()};

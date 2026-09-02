@@ -21,7 +21,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, UploaderMonthStat, Workspace
+from .db import Document, EmployeeMap, EmployeeOrgMonth, HistoricalFileNode, HistoricalSnapshot, UploaderMonthStat, Workspace
 
 
 def robot_ids() -> set[str]:
@@ -33,6 +33,12 @@ PERSON_DAY_BULK_MIN = 200
 CACHE_TTL_SECONDS = 60
 
 _cache: dict[str, Any] = {"stamp": None, "at": 0.0, "value": None}
+
+
+class OrganizationScopeCacheMissingError(RuntimeError):
+    def __init__(self, missing_months: list[str]):
+        super().__init__("研发体系月度组织缓存未就绪。")
+        self.missing_months = missing_months
 
 
 def _change_stamp(db: Session) -> tuple:
@@ -243,7 +249,7 @@ def monthly_increments(db: Session, year: str = "") -> dict[str, Any]:
 
 
 def increments_tree(db: Session, year: str = "", month: str = "", department: str = "",
-                    biz_group: str = "", person: str = "") -> dict[str, Any]:
+                    biz_group: str = "", person: str = "", scope: str = "") -> dict[str, Any]:
     """Year -> month -> day drill over the cached creator-day counters — no
     extra SQL beyond the shared 60-second collect cache (plus one small
     employee_map read when a people filter is active)."""
@@ -260,10 +266,47 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
         creators = {row.user_id for row in picked}
         parts = [part for part in (department, biz_group, person) if part]
         filter_label = " / ".join(parts) + f"（{len(picked)} 人）"
+    scoped_employee_keys: dict[str, str] = {}
+    rd_employee_months: set[tuple[str, str]] = set()
+    if scope == "rd_system":
+        relevant = [
+            (creator, day)
+            for creator, day in data["creator_day"]
+            if (not month or day.startswith(month)) and (not year or day.startswith(year))
+        ]
+        report_months = sorted({day[:7] for _, day in relevant})
+        if report_months:
+            cached_months = set(db.scalars(
+                select(EmployeeOrgMonth.month)
+                .where(EmployeeOrgMonth.month.in_(report_months)).distinct()
+            ).all())
+            missing = sorted(set(report_months) - cached_months)
+            if missing:
+                raise OrganizationScopeCacheMissingError(missing)
+            creator_ids = sorted({creator for creator, _ in relevant if creator})
+            if creator_ids:
+                identity_rows = db.scalars(
+                    select(EmployeeMap).where(
+                        EmployeeMap.user_id.in_(creator_ids),
+                        EmployeeMap.matched.is_(True),
+                        EmployeeMap.employee_key != "",
+                    )
+                ).all()
+                scoped_employee_keys = {row.user_id: row.employee_key for row in identity_rows}
+            rd_employee_months = set(db.execute(
+                select(EmployeeOrgMonth.month, EmployeeOrgMonth.employee_key).where(
+                    EmployeeOrgMonth.month.in_(report_months),
+                    EmployeeOrgMonth.is_rd_system.is_(True),
+                )
+            ).all())
     buckets: dict[str, list[int]] = {}
     for (creator, day), count in data["creator_day"].items():
         if creators is not None and creator not in creators:
             continue
+        if scope == "rd_system":
+            employee_key = scoped_employee_keys.get(creator, "")
+            if not employee_key or (day[:7], employee_key) not in rd_employee_months:
+                continue
         if month:
             if not day.startswith(month):
                 continue
@@ -281,6 +324,8 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
     level = "day" if month else ("month" if year else "year")
     keys = sorted(buckets, reverse=(level == "year"))  # recent years on top
     return {"level": level, "year": year, "month": month, "filter_label": filter_label,
+            "scope": scope,
+            "scope_label": "研发体系七部门（bi_center 月度组织口径）" if scope == "rd_system" else "全部部门",
             "person_day_bulk_min": PERSON_DAY_BULK_MIN,
             "rows": [{"key": key, "total": buckets[key][0], "bulk": buckets[key][1],
                       "routine": buckets[key][0] - buckets[key][1]} for key in keys]}

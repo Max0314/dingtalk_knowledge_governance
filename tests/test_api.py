@@ -170,6 +170,79 @@ def test_bulk_classification_and_increments_tree(monkeypatch):
         get_settings.cache_clear()
 
 
+def test_increment_tree_rd_system_scope_uses_monthly_bi_center_flag():
+    from app import metrics
+    from app.db import Document, EmployeeMap, EmployeeOrgMonth, SessionLocal
+
+    node_ids = ("rd-scope-rd", "rd-scope-other", "rd-scope-missing")
+    user_ids = ("rd-scope-u1", "rd-scope-u2", "rd-scope-u3")
+    with TestClient(app) as client:
+        try:
+            with SessionLocal() as db:
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.query(EmployeeMap).filter(EmployeeMap.user_id.in_(user_ids)).delete(synchronize_session=False)
+                db.query(EmployeeOrgMonth).filter(
+                    EmployeeOrgMonth.month.in_(("2031-04", "2032-01"))
+                ).delete(synchronize_session=False)
+                db.add_all([
+                    Document(node_id=node_ids[0], workspace_id="demo-workspace", name="研发范围.docx",
+                             uploader_key=user_ids[0], source_created_at="2031-04-08", file_class="document"),
+                    Document(node_id=node_ids[1], workspace_id="demo-workspace", name="非研发范围.docx",
+                             uploader_key=user_ids[1], source_created_at="2031-04-08", file_class="document"),
+                    EmployeeMap(user_id=user_ids[0], employee_key="rd-scope-ek1", name="甲",
+                                matched=True, include_official=True),
+                    EmployeeMap(user_id=user_ids[1], employee_key="rd-scope-ek2", name="乙",
+                                matched=True, include_official=True),
+                    EmployeeOrgMonth(month="2031-04", employee_key="rd-scope-ek1", is_rd_system=True,
+                                     resolved_snapshot_month="2031-04"),
+                    EmployeeOrgMonth(month="2031-04", employee_key="rd-scope-ek2", is_rd_system=False,
+                                     resolved_snapshot_month="2031-04"),
+                ])
+                db.commit()
+                metrics.invalidate_cache()
+
+            all_scope = client.get("/api/v1/metrics/increments/tree", params={"year": "2031"}).json()
+            all_row = next(row for row in all_scope["rows"] if row["key"] == "2031-04")
+            assert all_row["total"] == 2
+
+            rd_scope = client.get(
+                "/api/v1/metrics/increments/tree", params={"year": "2031", "scope": "rd_system"}
+            )
+            assert rd_scope.status_code == 200
+            rd_payload = rd_scope.json()
+            assert rd_payload["scope"] == "rd_system"
+            assert rd_payload["rows"] == [
+                {"key": "2031-04", "total": 1, "bulk": 0, "routine": 1}
+            ]
+            days = client.get(
+                "/api/v1/metrics/increments/tree", params={"month": "2031-04", "scope": "rd_system"}
+            ).json()
+            assert days["rows"] == [
+                {"key": "2031-04-08", "total": 1, "bulk": 0, "routine": 1}
+            ]
+
+            with SessionLocal() as db:
+                db.add(Document(node_id=node_ids[2], workspace_id="demo-workspace", name="缺缓存.docx",
+                                uploader_key=user_ids[2], source_created_at="2032-01-02", file_class="document"))
+                db.commit()
+                metrics.invalidate_cache()
+            missing = client.get(
+                "/api/v1/metrics/increments/tree", params={"year": "2032", "scope": "rd_system"}
+            )
+            assert missing.status_code == 409
+            assert missing.json()["detail"]["code"] == "organization_scope_cache_missing"
+            assert missing.json()["detail"]["missing_months"] == ["2032-01"]
+        finally:
+            with SessionLocal() as db:
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.query(EmployeeMap).filter(EmployeeMap.user_id.in_(user_ids)).delete(synchronize_session=False)
+                db.query(EmployeeOrgMonth).filter(
+                    EmployeeOrgMonth.month.in_(("2031-04", "2032-01"))
+                ).delete(synchronize_session=False)
+                db.commit()
+                metrics.invalidate_cache()
+
+
 def test_soft_deleted_document_leaves_the_headline_total():
     from app import metrics
     from app.db import Document, SessionLocal
