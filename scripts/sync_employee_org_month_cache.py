@@ -94,12 +94,13 @@ async def sync(months: list[str]) -> dict[str, Any]:
         ]
         if not rows:
             raise RuntimeError(f"bi_center 月度组织目录 {month} 为空，未覆盖本地缓存。")
+        month_rd_rows = sum(1 for item in by_employee.values() if bool(item.get("isRdSystem")))
         with SessionLocal() as db:
             db.execute(delete(EmployeeOrgMonth).where(EmployeeOrgMonth.month == month))
             db.add_all(rows)
             db.commit()
         inserted += len(rows)
-        rd_rows += sum(1 for row in rows if row.is_rd_system)
+        rd_rows += month_rd_rows
     return {
         "status": "ok",
         "report_months": len(months),
