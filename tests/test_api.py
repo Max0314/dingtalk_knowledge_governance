@@ -256,9 +256,18 @@ def test_files_can_filter_historical_entry_month_and_show_score():
             assert january.status_code == 200
             assert january.json()["total"] == 1
             assert january.json()["items"][0]["ai_score"] == 88
+            january_reviews = client.get(
+                "/api/v1/reviews", params={"month": "2034-01", "query": "历史月评分"}
+            )
+            assert january_reviews.status_code == 200
+            assert january_reviews.json()["total"] == 1
+            assert january_reviews.json()["items"][0]["document_created_at"].startswith("2034-01")
             february = client.get("/api/v1/files", params={"month": "2034-02", "query": "历史月评分"})
             assert february.json()["total"] == 1
             assert february.json()["items"][0]["ai_score"] is None
+            assert client.get(
+                "/api/v1/reviews", params={"month": "2034-02", "query": "历史月评分"}
+            ).json()["total"] == 0
             assert client.get("/api/v1/files", params={"month": "2034-13"}).status_code == 422
         finally:
             with SessionLocal() as db:

@@ -324,26 +324,27 @@ async function loadDeptOptions(sel){try{
   el.value=cur
 }catch(e){}}
 
-async function reviews(state_={verdict:'',query:'',dept:'',up:'',offset:0}){const controller=navAbort;const qs=new URLSearchParams({verdict:state_.verdict,query:state_.query,department:state_.dept||'',uploader:state_.up||'',offset:state_.offset,limit:50});
+async function reviews(state_={verdict:'',query:'',dept:'',up:'',month:'',offset:0}){const controller=navAbort;const qs=new URLSearchParams({verdict:state_.verdict,query:state_.query,department:state_.dept||'',uploader:state_.up||'',month:state_.month||'',offset:state_.offset,limit:50});
   const d=await api('/api/v1/reviews?'+qs);
   ensureCurrentNav(controller);
   shell('评审记录','全部 AI 评审实例；实例不可变，重评产生新记录。分数为建议，最终结论由审核员保存。',`
   <section class="card"><div class="card-head"><div class="controls" style="flex-wrap:wrap;gap:8px">
     <select class="input" id="rv-verdict"><option value="">全部结论</option><option value="pass" ${state_.verdict==='pass'?'selected':''}>通过</option><option value="manual_review" ${state_.verdict==='manual_review'?'selected':''}>待人工审核</option><option value="return" ${state_.verdict==='return'?'selected':''}>退回</option></select>
     <select class="input" id="rv-dept" title="知识库归属部门"><option value="">全部部门</option>${state_.dept?`<option value="${state_.dept}" selected>${state_.dept}</option>`:''}</select>
+    <input class="input" type="month" id="rv-month" title="文档入库月份" value="${state_.month||''}">
     <input class="input" id="rv-up" placeholder="上传人" value="${state_.up||''}" style="width:100px">
     <input class="input" id="rv-q" placeholder="按文档名搜索" value="${state_.query}"><button class="secondary" id="rv-btn">查询</button></div>
     <span class="hint">共 ${nf(d.total)} 条</span></div>
   ${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>文档</th><th>上传人 / 部门</th><th class="num">AI评分</th><th>结论</th><th>范围</th><th>触发</th><th>时间</th></tr></thead><tbody>
-    ${d.items.map(x=>`<tr class="rowlink" data-doc="${x.node_id}"><td><b>${x.document_name}</b><br><small>${x.review_instance_id.slice(0,8)}</small></td><td>${fmt(x.uploader_name)}<br><small>${fmt(x.department_name)}</small></td><td class="num score ${x.ai_score>0?scoreClass(x.ai_score):''}">${x.ai_score>0?x.ai_score:'—'}</td><td><span class="badge ${x.verdict}">${verdictText(x.verdict)}</span></td><td>${x.review_scope==='full_content'?'完整正文':'历史元数据初检（已停用）'}</td><td>${triggerText(x.trigger)}</td><td><small>${(x.created_at||'').replace('T',' ').slice(0,16)}</small></td></tr>`).join('')}
+    ${d.items.map(x=>`<tr class="rowlink" data-doc="${x.node_id}"><td><b>${x.document_name}</b><br><small>入库 ${(x.document_created_at||'').slice(0,7)} · ${x.review_instance_id.slice(0,8)}</small></td><td>${fmt(x.uploader_name)}<br><small>${fmt(x.department_name)}</small></td><td class="num score ${x.ai_score>0?scoreClass(x.ai_score):''}">${x.ai_score>0?x.ai_score:'—'}</td><td><span class="badge ${x.verdict}">${verdictText(x.verdict)}</span></td><td>${x.review_scope==='full_content'?'完整正文':'历史元数据初检（已停用）'}</td><td>${triggerText(x.trigger)}</td><td><small>${(x.created_at||'').replace('T',' ').slice(0,16)}</small></td></tr>`).join('')}
   </tbody></table></div>
   <div class="controls section-gap"><span class="hint">第 ${Math.floor(d.offset/50)+1} / ${Math.max(1,Math.ceil(d.total/50))} 页</span><button class="secondary" id="rv-prev" ${d.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="rv-next" ${d.offset+50>=d.total?'disabled':''}>下一页</button></div>`
   :'<div class="empty">暂无评审记录。白名单内的审计事件确认正文后，或详情页人工重评时产生。</div>'}
   </section>`);
   bindDocRows();
   loadDeptOptions('#rv-dept').then(()=>{const el=document.querySelector('#rv-dept');if(el)el.value=state_.dept||''});
-  document.querySelector('#rv-btn').onclick=()=>reviews({verdict:document.querySelector('#rv-verdict').value,query:document.querySelector('#rv-q').value,dept:document.querySelector('#rv-dept').value,up:document.querySelector('#rv-up').value.trim(),offset:0});
-  document.querySelectorAll('#rv-verdict,#rv-dept').forEach(s=>s.onchange=()=>document.querySelector('#rv-btn').click());
+  document.querySelector('#rv-btn').onclick=()=>reviews({verdict:document.querySelector('#rv-verdict').value,query:document.querySelector('#rv-q').value,dept:document.querySelector('#rv-dept').value,up:document.querySelector('#rv-up').value.trim(),month:document.querySelector('#rv-month').value,offset:0});
+  document.querySelectorAll('#rv-verdict,#rv-dept,#rv-month').forEach(s=>s.onchange=()=>document.querySelector('#rv-btn').click());
   document.querySelector('#rv-up').onkeydown=e=>{if(e.key==='Enter')document.querySelector('#rv-btn').click()};
   const pv=document.querySelector('#rv-prev'),nx=document.querySelector('#rv-next');
   if(pv)pv.onclick=()=>reviews({...state_,offset:Math.max(0,state_.offset-50)});

@@ -574,6 +574,7 @@ async def notification_test(payload: NotifyTestRequest):
 @app.get("/api/v1/reviews")
 def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_review|return)$"),
                  query: str = "", department: str = "", uploader: str = "",
+                 month: str = Query(default="", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
                  offset: int = Query(default=0, ge=0),
                  limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     stmt = select(ReviewInstance, Document).join(Document, Document.node_id == ReviewInstance.node_id)
@@ -581,6 +582,8 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
         stmt = stmt.where(ReviewInstance.verdict == verdict)
     if query:
         stmt = stmt.where(Document.name.contains(query))
+    if month:  # 文档业务入库月，不是评审实例创建月
+        stmt = stmt.where(Document.source_created_at.startswith(month))
     if department:  # 知识库归属部门
         stmt = stmt.where(Document.workspace_id.in_(
             select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))))
@@ -592,6 +595,7 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
             "items": [{"review_instance_id": r.review_instance_id, "node_id": d.node_id, "document_name": d.name,
                        "workspace_id": d.workspace_id, "uploader_name": d.uploader_name,
                        "department_name": d.department_name, "ai_score": round(r.ai_score, 1),
+                       "document_created_at": d.source_created_at,
                        "verdict": r.verdict, "review_scope": r.review_scope, "trigger": r.trigger,
                        "rule_version": r.rule_version, "rule_config_ref": r.rule_config_ref,
                        "created_at": r.created_at.isoformat() if r.created_at else None}
