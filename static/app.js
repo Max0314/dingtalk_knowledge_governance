@@ -272,7 +272,7 @@ async function loadPerson(personId,year,month){const panel=document.querySelecto
 function fileTable(d){if(!d.items.length)return '<div class="empty">未找到匹配文档。</div>';
   return `<div class="table-wrap"><table class="data-table"><thead><tr><th>文档名称 / 节点</th><th>知识库</th><th>上传人 / 部门</th><th class="num">AI评审</th><th>入库时间</th><th></th></tr></thead><tbody>${d.items.map(f=>{
     const ws=state.coverageNames[f.workspace_id]||f.workspace_id;
-    return `<tr ${f.has_detail?`class="rowlink" data-doc="${f.node_id}"`:''}><td><b>${f.name}</b><br><small>${f.node_id}</small></td><td><small>${ws}</small></td><td>${fmt(f.uploader_name)}${f.department_name?`<br><small>${f.department_name}</small>`:''}</td><td class="num">${f.ai_score!=null?`<span class="score ${scoreClass(f.ai_score)}">${f.ai_score}</span>`:'—'}${f.verdict?`<br><span class="badge ${f.verdict}">${verdictText(f.verdict)}</span>`:''}</td><td>${fmt((f.created_at||'').slice(0,10))}</td><td>${f.url?`<a class="link-btn" href="${f.url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">打开 ↗</a>`:''}${f.has_detail?' <small style="color:#9ca3af">›</small>':''}</td></tr>`}).join('')}</tbody></table></div>
+    return `<tr ${f.has_detail?`class="rowlink" data-doc="${f.node_id}"`:''}><td><b>${f.name}</b><br><small>${f.node_id}</small></td><td><small>${ws}</small></td><td>${fmt(f.uploader_name)}${f.department_name?`<br><small>${f.department_name}</small>`:''}</td><td class="num">${f.ai_score!=null?`<span class="score ${scoreClass(f.ai_score)}">${f.ai_score}</span>`:'<span class="hint">未评审</span>'}${f.verdict?`<br><span class="badge ${f.verdict}">${verdictText(f.verdict)}</span>`:''}</td><td>${fmt((f.created_at||'').slice(0,10))}</td><td>${f.url?`<a class="link-btn" href="${f.url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">打开 ↗</a>`:''}${f.has_detail?' <small style="color:#9ca3af">›</small>':''}</td></tr>`}).join('')}</tbody></table></div>
   <div class="controls section-gap"><span class="hint">共 ${nf(d.total)} 个 · 第 ${Math.floor(d.offset/d.limit)+1} / ${Math.max(1,Math.ceil(d.total/d.limit))} 页</span><button class="secondary" id="bl-prev" ${d.offset<=0?'disabled':''}>上一页</button><button class="secondary" id="bl-next" ${d.offset+d.limit>=d.total?'disabled':''}>下一页</button></div>`}
 function renderFilesBox(d){const box=document.querySelector('#bl-results');if(!box)return;box.innerHTML=fileTable(d);
   const t=document.querySelector('#fl-total');if(t)t.textContent=nf(d.total);
@@ -280,25 +280,26 @@ function renderFilesBox(d){const box=document.querySelector('#bl-results');if(!b
   const p=state.bl,prev=document.querySelector('#bl-prev'),next=document.querySelector('#bl-next');
   if(prev)prev.onclick=()=>{p.offset=Math.max(0,p.offset-50);blSearch()};
   if(next)next.onclick=()=>{p.offset+=50;blSearch()}}
-async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',department:p.dept||'',uploader:p.up||'',offset:p.offset,limit:50});
+async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',department:p.dept||'',uploader:p.up||'',month:p.month||'',offset:p.offset,limit:50});
   const d=await api('/api/v1/files?'+qs);state._filesLast=d;renderFilesBox(d)}
 
 async function documents(){
   const controller=navAbort;
-  state.bl={query:'',ws:'',dept:'',up:'',offset:0};
+  state.bl={query:'',ws:'',dept:'',up:'',month:'',offset:0};
   ensureCurrentNav(controller);
-  shell('文档列表','基线快照与实时增量合并去重后的全部文档，默认展示最新入库；可按知识库、归属部门、上传人、文件名过滤，有评审的行可点击查看详情。',`
+  shell('文档列表','基线快照与实时增量合并去重后的全部文档；可按历史入库月份查看当月已有评分，未生成评审实例的文档明确显示“未评审”。',`
   <section class="card"><div class="card-head"><h2>全部文档（<span id="fl-total">…</span>）</h2><div class="controls" style="flex-wrap:wrap;gap:8px">
     <select class="input" id="bl-ws"><option value="">全部知识库</option></select>
     <select class="input" id="fl-dept" title="知识库归属部门"><option value="">全部部门</option></select>
+    <input class="input" type="month" id="bl-month" title="文档入库月份">
     <input class="input" id="fl-up" placeholder="上传人" style="width:100px">
     <input class="input" id="bl-q" placeholder="按文件名搜索">
     <button class="secondary" id="bl-btn">查询</button></div></div>
   <div id="bl-results"><div class="empty">正在加载最新文档…</div></div></section>`);
-  const applyFilters=()=>{state.bl.query=document.querySelector('#bl-q').value;state.bl.ws=document.querySelector('#bl-ws').value;state.bl.dept=document.querySelector('#fl-dept').value;state.bl.up=document.querySelector('#fl-up').value.trim();state.bl.offset=0;blSearch()};
+  const applyFilters=()=>{state.bl.query=document.querySelector('#bl-q').value;state.bl.ws=document.querySelector('#bl-ws').value;state.bl.dept=document.querySelector('#fl-dept').value;state.bl.month=document.querySelector('#bl-month').value;state.bl.up=document.querySelector('#fl-up').value.trim();state.bl.offset=0;blSearch()};
   document.querySelector('#bl-btn').onclick=applyFilters;
   document.querySelectorAll('#bl-q,#fl-up').forEach(i=>i.onkeydown=e=>{if(e.key==='Enter')applyFilters()});
-  document.querySelectorAll('#bl-ws,#fl-dept').forEach(s=>s.onchange=applyFilters);
+  document.querySelectorAll('#bl-ws,#fl-dept,#bl-month').forEach(s=>s.onchange=applyFilters);
   blSearch().catch(e=>{if(aborted(e))return;const box=document.querySelector('#bl-results');if(box)box.innerHTML=`<div class="empty">${e.message}</div>`});
   loadWorkspaceOptions('#bl-ws');
   loadDeptOptions('#fl-dept')}

@@ -170,40 +170,41 @@ def test_bulk_classification_and_increments_tree(monkeypatch):
         get_settings.cache_clear()
 
 
-def test_increment_tree_rd_system_scope_uses_monthly_bi_center_flag():
+def test_increment_tree_rd_system_scope_uses_workspace_ownership(monkeypatch):
     from app import metrics
-    from app.db import Document, EmployeeMap, EmployeeOrgMonth, SessionLocal
+    from app.db import Document, EmployeeOrgMonth, SessionLocal, Workspace
 
-    node_ids = ("rd-scope-rd", "rd-scope-other", "rd-scope-missing")
-    user_ids = ("rd-scope-u1", "rd-scope-u2", "rd-scope-u3")
+    node_ids = ("rd-scope-rd-1", "rd-scope-rd-2", "rd-scope-other")
+    workspace_ids = ("rd-scope-owned", "rd-scope-cd-non-rd")
+    monkeypatch.setattr(metrics, "PERSON_DAY_BULK_MIN", 2)
     with TestClient(app) as client:
         try:
             with SessionLocal() as db:
                 db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
-                db.query(EmployeeMap).filter(EmployeeMap.user_id.in_(user_ids)).delete(synchronize_session=False)
-                db.query(EmployeeOrgMonth).filter(
-                    EmployeeOrgMonth.month.in_(("2031-04", "2032-01"))
-                ).delete(synchronize_session=False)
+                db.query(Workspace).filter(Workspace.workspace_id.in_(workspace_ids)).delete(synchronize_session=False)
+                db.query(EmployeeOrgMonth).filter(EmployeeOrgMonth.employee_key == "rd-scope-policy").delete(
+                    synchronize_session=False)
                 db.add_all([
-                    Document(node_id=node_ids[0], workspace_id="demo-workspace", name="研发范围.docx",
-                             uploader_key=user_ids[0], source_created_at="2031-04-08", file_class="document"),
-                    Document(node_id=node_ids[1], workspace_id="demo-workspace", name="非研发范围.docx",
-                             uploader_key=user_ids[1], source_created_at="2031-04-08", file_class="document"),
-                    EmployeeMap(user_id=user_ids[0], employee_key="rd-scope-ek1", name="甲",
-                                matched=True, include_official=True),
-                    EmployeeMap(user_id=user_ids[1], employee_key="rd-scope-ek2", name="乙",
-                                matched=True, include_official=True),
-                    EmployeeOrgMonth(month="2031-04", employee_key="rd-scope-ek1", is_rd_system=True,
-                                     resolved_snapshot_month="2031-04"),
-                    EmployeeOrgMonth(month="2031-04", employee_key="rd-scope-ek2", is_rd_system=False,
-                                     resolved_snapshot_month="2031-04"),
+                    Workspace(workspace_id=workspace_ids[0], name="普通研发归属库",
+                              owner_department_name="研发测试部", is_active=True),
+                    Workspace(workspace_id=workspace_ids[1], name="CD-非研发归属库",
+                              owner_department_name="其他部门", is_active=True),
+                    Document(node_id=node_ids[0], workspace_id=workspace_ids[0], name="迁移一.docx",
+                             uploader_key="outside-uploader", source_created_at="2031-04-08", file_class="document"),
+                    Document(node_id=node_ids[1], workspace_id=workspace_ids[0], name="迁移二.docx",
+                             uploader_key="outside-uploader", source_created_at="2031-04-08", file_class="document"),
+                    Document(node_id=node_ids[2], workspace_id=workspace_ids[1], name="前缀不参与判定.docx",
+                             uploader_key="outside-uploader", source_created_at="2031-04-08", file_class="document"),
+                    EmployeeOrgMonth(month="2099-12", employee_key="rd-scope-policy",
+                                     department_name="研发测试部", is_rd_system=True,
+                                     resolved_snapshot_month="2099-12"),
                 ])
                 db.commit()
                 metrics.invalidate_cache()
 
             all_scope = client.get("/api/v1/metrics/increments/tree", params={"year": "2031"}).json()
             all_row = next(row for row in all_scope["rows"] if row["key"] == "2031-04")
-            assert all_row["total"] == 2
+            assert all_row["total"] == 3
 
             rd_scope = client.get(
                 "/api/v1/metrics/increments/tree", params={"year": "2031", "scope": "rd_system"}
@@ -212,35 +213,59 @@ def test_increment_tree_rd_system_scope_uses_monthly_bi_center_flag():
             rd_payload = rd_scope.json()
             assert rd_payload["scope"] == "rd_system"
             assert rd_payload["rows"] == [
-                {"key": "2031-04", "total": 1, "bulk": 0, "routine": 1}
+                {"key": "2031-04", "total": 2, "bulk": 2, "routine": 0}
             ]
+            assert rd_payload["scope_label"] == "研发体系七部门（知识库归属口径）"
             days = client.get(
                 "/api/v1/metrics/increments/tree", params={"month": "2031-04", "scope": "rd_system"}
             ).json()
             assert days["rows"] == [
-                {"key": "2031-04-08", "total": 1, "bulk": 0, "routine": 1}
+                {"key": "2031-04-08", "total": 2, "bulk": 2, "routine": 0}
             ]
-
-            with SessionLocal() as db:
-                db.add(Document(node_id=node_ids[2], workspace_id="demo-workspace", name="缺缓存.docx",
-                                uploader_key=user_ids[2], source_created_at="2032-01-02", file_class="document"))
-                db.commit()
-                metrics.invalidate_cache()
-            missing = client.get(
-                "/api/v1/metrics/increments/tree", params={"year": "2032", "scope": "rd_system"}
-            )
-            assert missing.status_code == 409
-            assert missing.json()["detail"]["code"] == "organization_scope_cache_missing"
-            assert missing.json()["detail"]["missing_months"] == ["2032-01"]
         finally:
             with SessionLocal() as db:
                 db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
-                db.query(EmployeeMap).filter(EmployeeMap.user_id.in_(user_ids)).delete(synchronize_session=False)
-                db.query(EmployeeOrgMonth).filter(
-                    EmployeeOrgMonth.month.in_(("2031-04", "2032-01"))
-                ).delete(synchronize_session=False)
+                db.query(Workspace).filter(Workspace.workspace_id.in_(workspace_ids)).delete(synchronize_session=False)
+                db.query(EmployeeOrgMonth).filter(EmployeeOrgMonth.employee_key == "rd-scope-policy").delete(
+                    synchronize_session=False)
                 db.commit()
                 metrics.invalidate_cache()
+
+
+def test_files_can_filter_historical_entry_month_and_show_score():
+    from app.db import Document, ReviewInstance, SessionLocal
+
+    node_ids = ("history-score-jan", "history-score-feb")
+    review_id = "history-score-review"
+    with TestClient(app) as client:
+        try:
+            with SessionLocal() as db:
+                db.query(ReviewInstance).filter(ReviewInstance.review_instance_id == review_id).delete(
+                    synchronize_session=False)
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.add_all([
+                    Document(node_id=node_ids[0], workspace_id="demo-workspace", name="历史月评分一.docx",
+                             source_created_at="2034-01-15T10:00:00+08:00", file_class="document"),
+                    Document(node_id=node_ids[1], workspace_id="demo-workspace", name="历史月评分二.docx",
+                             source_created_at="2034-02-15T10:00:00+08:00", file_class="document"),
+                    ReviewInstance(review_instance_id=review_id, node_id=node_ids[0], ai_score=88,
+                                   verdict="pass", review_scope="full_content"),
+                ])
+                db.commit()
+            january = client.get("/api/v1/files", params={"month": "2034-01", "query": "历史月评分"})
+            assert january.status_code == 200
+            assert january.json()["total"] == 1
+            assert january.json()["items"][0]["ai_score"] == 88
+            february = client.get("/api/v1/files", params={"month": "2034-02", "query": "历史月评分"})
+            assert february.json()["total"] == 1
+            assert february.json()["items"][0]["ai_score"] is None
+            assert client.get("/api/v1/files", params={"month": "2034-13"}).status_code == 422
+        finally:
+            with SessionLocal() as db:
+                db.query(ReviewInstance).filter(ReviewInstance.review_instance_id == review_id).delete(
+                    synchronize_session=False)
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.commit()
 
 
 def test_soft_deleted_document_leaves_the_headline_total():

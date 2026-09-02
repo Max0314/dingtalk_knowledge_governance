@@ -278,7 +278,7 @@ def metrics_increments_tree(year: str = Query(default="", pattern=r"^$|^\d{4}$")
     except metrics.OrganizationScopeCacheMissingError as exc:
         raise HTTPException(status_code=409, detail={
             "code": "organization_scope_cache_missing",
-            "message": "研发体系月度组织缓存未就绪，请联系管理员同步后重试。",
+            "message": "研发体系组织口径缓存未就绪，请联系管理员同步后重试。",
             "missing_months": exc.missing_months,
         }) from exc
 
@@ -463,6 +463,7 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
 @app.get("/api/v1/files")
 def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
                   department: str = "", uploader: str = "",
+                  month: str = Query(default="", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
                   offset: int = Query(default=0, ge=0),
                   limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     """The single merged document list: primary-baseline snapshot rows plus the
@@ -498,6 +499,9 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     if query:
         base = base.where(HistoricalFileNode.name.contains(query))
         live = live.where(Document.name.contains(query))
+    if month:  # 文档业务入库月，不是评审实例创建月
+        base = base.where(HistoricalFileNode.source_created_at.startswith(month))
+        live = live.where(Document.source_created_at.startswith(month))
     if department:  # 知识库归属部门（workspaces.owner_department_name，宜搭回填）
         dept_ws = select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))
         base = base.where(HistoricalFileNode.workspace_id.in_(dept_ws))

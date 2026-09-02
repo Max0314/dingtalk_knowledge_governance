@@ -113,32 +113,32 @@ def _collect(db: Session) -> dict[str, Any]:
                                           .group_by(Document.workspace_id)):
         space_totals[workspace_id] += count
 
-    base_month = func.substr(HistoricalFileNode.source_created_at, 1, 7)
     base_day = func.substr(HistoricalFileNode.source_created_at, 1, 10)
-    live_month = func.substr(Document.source_created_at, 1, 7)
     live_day = func.substr(Document.source_created_at, 1, 10)
     dated_base = base_where + (func.length(HistoricalFileNode.source_created_at) >= 10,)
     dated_live = (func.length(Document.source_created_at) >= 10,)
 
-    space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
-    for workspace_id, month, count in db.execute(
-            select(HistoricalFileNode.workspace_id, base_month, func.count()).where(*dated_base)
-            .group_by(HistoricalFileNode.workspace_id, base_month)):
-        space_months[workspace_id][month] += count
-    for workspace_id, month, count in db.execute(
-            live_agg(Document.workspace_id, live_month).where(*dated_live)
-            .group_by(Document.workspace_id, live_month)):
-        space_months[workspace_id][month] += count
+    # Keep the joint dimensions once, then derive both existing aggregates.
+    # This replaces four GROUP BY scans (workspace/month + creator/day for two
+    # source arms) with two.  The joint view is what lets an organization-wide
+    # chart filter by *knowledge-base ownership* without confusing it with the
+    # uploader's department.
+    workspace_creator_day = collections.Counter()  # (workspace, creator, YYYY-MM-DD) -> files
+    for workspace_id, creator, day, count in db.execute(
+            select(HistoricalFileNode.workspace_id, HistoricalFileNode.creator_user_id,
+                   base_day, func.count()).where(*dated_base)
+            .group_by(HistoricalFileNode.workspace_id, HistoricalFileNode.creator_user_id, base_day)):
+        workspace_creator_day[(workspace_id, creator or "", day)] += count
+    for workspace_id, creator, day, count in db.execute(
+            live_agg(Document.workspace_id, Document.uploader_key, live_day).where(*dated_live)
+            .group_by(Document.workspace_id, Document.uploader_key, live_day)):
+        workspace_creator_day[(workspace_id, creator or "", day)] += count
 
+    space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     creator_day = collections.Counter()  # (creator, YYYY-MM-DD) -> files
-    for creator, day, count in db.execute(
-            select(HistoricalFileNode.creator_user_id, base_day, func.count()).where(*dated_base)
-            .group_by(HistoricalFileNode.creator_user_id, base_day)):
-        creator_day[(creator or "", day)] += count
-    for creator, day, count in db.execute(
-            live_agg(Document.uploader_key, live_day).where(*dated_live)
-            .group_by(Document.uploader_key, live_day)):
-        creator_day[(creator or "", day)] += count
+    for (workspace_id, creator, day), count in workspace_creator_day.items():
+        space_months[workspace_id][day[:7]] += count
+        creator_day[(creator, day)] += count
 
     robots = robot_ids()
     monthly = collections.Counter()
@@ -154,6 +154,7 @@ def _collect(db: Session) -> dict[str, Any]:
         "monthly": dict(monthly),
         "bulk_by_month": dict(bulk_by_month),
         "creator_day": dict(creator_day),
+        "workspace_creator_day": dict(workspace_creator_day),
         "robots": robots,
         "space_totals": dict(space_totals),
         "space_months": {ws: dict(months) for ws, months in space_months.items()},
@@ -250,9 +251,12 @@ def monthly_increments(db: Session, year: str = "") -> dict[str, Any]:
 
 def increments_tree(db: Session, year: str = "", month: str = "", department: str = "",
                     biz_group: str = "", person: str = "", scope: str = "") -> dict[str, Any]:
-    """Year -> month -> day drill over the cached creator-day counters — no
-    extra SQL beyond the shared 60-second collect cache (plus one small
-    employee_map read when a people filter is active)."""
+    """Year -> month -> day drill over the cached increment counters.
+
+    ``rd_system`` is a knowledge-base ownership scope.  Uploader organization
+    remains available as an explicit people filter, but never determines
+    whether a department-owned knowledge base enters the scope.
+    """
     data = collected(db)
     robots = data["robots"]
     creators: set[str] | None = None
@@ -266,47 +270,36 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
         creators = {row.user_id for row in picked}
         parts = [part for part in (department, biz_group, person) if part]
         filter_label = " / ".join(parts) + f"（{len(picked)} 人）"
-    scoped_employee_keys: dict[str, str] = {}
-    rd_employee_months: set[tuple[str, str]] = set()
+    rd_workspace_ids: set[str] = set()
     if scope == "rd_system":
-        relevant = [
-            (creator, day)
-            for creator, day in data["creator_day"]
-            if (not month or day.startswith(month)) and (not year or day.startswith(year))
-        ]
-        report_months = sorted({day[:7] for _, day in relevant})
-        if report_months:
-            cached_months = set(db.scalars(
-                select(EmployeeOrgMonth.month)
-                .where(EmployeeOrgMonth.month.in_(report_months)).distinct()
-            ).all())
-            missing = sorted(set(report_months) - cached_months)
-            if missing:
-                raise OrganizationScopeCacheMissingError(missing)
-            creator_ids = sorted({creator for creator, _ in relevant if creator})
-            if creator_ids:
-                identity_rows = db.scalars(
-                    select(EmployeeMap).where(
-                        EmployeeMap.user_id.in_(creator_ids),
-                        EmployeeMap.matched.is_(True),
-                        EmployeeMap.employee_key != "",
-                    )
-                ).all()
-                scoped_employee_keys = {row.user_id: row.employee_key for row in identity_rows}
-            rd_employee_months = set(db.execute(
-                select(EmployeeOrgMonth.month, EmployeeOrgMonth.employee_key).where(
-                    EmployeeOrgMonth.month.in_(report_months),
-                    EmployeeOrgMonth.is_rd_system.is_(True),
-                )
-            ).all())
+        latest_scope_month = db.scalar(select(func.max(EmployeeOrgMonth.month))) or ""
+        if not latest_scope_month:
+            raise OrganizationScopeCacheMissingError([])
+        rd_departments = set(db.scalars(
+            select(EmployeeOrgMonth.department_name).where(
+                EmployeeOrgMonth.month == latest_scope_month,
+                EmployeeOrgMonth.is_rd_system.is_(True),
+                EmployeeOrgMonth.department_name != "",
+            ).distinct()
+        ).all())
+        if not rd_departments:
+            raise OrganizationScopeCacheMissingError([latest_scope_month])
+        rd_workspace_ids = set(db.scalars(
+            select(Workspace.workspace_id).where(
+                Workspace.is_active.is_(True),
+                Workspace.owner_department_name.in_(rd_departments),
+            )
+        ).all())
     buckets: dict[str, list[int]] = {}
-    for (creator, day), count in data["creator_day"].items():
+    source_rows = (
+        ((creator, day, count) for (workspace_id, creator, day), count
+         in data["workspace_creator_day"].items() if workspace_id in rd_workspace_ids)
+        if scope == "rd_system"
+        else ((creator, day, count) for (creator, day), count in data["creator_day"].items())
+    )
+    for creator, day, count in source_rows:
         if creators is not None and creator not in creators:
             continue
-        if scope == "rd_system":
-            employee_key = scoped_employee_keys.get(creator, "")
-            if not employee_key or (day[:7], employee_key) not in rd_employee_months:
-                continue
         if month:
             if not day.startswith(month):
                 continue
@@ -319,13 +312,16 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
             key = day[:4]
         bucket = buckets.setdefault(key, [0, 0])
         bucket[0] += count
-        if creator in robots or count >= PERSON_DAY_BULK_MIN:
+        # A person's bulk signature is organization-wide for the day; the
+        # scoped workspace count alone must not downgrade part of a migration.
+        person_day_total = data["creator_day"].get((creator, day), 0)
+        if creator in robots or person_day_total >= PERSON_DAY_BULK_MIN:
             bucket[1] += count
     level = "day" if month else ("month" if year else "year")
     keys = sorted(buckets, reverse=(level == "year"))  # recent years on top
     return {"level": level, "year": year, "month": month, "filter_label": filter_label,
             "scope": scope,
-            "scope_label": "研发体系七部门（bi_center 月度组织口径）" if scope == "rd_system" else "全部部门",
+            "scope_label": "研发体系七部门（知识库归属口径）" if scope == "rd_system" else "全部部门",
             "person_day_bulk_min": PERSON_DAY_BULK_MIN,
             "rows": [{"key": key, "total": buckets[key][0], "bulk": buckets[key][1],
                       "routine": buckets[key][0] - buckets[key][1]} for key in keys]}
