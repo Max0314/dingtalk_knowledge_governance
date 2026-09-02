@@ -21,7 +21,8 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .db import Document, EmployeeMap, EmployeeOrgMonth, HistoricalFileNode, HistoricalSnapshot, UploaderMonthStat, Workspace
+from .db import (Document, EmployeeMap, EmployeeOrgMonth, HistoricalFileNode,
+                 HistoricalSnapshot, ReviewInstance, UploaderMonthStat, Workspace)
 
 
 def robot_ids() -> set[str]:
@@ -249,6 +250,60 @@ def monthly_increments(db: Session, year: str = "") -> dict[str, Any]:
     }
 
 
+def _latest_review_scores_by_period(db: Session, level: str, year: str = "", month: str = "",
+                                    creators: set[str] | None = None,
+                                    workspace_ids: set[str] | None = None) -> dict[str, tuple[float, int]]:
+    """Average the latest AI review per document by its DingTalk entry period.
+
+    Review history is immutable, so reruns must not give one document extra
+    weight.  Unreviewed documents are intentionally absent rather than treated
+    as zero.  The period belongs to the document's ``source_created_at`` (the
+    same business clock as the increment tree), not the review execution time.
+    """
+    period_length = {"year": 4, "month": 7, "day": 10}[level]
+    latest_reviews = (
+        select(
+            ReviewInstance.node_id.label("node_id"),
+            ReviewInstance.ai_score.label("ai_score"),
+            func.row_number().over(
+                partition_by=ReviewInstance.node_id,
+                order_by=(ReviewInstance.created_at.desc(),
+                          ReviewInstance.review_instance_id.desc()),
+            ).label("rank"),
+        )
+        .subquery()
+    )
+    period = func.substr(Document.source_created_at, 1, period_length)
+    conditions = [
+        latest_reviews.c.rank == 1,
+        Document.is_folder.is_(False),
+        Document.is_deleted.is_(False),
+        Workspace.is_active.is_(True),
+        func.length(Document.source_created_at) >= period_length,
+    ]
+    if month:
+        conditions.append(Document.source_created_at.like(f"{month}%"))
+    elif year:
+        conditions.append(Document.source_created_at.like(f"{year}%"))
+    if creators is not None:
+        conditions.append(Document.uploader_key.in_(creators))
+    if workspace_ids is not None:
+        conditions.append(Document.workspace_id.in_(workspace_ids))
+    statement = (
+        select(period.label("period"), func.avg(latest_reviews.c.ai_score), func.count())
+        .select_from(Document)
+        .join(latest_reviews, latest_reviews.c.node_id == Document.node_id)
+        .join(Workspace, Workspace.workspace_id == Document.workspace_id)
+        .where(*conditions)
+        .group_by(period)
+    )
+    return {
+        key: (round(float(average), 1), int(count))
+        for key, average, count in db.execute(statement)
+        if key and average is not None
+    }
+
+
 def increments_tree(db: Session, year: str = "", month: str = "", department: str = "",
                     biz_group: str = "", person: str = "", scope: str = "") -> dict[str, Any]:
     """Year -> month -> day drill over the cached increment counters.
@@ -319,12 +374,19 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
             bucket[1] += count
     level = "day" if month else ("month" if year else "year")
     keys = sorted(buckets, reverse=(level == "year"))  # recent years on top
+    scores = _latest_review_scores_by_period(
+        db, level, year=year, month=month, creators=creators,
+        workspace_ids=rd_workspace_ids if scope == "rd_system" else None,
+    )
     return {"level": level, "year": year, "month": month, "filter_label": filter_label,
             "scope": scope,
             "scope_label": "研发体系七部门（知识库归属口径）" if scope == "rd_system" else "全部部门",
             "person_day_bulk_min": PERSON_DAY_BULK_MIN,
             "rows": [{"key": key, "total": buckets[key][0], "bulk": buckets[key][1],
-                      "routine": buckets[key][0] - buckets[key][1]} for key in keys]}
+                      "routine": buckets[key][0] - buckets[key][1],
+                      "average_ai_score": scores[key][0] if key in scores else None,
+                      "scored_documents": scores[key][1] if key in scores else 0}
+                     for key in keys]}
 
 
 def _scan_status(workspace_id: str, space_totals: dict, live_counts: dict, excluded) -> str:

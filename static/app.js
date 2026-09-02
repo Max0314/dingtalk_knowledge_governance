@@ -46,7 +46,7 @@ function renderChart(id,option){const el=document.getElementById(id);if(!el)retu
   /* 复用实例 + notMerge：下钻/筛选时不再 dispose+init 重建画布，掉的就是那一下闪。 */
   c.setOption(option,{notMerge:true})}
 function stackedOption(rows,{zoom=false}={}){return{
-  tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:ps=>{const m=ps[0].axisValue;const r=ps.find(p=>p.seriesName==='日常新增')?.value||0;const b=ps.find(p=>p.seriesName==='批量导入')?.value||0;return `<b>${m}</b><br/>全量新增：<b>${nf(r+b)}</b><br/>日常新增：${nf(r)}<br/>批量导入：${nf(b)}`}},
+  tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:ps=>{const m=ps[0].axisValue;const r=ps.find(p=>p.seriesName==='日常新增')?.value||0;const b=ps.find(p=>p.seriesName==='批量导入')?.value||0;const row=rows.find(x=>x.month===m);const score=row?.average_ai_score;const scoreLine=score==null?'':`<br/>平均 AI 评分：<b>${score}</b>（${nf(row.scored_documents||0)} 篇）`;return `<b>${m}</b><br/>全量新增：<b>${nf(r+b)}</b><br/>日常新增：${nf(r)}<br/>批量导入：${nf(b)}${scoreLine}`}},
   legend:{data:['日常新增','批量导入'],top:0,itemWidth:14,itemHeight:9,textStyle:{fontSize:12,color:'#6b7280'}},
   grid:{left:8,right:8,top:34,bottom:zoom?46:8,containLabel:true},
   xAxis:{type:'category',triggerEvent:true,data:rows.map(r=>r.month),axisTick:{show:false},axisLine:{lineStyle:{color:'#e5e7eb'}},axisLabel:{color:'#6b7280',fontSize:11}},
@@ -150,7 +150,7 @@ async function increments(){
   </div></section>`,
   `<button class="secondary" id="csvBtn">导出 CSV</button>`);
   document.querySelector('#csvBtn').onclick=()=>{const t=st._tree;if(!t)return;const lvlName={year:'年份',month:'月份',day:'日期'}[t.level];
-    const lines=[`${lvlName},全量新增,批量导入,日常新增`].concat(t.rows.map(r=>`${r.key},${r.total},${r.bulk},${r.routine}`));
+    const lines=[`${lvlName},全量新增,批量导入,日常新增,平均AI评分,已评分文档`].concat(t.rows.map(r=>`${r.key},${r.total},${r.bulk},${r.routine},${r.average_ai_score??''},${r.scored_documents||0}`));
     const blob=new Blob(['﻿'+lines.join('\n')],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`知识库增量构成-${st.scope==='rd_system'?'研发体系七部门-':''}${t.level==='year'?'按年':t.level==='month'?(st.year||st.month.slice(0,4)):st.month}.csv`;a.click();URL.revokeObjectURL(a.href)};
   await Promise.all([renderTreeSection(),renderOrgSection()])}
 
@@ -163,9 +163,9 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
   const lvl=tree.level,lvlName={year:'年份',month:'月份',day:'日期'}[lvl];
   const crumbs=`<div class="crumbs"><button class="crumb ${lvl==='year'?'current':''}" data-tcrumb="root">全部年份</button>${(st.year||st.month)?`<span class="sep">›</span><button class="crumb ${lvl==='month'?'current':''}" data-tcrumb="year">${(st.month?st.month.slice(0,4):st.year)} 年</button>`:''}${st.month?`<span class="sep">›</span><button class="crumb current" data-tcrumb="month">${st.month.slice(5)} 月</button>`:''}</div>`;
   const treeRows=tree.rows.map(r=>{const label=lvl==='year'?r.key+' 年':lvl==='month'?r.key.slice(5)+' 月':r.key.slice(8)+' 日';
-    return `<tr class="${lvl!=='day'?'rowlink':''}" ${lvl!=='day'?`data-tdrill="${r.key}"`:''}><td><b>${label}</b>${lvl!=='day'?' <small style="color:#9ca3af">›</small>':''}</td><td class="num"><b>${nf(r.total)}</b></td><td class="num">${r.bulk?nf(r.bulk):'—'}</td><td class="num">${nf(r.routine)}</td></tr>`}).join('')||'<tr><td colspan="4"><div class="empty">该范围内无数据</div></td></tr>';
+    return `<tr class="${lvl!=='day'?'rowlink':''}" ${lvl!=='day'?`data-tdrill="${r.key}"`:''}><td><b>${label}</b>${lvl!=='day'?' <small style="color:#9ca3af">›</small>':''}</td><td class="num"><b>${nf(r.total)}</b></td><td class="num">${r.bulk?nf(r.bulk):'—'}</td><td class="num">${nf(r.routine)}</td><td class="num">${r.average_ai_score!=null?`<span class="score ${scoreClass(r.average_ai_score)}">${r.average_ai_score}</span>`:'<span class="hint">—</span>'}</td><td class="num">${r.scored_documents?nf(r.scored_documents):'—'}</td></tr>`}).join('')||'<tr><td colspan="6"><div class="empty">该范围内无数据</div></td></tr>';
   const sorted=tree.rows.slice().sort((a,b)=>a.key<b.key?-1:1);
-  const chartRows=sorted.map(r=>({month:lvl==='year'?r.key+'年':lvl==='month'?r.key.slice(5)+'月':r.key.slice(8)+'日',total:r.total,bulk_import:r.bulk,routine:r.routine}));
+  const chartRows=sorted.map(r=>({month:lvl==='year'?r.key+'年':lvl==='month'?r.key.slice(5)+'月':r.key.slice(8)+'日',total:r.total,bulk_import:r.bulk,routine:r.routine,average_ai_score:r.average_ai_score,scored_documents:r.scored_documents}));
   card.innerHTML=`<div class="card-head"><h2>增量构成</h2><span class="hint">点击柱状图或表格行下钻：年 → 月 → 日 · 点击图表空白处回退</span></div>
     <div class="controls" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">${crumbs}<span style="flex:1"></span>
       <button class="${st.scope==='rd_system'?'primary':'secondary'}" id="rd-scope" aria-pressed="${st.scope==='rd_system'}">${st.scope==='rd_system'?'✓ 仅统计研发体系七部门':'统计研发体系七部门'}</button>
@@ -175,9 +175,9 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
       <datalist id="dl-dept"></datalist><datalist id="dl-group"></datalist><datalist id="dl-person"></datalist>
       <button class="primary" id="tf-go">筛选</button>${(st.fDept||st.fGroup||st.fPerson)?'<button class="secondary" id="tf-clear">清除</button>':''}
     </div>
-    <p class="hint" style="margin:0 0 8px">当前统计范围：${tree.scope_label}${tree.filter_label?` · 筛选：${tree.filter_label}`:''}</p>
+    <p class="hint" style="margin:0 0 8px">当前统计范围：${tree.scope_label}${tree.filter_label?` · 筛选：${tree.filter_label}`:''} · 平均分按该入库周期内每份文档的最新评审计算，未评审文档不计入</p>
     <div id="incChart" class="chart"></div>
-    <div class="table-wrap" style="margin-top:8px"><table class="data-table"><thead><tr><th>${lvlName}</th><th class="num">全量新增</th><th class="num">批量导入</th><th class="num">日常新增</th></tr></thead><tbody>${treeRows}</tbody></table></div>`;
+    <div class="table-wrap" style="margin-top:8px"><table class="data-table"><thead><tr><th>${lvlName}</th><th class="num">全量新增</th><th class="num">批量导入</th><th class="num">日常新增</th><th class="num">平均 AI 评分</th><th class="num">已评分文档</th></tr></thead><tbody>${treeRows}</tbody></table></div>`;
   renderChart('incChart',stackedOption(chartRows,{zoom:chartRows.length>18}));
   bindChartDrill('incChart',{keys:sorted.map(r=>r.key),labels:chartRows.map(r=>r.month),
     onDrill:lvl==='day'?null:k=>{if(lvl==='year'){st.year=k;st.month=''}else{st.month=k}refreshIncSections()},
