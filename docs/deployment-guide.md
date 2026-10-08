@@ -45,7 +45,8 @@ git clone git@github.com:Max0314/dingtalk_knowledge_governance.git
 cd dingtalk_knowledge_governance
 cp .env.example .env && chmod 600 .env
 vi .env                      # 按运维手册填写
-docker compose up --build -d
+python3 scripts/pause_background_work.py --apply
+docker compose up --build -d api
 ```
 
 建库建号（首次，用管理账号在数据服务器执行；密码见运维手册）：
@@ -79,7 +80,8 @@ docker compose exec api python scripts/import_historical_snapshot.py \
 git add -A && git commit && git push
 # 服务器
 cd ~/apps/dingtalk_knowledge_governance && git pull
-docker compose up --build -d
+python3 scripts/pause_background_work.py --apply
+docker compose up --build -d api
 ```
 
 ## 健康检查
@@ -101,7 +103,7 @@ ssh -N -L 39021:127.0.0.1:39021 neoflow
 ```bash
 cd ~/apps/dingtalk_knowledge_governance
 git checkout <上一个可用提交>
-docker compose up --build -d
+docker compose up --build -d api
 ```
 
 数据库按数据服务器的常规 mysqldump 流程备份/恢复（命令见运维手册）。

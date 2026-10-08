@@ -1,6 +1,5 @@
-"""Run one watch cycle immediately (same code path as the worker tick) and
-print the summary. For e2e testing and ops; safe to run while the worker is
-up — job enqueueing is deduplicated against pending jobs."""
+"""Advance the durable monthly calibration by one slice. Requires explicit
+KG_FULL_SCAN_ENABLED; repeat calls never rescan completed monthly tasks."""
 from __future__ import annotations
 
 import json

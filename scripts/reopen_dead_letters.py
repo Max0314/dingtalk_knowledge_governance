@@ -75,6 +75,8 @@ def main() -> None:
             event.processed = False
             event.resolution = ""
             event.last_attempt_at = None
+            event.locate_attempts = 0
+            event.next_locate_at = None
             # 重试窗口基准用独立列重置；received_at 是原始入库审计字段，不动
             event.retry_started_at = now
         db.commit()

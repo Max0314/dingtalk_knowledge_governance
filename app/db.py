@@ -74,7 +74,7 @@ class Document(Base):
     node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
     # 目录架构：walk 遍历时可直接得到父节点；审计直建的文档先记 path、
-    # 置 directory_pending，父节点由每月 10/24 全量核对补准。
+    # 置 directory_pending，父节点由每月目录校准补准。
     parent_node_id: Mapped[str] = mapped_column(id_string(), default="")
     path: Mapped[str] = mapped_column(String(1024), default="")
     directory_pending: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -410,8 +410,9 @@ class FileAuditEvent(Base):
     resolution: Mapped[str] = mapped_column(String(32), default="")
     # Fair retry rotation: locator picks the least-recently attempted first.
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Retry-window base for dead-letter reopens; received_at stays untouched
-    # as the immutable ingestion audit field.
+    locate_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_locate_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Retry-window base for dead-letter reopens; received_at stays untouched.
     retry_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -427,6 +428,36 @@ class WatchPlan(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ApiUsage(Base):
+    """Atomic reservations before HTTP; no parameters or credentials."""
+    __tablename__ = "dingtalk_api_usage"
+    period: Mapped[str] = mapped_column(String(24), primary_key=True)
+    interface: Mapped[str] = mapped_column(String(64), primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ScanCycle(Base):
+    __tablename__ = "scan_cycles"
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ScanTask(Base):
+    __tablename__ = "scan_tasks"
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    root_node_id: Mapped[str] = mapped_column(id_string(), default="")
+    workspace_name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_id: Mapped[str] = mapped_column(String(64), default="")
+    error_code: Mapped[str] = mapped_column(String(64), default="")
+
+
 class BridgeWalk(Base):
     """Persistent bridge-walk queue: workspaces the audit bridge owes a fast
     targeted walk. Rows survive restarts and per-pass walk budgets — the
@@ -438,6 +469,7 @@ class BridgeWalk(Base):
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failures: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
 
 
 class AuditDailyAgg(Base):
@@ -563,12 +595,15 @@ EXTRA_COLUMNS = {
                    "is_active": "TINYINT(1) NOT NULL DEFAULT 1",
                    "unreachable_misses": "INTEGER NOT NULL DEFAULT 0"},
     "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
+                          "locate_attempts": "INTEGER NOT NULL DEFAULT 0",
+                          "next_locate_at": "DATETIME NULL",
                           "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
                           "last_attempt_at": "DATETIME NULL",
                           "retry_started_at": "DATETIME NULL",
                           "event_key": "VARCHAR(64) NOT NULL DEFAULT ''",
                           "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''"},
     "bridge_walk_queue": {"last_attempt_at": "DATETIME NULL",
+                          "status": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
                           "failures": "INTEGER NOT NULL DEFAULT 0"},
     "documents": {"parent_node_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "path": "VARCHAR(1024) NOT NULL DEFAULT ''",

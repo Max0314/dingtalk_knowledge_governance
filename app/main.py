@@ -16,7 +16,7 @@ from .config import get_settings
 from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .scoring import RULE_VERSION, catalog_dict, effective_config
-from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict, workspace_level
+from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, seed_demo, workspace_dict, workspace_level
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1147,8 +1147,7 @@ def sync_runs(status: str = "", db: Session = Depends(db_session)):
 
 @app.post("/api/v1/sync-runs", status_code=202, dependencies=[Depends(require_admin)])
 async def start_sync(mode: str = "incremental", db: Session = Depends(db_session)):
-    run = await sync_from_dingtalk(db, get_settings(), mode)
-    return {"run_id": run.run_id, "status": run.status, "error_code": run.error_code, "documents_new": run.documents_new, "documents_changed": run.documents_changed}
+    return await run_watch_now(db)
 
 
 @app.post("/api/v1/watch/run", dependencies=[Depends(require_admin)])
@@ -1156,9 +1155,30 @@ async def run_watch_now(db: Session = Depends(db_session)):
     """On-demand watch cycle (same code path as the worker tick), for testing
     and for ops after adding a workspace to KG_WATCH_WORKSPACES."""
     settings = get_settings()
+    if not settings.full_scan_enabled:
+        raise HTTPException(409, "全量校准已暂停。")
     if not settings.watch_workspaces:
         raise HTTPException(400, "未配置 KG_WATCH_WORKSPACES。")
-    return await run_watch_cycle_async(db, settings)
+    from .scan_scheduler import run_scan_slice_async
+    try:
+        return await run_scan_slice_async(db, settings, force=True)
+    except IntegrationError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v1/diagnostics/api-usage", dependencies=[Depends(require_admin)])
+def api_usage_status(db: Session = Depends(db_session)):
+    from .api_usage import usage_status
+    from .db import ScanCycle, ScanTask
+    settings = get_settings()
+    return {**usage_status(db, settings),
+            "switches": {"full_scan": settings.full_scan_enabled, "audit_pull": settings.audit_pull_enabled,
+                         "bridge": settings.bridge_enabled, "reviews": settings.review_enabled,
+                         "event_tree_walks": settings.bridge_walks_enabled},
+            "scan_days": settings.scan_days,
+            "cycles": [{"month": c.month, "status": c.status} for c in db.scalars(select(ScanCycle)).all()],
+            "scan_tasks": [{"month": t.month, "status": t.status, "attempts": t.attempts,
+                            "error_code": t.error_code} for t in db.scalars(select(ScanTask)).all()]}
 
 
 # Read-only DingTalk proxy endpoints for interactive directory browsing; each request supplies the real operator UnionID.

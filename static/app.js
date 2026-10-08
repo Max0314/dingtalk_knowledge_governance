@@ -14,6 +14,7 @@ const api=(url,options={})=>fetch(url.replace(/^\//,''),{signal:navAbort&&navAbo
 const app=document.querySelector('#app');
 const state={view:'overview',coverageNames:{},depth:0};
 const nf=v=>Number(v||0).toLocaleString('zh-CN');
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const fmt=v=>v||'—';
 const scoreClass=s=>s>=80?'good':s>=60?'warn':'bad';
 const verdictText=v=>({pass:'通过',manual_review:'待人工审核',return:'退回'})[v]||v;
@@ -522,9 +523,12 @@ async function models(editing){const controller=navAbort;const d=await api('/api
     document.querySelectorAll('[data-rb]').forEach(r=>r.onclick=async()=>{if(!confirm('回滚到该历史版本？当前状态会先留档。'))return;
       await api('/api/v1/model-configs/'+r.dataset.cfg+'/rollback/'+r.dataset.rb,{method:'POST'});toast('已回滚');models()})})}
 
-async function diagnostics(){const controller=navAbort;const[d,n,sr]=await Promise.all([api('/api/v1/diagnostics/connectivity'),optional(api('/api/v1/notifications?limit=10')),optional(api('/api/v1/diagnostics/sync-runs?status=failed'))]);
+async function diagnostics(){const controller=navAbort;const[d,n,sr,u]=await Promise.all([api('/api/v1/diagnostics/connectivity'),optional(api('/api/v1/notifications?limit=10')),optional(api('/api/v1/diagnostics/sync-runs?status=failed')),optional(api('/api/v1/diagnostics/api-usage'))]);
   ensureCurrentNav(controller);
   shell('连接诊断',d.body_storage,`
+  ${u?`<section class="card"><h2>钉钉接口调用量保护</h2><p class="hint">${esc(u.measurement)}。总预算 ${fmt(u.limits.daily)} 次/日、${fmt(u.limits.monthly)} 次/月；节点列表 ${fmt(u.limits.nodes_monthly)} 次/月；文件搜索 ${fmt(u.limits.search_daily)} 次/日。达到限额自动停止请求。</p>
+    <p class="hint">全量校准：${u.switches.full_scan?'已启用，每月一轮':'已暂停'} · 审计拉取：${u.switches.audit_pull?'已启用':'已暂停'} · 自动评审：${u.switches.reviews?'已启用':'已暂停'} · 审计事件不触发整库扫描。</p>
+    ${u.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>统计期间</th><th>接口</th><th>请求次数</th></tr></thead><tbody>${u.items.map(x=>`<tr><td>${esc(x.period)}</td><td>${esc(x.interface)}</td><td>${fmt(x.calls)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">修复部署后尚无钉钉接口请求。</p>'}</section>`:''}
   <section class="card"><h2>外部接口状态</h2>${d.items.map(x=>`<div class="diagnostic"><span class="health ${x.status}"></span><div><b>${x.name}</b><br><small>${x.status}</small></div><span class="message">${x.message}</span></div>`).join('')}<div class="section-gap"><button class="primary" id="refresh">刷新诊断</button></div></section>
   ${sr&&sr.items&&sr.items.length?`<section class="card section-gap"><div class="card-head"><h2>最近监控异常</h2><span class="hint">近 30 条运行里的失败记录，含所属知识库与异常详情</span></div>
     <div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>模式</th><th>错误码</th><th>详情</th><th>时间</th></tr></thead><tbody>
@@ -534,17 +538,17 @@ async function diagnostics(){const controller=navAbort;const[d,n,sr]=await Promi
     <p class="hint">robotCode：${n.robot_code} · 不合格评审自动入队，worker 逐条发送并留痕。</p>
     <div class="controls"><input class="input" id="test-uid" placeholder="接收人 userId（如 01115324500438248944）" style="min-width:280px"><button class="secondary" id="test-send">发送测试消息</button></div>
     ${n.items.length?`<div class="table-wrap section-gap"><table class="data-table"><thead><tr><th>时间</th><th>标题</th><th>接收人</th><th>状态</th><th>错误码</th></tr></thead><tbody>${n.items.map(x=>`<tr><td><small>${(x.created_at||'').replace('T',' ').slice(0,19)}</small></td><td>${x.title||'—'}</td><td><small>${x.target_user_id||'—'}</small></td><td><span class="badge ${x.status==='sent'?'pass':x.status==='failed'?'return':''}">${x.status}</span></td><td><small>${x.error_code||'—'}</small></td></tr>`).join('')}</tbody></table></div>`:'<p class="hint section-gap">暂无推送记录。</p>'}</section>`:''}
-  <section class="card section-gap"><div class="card-head"><h2>手动增量同步</h2></div>
-    <p class="hint">调用钉钉接口全量拉取已登记知识库的文档元数据，需要企业应用 Wiki 读取权限。日常增量由 watcher 自动轮询发现，正常情况无需手动执行。</p>
-    <button class="secondary" id="manual-sync">执行增量同步</button></section>
+  <section class="card section-gap"><div class="card-head"><h2>月度目录校准</h2></div>
+    <p class="hint">每月仅一轮，按知识库保存进度；失败只重试失败库，最多 3 次。重复点击继续本月剩余任务，不重新扫描已完成的库。</p>
+    <button class="secondary" id="manual-sync" ${!u||!u.switches.full_scan?'disabled':''}>${u&&u.switches.full_scan?'推进本月校准':'全量校准已暂停'}</button></section>
   <section class="card section-gap"><h2>上线前检查</h2>
     <p class="hint">1. 钉钉企业应用开通知识库读取与机器人发送权限，并发布版本；operatorId 使用数字员工 UnionID。</p>
     <p class="hint">2. 数字员工需为目标知识库成员；缺失的库在「知识库管理」的待授权清单中。</p>
     <p class="hint">3. bi_center 只读 Token 用于员工/部门归属映射（employeeKey=UnionID）。</p>
     <p class="hint">4. 仅在合规确认后配置正文临时获取网关与模型正文传输策略。</p></section>`);
   document.querySelector('#refresh').onclick=diagnostics;
-  document.querySelector('#manual-sync').onclick=async()=>{if(!confirm('确认触发一次增量同步？日常增量已由 watcher 自动处理。'))return;
-    toast('同步已提交…');try{const r=await api('/api/v1/sync-runs',{method:'POST'});toast(r.status==='succeeded'?'增量同步完成':'同步未成功：'+(r.error_code||'见上方接口状态'))}catch(e){toast(e.message)}};
+  document.querySelector('#manual-sync').onclick=async()=>{
+    toast('校准任务执行中…');try{const r=await api('/api/v1/sync-runs',{method:'POST'});toast(({completed:'本月校准已完成',completed_with_errors:'本月校准结束，部分库待处理',budget_exhausted:'调用预算已用尽，已停止校准',running:'已推进本月校准',busy:'已有校准正在执行'})[r.status]||'校准状态：'+r.status)}catch(e){toast(e.message)}};
   const send=document.querySelector('#test-send');
   if(send)send.onclick=async()=>{const uid=document.querySelector('#test-uid').value.trim();if(!uid)return toast('请填写 userId');
     try{await api('/api/v1/notifications/test',{method:'POST',body:JSON.stringify({user_id:uid})});toast('已发送，请在钉钉查收')}catch(e){toast(e.message)}}}

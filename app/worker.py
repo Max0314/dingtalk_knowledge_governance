@@ -30,6 +30,9 @@ def main() -> None:
     for handler in logging.getLogger().handlers:
         handler.addFilter(_DependencyCredentialFilter())
     settings = get_settings(); init_db()
+    if not any((settings.audit_pull_enabled, settings.bridge_enabled, settings.review_enabled, settings.notify_enabled)):
+        logger.info("Background work disabled; worker exits without external requests")
+        return
     start_stream_consumer(settings)
     with SessionLocal() as db:
         if settings.demo_mode: seed_demo(db)
@@ -64,12 +67,12 @@ def main() -> None:
                 logger.exception("audit bridge failed")
             next_bridge_at = time.time() + max(15, settings.bridge_interval_seconds)
         with SessionLocal() as db:
-            harvested = harvest_due_reviews(db, settings)  # 修改合并窗到点的文档入队
+            harvested = harvest_due_reviews(db, settings) if settings.review_enabled else 0
             if harvested:
                 logger.info("merge-window harvest queued %s review(s)", harvested)
             processed = 0
             for _ in range(3):  # 小额度：模型评审单笔可达 2 分钟，不许垄断循环
-                if not process_next_job(db, settings):
+                if not settings.review_enabled or not process_next_job(db, settings):
                     break
                 processed += 1
             notified = process_pending_notifications(db, settings)

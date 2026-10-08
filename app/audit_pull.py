@@ -24,6 +24,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import Settings
+from .api_usage import reserve_call
 from .db import AuditDailyAgg, AuditState, FileAuditEvent, SessionLocal, _audit_event_key, utcnow
 from .integrations import DingtalkClient, IntegrationError
 
@@ -73,6 +74,7 @@ async def _fetch_pages(settings: Settings, start_ms: int, end_ms: int) -> list[d
             params = {"startDate": start_ms, "endDate": end_ms, "pageSize": PAGE_SIZE}
             if cursor_g:
                 params["nextGmtCreate"], params["nextBizId"] = cursor_g, cursor_b
+            reserve_call(settings, "exclusive.fileAuditLogs")
             response = await http.get("https://api.dingtalk.com/v1.0/exclusive/fileAuditLogs",
                                       params=params, headers={"x-acs-dingtalk-access-token": token})
             if response.status_code != 200:
