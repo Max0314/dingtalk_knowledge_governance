@@ -13,4 +13,6 @@ COPY static ./static
 COPY docs ./docs
 COPY scripts ./scripts
 EXPOSE 39021
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "39021"]
+# OAuth callback query strings contain one-time credentials. Application
+# access logging is disabled; proxy logs must also omit callback query args.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "39021", "--no-access-log"]

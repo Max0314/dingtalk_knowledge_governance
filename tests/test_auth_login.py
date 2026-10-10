@@ -100,7 +100,9 @@ def test_callback_network_failure_is_retryable(login_settings, monkeypatch):
     monkeypatch.setattr(auth, "exchange_user", unavailable)
     target = login_settings.public_base_url + "/#/reviews"
     state = auth.make_state(login_settings, target)
-    response = TestClient(app).get("/api/auth/dingtalk/callback", params={"authCode": "synthetic-code", "state": state}, follow_redirects=False)
+    client = TestClient(app)
+    client.cookies.set(auth.STATE_COOKIE_NAME, auth.hashlib.sha256(state.encode()).hexdigest())
+    response = client.get("/api/auth/dingtalk/callback", params={"authCode": "synthetic-code", "state": state}, follow_redirects=False)
     query = parse_qs(urlsplit(response.headers["location"]).query)
     assert response.status_code == 303
     assert query["error"] == ["authorization_unavailable"]
@@ -115,7 +117,9 @@ def test_callback_session_failure_is_retryable(login_settings, monkeypatch):
     monkeypatch.setattr(auth, "exchange_user", user)
     monkeypatch.setattr(auth, "issue_session", unavailable)
     state = auth.make_state(login_settings, login_settings.public_base_url + "/")
-    response = TestClient(app).get("/api/auth/dingtalk/callback", params={"code": "synthetic-code", "state": state}, follow_redirects=False)
+    client = TestClient(app)
+    client.cookies.set(auth.STATE_COOKIE_NAME, auth.hashlib.sha256(state.encode()).hexdigest())
+    response = client.get("/api/auth/dingtalk/callback", params={"code": "synthetic-code", "state": state}, follow_redirects=False)
     assert response.status_code == 303
     assert "session_store_unavailable" in response.headers["location"]
 
@@ -126,7 +130,10 @@ def test_callback_success_restores_deep_link(login_settings, monkeypatch):
     monkeypatch.setattr(auth, "exchange_user", user)
     monkeypatch.setattr(auth, "issue_session", lambda _: "synthetic-session")
     target = login_settings.public_base_url + "/#/documents"
-    response = TestClient(app).get("/api/auth/dingtalk/callback", params={"code": "synthetic-code", "state": auth.make_state(login_settings, target)}, follow_redirects=False)
+    state = auth.make_state(login_settings, target)
+    client = TestClient(app)
+    client.cookies.set(auth.STATE_COOKIE_NAME, auth.hashlib.sha256(state.encode()).hexdigest())
+    response = client.get("/api/auth/dingtalk/callback", params={"code": "synthetic-code", "state": state}, follow_redirects=False)
     assert response.status_code == 302
     assert response.headers["location"] == target
     assert "HttpOnly" in response.headers["set-cookie"]

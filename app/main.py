@@ -528,7 +528,13 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         # live 臂一致（该处已验证走 ix_hfn_snapshot_node）。
         base = base.outerjoin(Document, Document.node_id == HistoricalFileNode.node_id)                    .where(Document.node_id.is_(None))
         need = offset + limit
-        merged = union_all(base, live).subquery()
+        # Top N of the merged order can only come from top N of each arm.
+        # Limit BEFORE union/filesort, but only materialize the final page.
+        base_page = base.order_by(HistoricalFileNode.source_created_at.desc(),
+                                  HistoricalFileNode.node_id.desc()).limit(need).subquery()
+        live_page = live.order_by(Document.source_created_at.desc(),
+                                  Document.node_id.desc()).limit(need).subquery()
+        merged = union_all(select(base_page), select(live_page)).subquery()
         rows = db.execute(select(merged).order_by(merged.c.created_at.desc(), merged.c.node_id.desc())
                           .offset(offset).limit(limit)).all()
         total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \

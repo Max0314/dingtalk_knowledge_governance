@@ -31,6 +31,7 @@ from .config import Settings, get_settings
 from .db import AuthSession, SessionLocal, utcnow
 
 COOKIE_NAME = "kg_session"
+STATE_COOKIE_NAME = "kg_login_state"
 SESSION_TTL = timedelta(days=7)
 STATE_TTL_SECONDS = 600
 # The export namespace is handled explicitly at the top of the middleware so
@@ -250,13 +251,23 @@ def register_auth_routes(app) -> None:
         settings = get_settings()
         if not settings.dingtalk_app_key:
             return JSONResponse(status_code=400, content={"detail": {"code": "app_key_missing", "message": "未配置钉钉应用凭据。"}})
-        return {"login_url": build_login_url(settings, return_url)}
+        from urllib.parse import parse_qs
+        url = build_login_url(settings, return_url)
+        state = parse_qs(urlsplit(url).query)["state"][0]
+        response = JSONResponse({"login_url": url})
+        response.set_cookie(STATE_COOKIE_NAME, hashlib.sha256(state.encode()).hexdigest(),
+                            max_age=STATE_TTL_SECONDS, httponly=True, samesite="lax",
+                            secure=settings.public_base_url.startswith("https"), path="/")
+        return response
 
     @app.get("/api/auth/dingtalk/callback")
     async def callback(request: Request, authCode: str = "", code: str = "", state: str = ""):
         settings = get_settings()
         target = settings.public_base_url.rstrip("/") + "/"
         try:
+            expected = hashlib.sha256(state.encode()).hexdigest()
+            if not state or not hmac.compare_digest(request.cookies.get(STATE_COOKIE_NAME, ""), expected):
+                raise ValueError("state_invalid")
             payload = read_state(settings, state)
             target = sanitize_return_url(settings, payload.get("r", ""))
             if not (authCode or code):
