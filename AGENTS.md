@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本文件是 `dingtalk_knowledge_governance` 的 AI 工程化约束。修改项目时先读本文、`README.md` 和 `docs/phase-1-plan.md`。
+本文件是 `dingtalk_knowledge_governance` 的 AI 工程化约束。修改项目时先读本文、`README.md`、`docs/README.md` 和 `docs/performance-resilience.md`。历史规划仅在需要追溯设计时阅读，不作为现行指令。
 
 ## 项目边界
 

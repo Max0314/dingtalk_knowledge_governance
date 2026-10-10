@@ -12,6 +12,8 @@ import hashlib
 import re
 from dataclasses import dataclass, asdict
 
+from . import genre as genre_mod
+
 
 RULE_VERSION = "V1.1"
 PASS_SCORE, RETURN_SCORE = 70, 60
@@ -130,8 +132,11 @@ def catalog_dict() -> list[dict]:
 
 def verdict_for(score: float, config: dict | None = None) -> str:
     cfg = config or {}
-    passing, returning = cfg.get("pass_score", PASS_SCORE), cfg.get("return_score", RETURN_SCORE)
-    return "pass" if score >= passing else "manual_review" if score >= returning else "return"
+    # 人工复核挡位已取消（2026-08-21 用户决策）：AI 分数直接就是结论，
+    # 不再有"待人工审核"这个没有下游承接方的中间态。库内取值保持
+    # pass / return 不变（BI V2 契约与历史行数据沿用），"return" 的展示
+    # 文案改为"待改进"——试点期明确不存在退回流程。
+    return "pass" if score >= cfg.get("pass_score", PASS_SCORE) else "return"
 
 
 @dataclass
@@ -139,10 +144,34 @@ class Finding:
     rule: str
     deduction: int
     message: str
+    # 该问题真实存在，但所在维度的扣分上限已用尽——照常上报，不计分。
+    capped: bool = False
 
 
 def _chars(text: str) -> set[str]:
     return {c for c in text.lower() if "一" <= c <= "鿿" or c.isalnum()}
+
+
+# 版本历史表的字段同义组：模板里写"修改人"的地方，标准正文叫"作者"。
+HISTORY_FIELD_GROUPS = (("版本",), ("日期", "时间"), ("修改", "变更", "内容"),
+                        ("作者", "修改人", "责任人", "负责人"))
+
+
+def _version_history(text: str) -> str:
+    """版本历史既可能是带标题的小节，也可能是一张没有标题的 Markdown 表。
+
+    只认字面标题会把公司标准模板本身判成"缺少版本历史"——实测该模板带着
+    完整的 | 版本号 | 修订日期 | 修改内容 | 修改人 | 表，仍被扣 3 分。这类
+    "文档明明做对了却被判错"的误报，每发生一次就折损一次用户信任。
+    """
+    section = _section(text, ("版本历史", "修订历史", "变更记录", "版本记录",
+                              "修订记录", "版本释放列表", "修订说明"))
+    if section.strip():
+        return section
+    for line in text.splitlines():
+        if line.count("|") >= 3 and "版本" in line and re.search(r"日期|时间|修订|修改", line):
+            return line
+    return ""
 
 
 def _section(text: str, names: tuple[str, ...]) -> str:
@@ -150,7 +179,8 @@ def _section(text: str, names: tuple[str, ...]) -> str:
     return match.group(1) if match else ""
 
 
-def score_document(name: str, content: str, file_class: str = "document", config: dict | None = None) -> dict:
+def score_document(name: str, content: str, file_class: str = "document", config: dict | None = None,
+                   genre: str = "") -> dict:
     """Return only structured results; callers must not persist ``content``.
 
     ``file_class`` selects the applicable rule subset: spreadsheets have no
@@ -160,57 +190,75 @@ def score_document(name: str, content: str, file_class: str = "document", config
 
     ``config`` is an effective_config()-shaped parameter set (None = V1.1
     defaults); detection logic is fixed, only its parameters vary.
+
+    ``genre`` 是 app.genre 的规范文体名（空 = 默认档）。文体决定适用维度与
+    严格度：适用集合 = 该文体档位的维度 ∩ 该载体能支撑的维度。合规分对适用
+    维度的上限做归一化，因此不同文体之间分数可比，且量程铺满 0–100。
     """
     cfg = effective_config(config)
+    resolved_genre = genre_mod.normalize_genre(genre) or genre_mod.DEFAULT_GENRE
+    tier = genre_mod.tier_of(resolved_genre)
+    active = set(genre_mod.dimensions_for(resolved_genre, file_class))
 
     def param(dim: str, rule: str, key: str):
         return cfg["dimensions"][dim]["rules"][rule]["params"][key]
 
     findings: list[Finding] = []
     dimensions: dict[str, dict] = {}
-    document_shaped = file_class not in ("sheet",)
 
     def chapter(key: str, checks: list[tuple[str, int, str]]):
-        """``checks``: (rule_key, occurrence_count, message); 0 = compliant."""
+        """``checks``: (rule_key, occurrence_count, message); 0 = compliant.
+
+        两条 2026-08-21 的改动：
+
+        1. 维度不在本文体的适用集合里就整段跳过——不拿制度的尺子量通知。
+        2. 维度上限只截**扣分**，不截**问题清单**。此前 cap 耗尽即 continue，
+           一份既缺版本号又缺版本历史、标签和适用范围的文档只会被告知
+           "缺版本号"；用户照做后分数纹丝不动（下一条规则立刻顶满 cap），
+           整改闭环因此失效。现在超额问题以 deduction=0 + capped=True 照常上报。
+        """
+        if key not in active:
+            return
         dim_cfg = cfg["dimensions"][key]
         local: list[Finding] = []
         remaining = dim_cfg["cap"]
         for rule_key, count, message in checks:
             rule_cfg = dim_cfg["rules"][rule_key]
-            if count <= 0 or not rule_cfg["enabled"] or not remaining:
+            if count <= 0 or not rule_cfg["enabled"]:
                 continue
             take = rule_cfg["points"] * count
             if "max" in rule_cfg:
                 take = min(take, rule_cfg["max"])
-            take = min(take, remaining)
             if take <= 0:
                 continue
-            local.append(Finding(rule_key, take, message))
-            remaining -= take
+            applied = max(0, min(take, remaining))
+            local.append(Finding(rule_key, applied, message, capped=applied < take))
+            remaining -= applied
         findings.extend(local)
         dimensions[key] = {"label": RULE_CATALOG[key]["label"], "deduction": sum(x.deduction for x in local),
                            "cap": dim_cfg["cap"], "findings": [asdict(x) for x in local]}
 
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     meta = _section(content, ("文档信息", "基本信息", "元数据")) + "\n" + content[:1000]
-    tags_match = re.search(r"(?:标签|Tags)\s*[:：]\s*([^\n]+)", meta, re.I)
+    # "标签（Tags）：" 这种括号别名写法此前不匹配，导致标签齐全的文档被判 0 个
+    # 标签——公司标准模板自己就是这么写的，直接被自己的规则扣了分。
+    tags_match = re.search(r"(?:标签|Tags)(?:\s*[（(][^）)]{0,24}[)）])?\s*[:：]\s*([^\n]+)", meta, re.I)
     tags = re.split(r"[,，、;；\s]+", tags_match.group(1).strip()) if tags_match else []
-    history = _section(content, ("版本历史", "修订历史", "变更记录"))
-    history_fields = sum(1 for x in ("版本", "日期", "修改", "作者") if x in history)
-    if document_shaped:
-        tag_count = len([x for x in tags if x])
-        chapter("metadata", [
-            ("1.1", int(not re.search(r"(?:版本号|版本)\s*[:：]\s*V\d+\.\d+", meta, re.I)), "未识别到 Vx.x 版本号。"),
-            ("1.2a", int(not history), "缺少版本历史表或版本记录。"),
-            ("1.2b", (4 - history_fields) if history and history_fields < 4 else 0, "版本历史字段不完整。"),
-            ("1.3", int(tag_count < param("metadata", "1.3", "tag_min") or len(tags) > param("metadata", "1.3", "tag_max")),
-             f"标签数量不在 {param('metadata', '1.3', 'tag_min')}–{param('metadata', '1.3', 'tag_max')} 个范围内。"),
-            ("1.4", int(not re.search(r"(?:适用范围|范围)\s*[:：]\s*\S+", meta)), "缺少适用范围。"),
-        ])
+    history = _version_history(content)
+    history_fields = sum(1 for group in HISTORY_FIELD_GROUPS if any(x in history for x in group))
+    tag_count = len([x for x in tags if x])
+    chapter("metadata", [
+        ("1.1", int(not re.search(r"(?:版本号|版本)\s*[:：]\s*V\d+\.\d+", meta, re.I)), "未识别到 Vx.x 版本号。"),
+        ("1.2a", int(not history), "缺少版本历史表或版本记录。"),
+        ("1.2b", (4 - history_fields) if history and history_fields < 4 else 0, "版本历史字段不完整。"),
+        ("1.3", int(tag_count < param("metadata", "1.3", "tag_min") or tag_count > param("metadata", "1.3", "tag_max")),
+         f"标签数量不在 {param('metadata', '1.3', 'tag_min')}–{param('metadata', '1.3', 'tag_max')} 个范围内。"),
+        ("1.4", int(not re.search(r"(?:适用范围|范围)\s*[:：]\s*\S+", meta)), "缺少适用范围。"),
+    ])
     abstract = _section(content, ("摘要", "概述", "简介"))
     body = content.replace(abstract, "", 1)
     overlap = len(_chars(abstract) & _chars(body)) / max(1, len(_chars(abstract))) if abstract else 0
-    if document_shaped: chapter("abstract", [
+    chapter("abstract", [
         ("2.1", int(bool(abstract) and len(re.findall(r"[。！？!?]", abstract)) > param("abstract", "2.1", "max_sentences")),
          f"摘要超过 {param('abstract', '2.1', 'max_sentences')} 句。"),
         ("2.2", int(not abstract or overlap < param("abstract", "2.2", "min_overlap_pct") / 100),
@@ -228,7 +276,7 @@ def score_document(name: str, content: str, file_class: str = "document", config
         except IndexError:
             intro_missing += 1
     min_headings = param("structure", "3.1", "min_headings")
-    if document_shaped: chapter("structure", [
+    chapter("structure", [
         ("3.1", int(len(headings) < min_headings), "未识别到多级编号结构。"),
         ("3.2", int(len(headings) >= min_headings and not any("." in x for x in headings)), "章节编号层级不清晰。"),
         ("3.3", intro_missing, "部分章节缺少引导句。"),
@@ -238,7 +286,7 @@ def score_document(name: str, content: str, file_class: str = "document", config
     uncommon = [x for x in title_terms if content.lower().count(x.lower()) < param("retrieval", "4.1", "min_occurrences")]
     abbrs = set(re.findall(r"\b[A-Z]{2,}\b", content))
     undefined = [x for x in abbrs if not re.search(r"[一-鿿A-Za-z]{2,}[（(]" + re.escape(x) + r"[)）]|" + re.escape(x) + r"[（(][一-鿿A-Za-z]{2,}[)）]", content)]
-    if document_shaped: chapter("retrieval", [
+    chapter("retrieval", [
         ("4.1", len(uncommon), f"标题核心词在正文出现不足 {param('retrieval', '4.1', 'min_occurrences')} 次。"),
         ("4.2", len(undefined), "存在未在首次出现处释义的英文缩写。"),
         ("4.3", int("【重点】" not in content and "Note:" not in content), "缺少重点或 Note 标记。"),
@@ -254,7 +302,7 @@ def score_document(name: str, content: str, file_class: str = "document", config
     incoherent = sum(1 for a, b in zip(sentences, sentences[1:]) if len(_chars(a) & _chars(b)) / max(1, len(_chars(a) | _chars(b))) < 0.04)
     tech = bool(re.search(r"API|接口|架构|部署|代码|技术", content, re.I))
     has_data = bool(re.search(r"\d+(?:\.\d+)?%|数据|结论", content))
-    if document_shaped: chapter("rag", [
+    chapter("rag", [
         ("6.1", int(incoherent >= param("rag", "6.1", "min_incoherent")), "相邻主题语义关联弱，建议拆分主题。"),
         ("6.2", int(tech and not re.search(r"术语表|名词解释|Glossary", content, re.I)), "技术类文档缺少术语表。"),
         ("6.3", int(has_data and not re.search(r"参考资料|引用|来源|https?://", content, re.I)), "数据或结论缺少可追溯引用。"),
@@ -268,5 +316,22 @@ def score_document(name: str, content: str, file_class: str = "document", config
         ("7.3", contradiction, "版本信息与历史记录存在矛盾。"),
     ])
     deduction = sum(item["deduction"] for item in dimensions.values())
-    score = max(0, 100 - deduction)
-    return {"ai_score": score, "verdict": verdict_for(score, cfg), "dimensions": dimensions, "findings": [asdict(x) for x in findings], "fingerprint": hashlib.sha256(content.encode("utf-8")).hexdigest() if content else ""}
+    applicable_cap = sum(cfg["dimensions"][key]["cap"] for key in active)
+    # 归一化：扣满本文体所有适用项 = 0 分，一项不扣 = 100 分。此前直接
+    # 100-扣分，而七个维度 cap 合计只有 40，分数地板恒为 60，"打回线 60"
+    # 结构性不可达——这个缺陷源自 V1.1 标准原文，不是实现走样。
+    if not applicable_cap:
+        # D 档「仅登记」没有任何适用维度：不出分。ai_score=None 让任何误持久化
+        # 立刻炸在写库处，而不是悄悄记一个满分——台账、BOM、空模板不该有分数。
+        return {"ai_score": None, "verdict": "registered", "registry_only": True,
+                "dimensions": dimensions, "findings": [asdict(x) for x in findings],
+                "genre": resolved_genre, "tier": tier, "applicable_dimensions": [],
+                "applicable_cap": 0, "raw_deduction": deduction,
+                "fingerprint": hashlib.sha256(content.encode("utf-8")).hexdigest() if content else ""}
+    score = max(0, min(100, round((1 - deduction / applicable_cap) * 100)))
+    return {"ai_score": score, "verdict": verdict_for(score, cfg), "registry_only": False,
+            "dimensions": dimensions,
+            "findings": [asdict(x) for x in findings], "genre": resolved_genre, "tier": tier,
+            "applicable_dimensions": sorted(active), "applicable_cap": applicable_cap,
+            "raw_deduction": deduction,
+            "fingerprint": hashlib.sha256(content.encode("utf-8")).hexdigest() if content else ""}

@@ -70,11 +70,12 @@ class Document(Base):
         # paged newest-first. Without this composite index MySQL filesorts the
         # whole live mirror (~153k rows) for every page.
         Index("ix_documents_current_created", "is_folder", "is_deleted", "source_created_at", "node_id"),
+        Index("ix_documents_current_cover", "is_folder", "is_deleted", "source_created_at", "node_id", "workspace_id"),
     )
     node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
     # 目录架构：walk 遍历时可直接得到父节点；审计直建的文档先记 path、
-    # 置 directory_pending，父节点由每月 10/24 全量核对补准。
+    # 置 directory_pending，父节点由每月目录校准补准。
     parent_node_id: Mapped[str] = mapped_column(id_string(), default="")
     path: Mapped[str] = mapped_column(String(1024), default="")
     directory_pending: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -101,6 +102,10 @@ class Document(Base):
     # Asset class from app.fileclass (document/sheet/image/engineering/...).
     # Only configured classes enter the review queue automatically.
     file_class: Mapped[str] = mapped_column(String(32), default="", index=True)
+    # 最近一次判定的文体与依据（app.genre）。缓存在文档行上，便于看板按文体
+    # 切片，也让"仅登记"文档在不产生评审实例的情况下仍可见分类结果。
+    genre: Mapped[str] = mapped_column(String(32), default="", index=True)
+    genre_source: Mapped[str] = mapped_column(String(16), default="")
     # Numeric storage dentry id (== the audit trail's bizId for the upload
     # event — verified by cross-download 2026-08-12). The download API only
     # accepts this numeric form; empty means no event seen yet.
@@ -119,6 +124,7 @@ class Document(Base):
 
 class ReviewInstance(Base):
     __tablename__ = "review_instances"
+    __table_args__ = (Index("ix_review_instances_node_created", "node_id", "created_at"),)
     review_instance_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("documents.node_id"), index=True)
     ai_score: Mapped[float] = mapped_column(Float)
@@ -129,6 +135,11 @@ class ReviewInstance(Base):
     # "department:研发中心@v2" — reviews stay traceable across rule edits.
     rule_config_ref: Mapped[str] = mapped_column(String(160), default="")
     model_config_version: Mapped[str] = mapped_column(String(64), default="rule-engine")
+    # 文体与档位决定了本次用哪套维度和严格度，属于评分口径的一部分，
+    # 必须随不可变实例留痕；genre_source 记录凭什么判的（model/filename/default）。
+    genre: Mapped[str] = mapped_column(String(32), default="")
+    genre_source: Mapped[str] = mapped_column(String(16), default="")
+    tier: Mapped[str] = mapped_column(String(4), default="")
     trigger: Mapped[str] = mapped_column(String(32), default="manual")
     content_fingerprint: Mapped[str] = mapped_column(String(128), default="")
     dimensions: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -161,6 +172,21 @@ class ReviewJob(Base):
     error_code: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Atomic claim and a bounded lease prevent another process's boot sweep
+    # from replaying a running review. Existing legacy jobs have no lease.
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ReadCacheEntry(Base):
+    """Rebuildable metadata responses, never document bodies or credentials."""
+    __tablename__ = "read_cache_entries"
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    endpoint: Mapped[str] = mapped_column(String(128))
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str] = mapped_column(String(64), default="")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SyncRun(Base):
@@ -273,7 +299,9 @@ class HistoricalFileNode(Base):
                       # pages newest-first before the live anti-join.
                       Index("ix_hfn_snapshot_file_created", "snapshot_id", "node_type", "source_created_at", "node_id"),
                       # anti-join for baseline∪live dedup (metrics aggregation, /api/v1/files)
-                      Index("ix_hfn_snapshot_node", "snapshot_id", "node_id"))
+                      Index("ix_hfn_snapshot_node", "snapshot_id", "node_id"),
+                      Index("ix_hfn_file_count_cover", "snapshot_id", "node_type", "node_id", "workspace_id"),
+                      Index("ix_hfn_file_page_cover", "snapshot_id", "node_type", "source_created_at", "node_id", "workspace_id"))
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
@@ -321,6 +349,30 @@ class EmployeeMap(Base):
     matched: Mapped[bool] = mapped_column(Boolean, default=False)
     include_official: Mapped[bool] = mapped_column(Boolean, default=False)
     resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EmployeeOrgMonth(Base):
+    """Read-only bi_center monthly organization snapshot cache.
+
+    ``employee_key`` is UnionID.  The R&D-system flag is supplied by
+    bi_center; this service deliberately does not copy department-name rules.
+    Rows contain organization metadata only, never document content.
+    """
+    __tablename__ = "employee_org_month_cache"
+    __table_args__ = (
+        UniqueConstraint("month", "employee_key", name="uq_employee_org_month"),
+        Index("ix_employee_org_month_scope", "month", "is_rd_system"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    month: Mapped[str] = mapped_column(String(7), index=True)
+    employee_key: Mapped[str] = mapped_column(id_string(), index=True)
+    department_name: Mapped[str] = mapped_column(String(255), default="")
+    biz_group_name: Mapped[str] = mapped_column(String(255), default="")
+    is_rd_system: Mapped[bool] = mapped_column(Boolean, default=False)
+    resolved_snapshot_month: Mapped[str] = mapped_column(String(7), default="")
+    directory_version: Mapped[str] = mapped_column(String(64), default="")
+    policy_version: Mapped[str] = mapped_column(String(64), default="")
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class AuthSession(Base):
@@ -386,8 +438,9 @@ class FileAuditEvent(Base):
     resolution: Mapped[str] = mapped_column(String(32), default="")
     # Fair retry rotation: locator picks the least-recently attempted first.
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # Retry-window base for dead-letter reopens; received_at stays untouched
-    # as the immutable ingestion audit field.
+    locate_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_locate_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Retry-window base for dead-letter reopens; received_at stays untouched.
     retry_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -403,6 +456,36 @@ class WatchPlan(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ApiUsage(Base):
+    """Atomic reservations before HTTP; no parameters or credentials."""
+    __tablename__ = "dingtalk_api_usage"
+    period: Mapped[str] = mapped_column(String(24), primary_key=True)
+    interface: Mapped[str] = mapped_column(String(64), primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ScanCycle(Base):
+    __tablename__ = "scan_cycles"
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), default="running")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ScanTask(Base):
+    __tablename__ = "scan_tasks"
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    root_node_id: Mapped[str] = mapped_column(id_string(), default="")
+    workspace_name: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_id: Mapped[str] = mapped_column(String(64), default="")
+    error_code: Mapped[str] = mapped_column(String(64), default="")
+
+
 class BridgeWalk(Base):
     """Persistent bridge-walk queue: workspaces the audit bridge owes a fast
     targeted walk. Rows survive restarts and per-pass walk budgets — the
@@ -414,6 +497,7 @@ class BridgeWalk(Base):
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     failures: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
 
 
 class AuditDailyAgg(Base):
@@ -482,7 +566,9 @@ def build_engine():
         return create_engine(settings.database_url, connect_args={"check_same_thread": False})
     # pool_pre_ping is an engine option, not a DBAPI connect arg; pool_recycle
     # keeps pooled connections younger than MySQL's wait_timeout.
-    return create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=3600)
+    return create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=1800,
+                         pool_size=5, max_overflow=5, pool_timeout=3,
+                         connect_args={"connect_timeout": 3, "read_timeout": 15, "write_timeout": 15})
 
 
 engine = build_engine()
@@ -530,8 +616,12 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
 # create_all only creates missing tables; columns added to an existing model
 # need an explicit ALTER. Keep this list tiny and append-only.
 EXTRA_COLUMNS = {
+    "review_jobs": {"lease_until": "DATETIME NULL"},
     "review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''",
-                         "content_note": "VARCHAR(64) NOT NULL DEFAULT ''"},
+                         "content_note": "VARCHAR(64) NOT NULL DEFAULT ''",
+                         "genre": "VARCHAR(32) NOT NULL DEFAULT ''",
+                         "genre_source": "VARCHAR(16) NOT NULL DEFAULT ''",
+                         "tier": "VARCHAR(4) NOT NULL DEFAULT ''"},
     "sync_runs": {"workspace_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
                   "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
@@ -539,12 +629,15 @@ EXTRA_COLUMNS = {
                    "is_active": "TINYINT(1) NOT NULL DEFAULT 1",
                    "unreachable_misses": "INTEGER NOT NULL DEFAULT 0"},
     "file_audit_events": {"match_status": "VARCHAR(16) NOT NULL DEFAULT ''",
+                          "locate_attempts": "INTEGER NOT NULL DEFAULT 0",
+                          "next_locate_at": "DATETIME NULL",
                           "resolution": "VARCHAR(32) NOT NULL DEFAULT ''",
                           "last_attempt_at": "DATETIME NULL",
                           "retry_started_at": "DATETIME NULL",
                           "event_key": "VARCHAR(64) NOT NULL DEFAULT ''",
                           "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''"},
     "bridge_walk_queue": {"last_attempt_at": "DATETIME NULL",
+                          "status": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
                           "failures": "INTEGER NOT NULL DEFAULT 0"},
     "documents": {"parent_node_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "path": "VARCHAR(1024) NOT NULL DEFAULT ''",
@@ -552,16 +645,24 @@ EXTRA_COLUMNS = {
                   "review_due_at": "DATETIME NULL",
                   "dirty_since": "DATETIME NULL",
                   "deleted_at": "DATETIME NULL",
-                  "last_modifier_key": "VARCHAR(128) NOT NULL DEFAULT ''"},
+                  "last_modifier_key": "VARCHAR(128) NOT NULL DEFAULT ''",
+                  "genre": "VARCHAR(32) NOT NULL DEFAULT ''",
+                  "genre_source": "VARCHAR(16) NOT NULL DEFAULT ''"},
 }
 
 
 EXTRA_INDEXES = {
+    "review_instances": {
+        "ix_review_instances_node_created": "CREATE INDEX ix_review_instances_node_created ON review_instances (node_id, created_at)",
+    },
     "historical_file_nodes": {
+        "ix_hfn_file_page_cover": "CREATE INDEX ix_hfn_file_page_cover ON historical_file_nodes (snapshot_id, node_type, source_created_at, node_id, workspace_id)",
+        "ix_hfn_file_count_cover": "CREATE INDEX ix_hfn_file_count_cover ON historical_file_nodes (snapshot_id, node_type, node_id, workspace_id)",
         "ix_hfn_snapshot_node": "CREATE INDEX ix_hfn_snapshot_node ON historical_file_nodes (snapshot_id, node_id)",
         "ix_hfn_snapshot_file_created": "CREATE INDEX ix_hfn_snapshot_file_created ON historical_file_nodes (snapshot_id, node_type, source_created_at, node_id)",
     },
     "documents": {
+        "ix_documents_current_cover": "CREATE INDEX ix_documents_current_cover ON documents (is_folder, is_deleted, source_created_at, node_id, workspace_id)",
         "ix_documents_review_due_at": "CREATE INDEX ix_documents_review_due_at ON documents (review_due_at)",
         "ix_documents_current_created": "CREATE INDEX ix_documents_current_created ON documents (is_folder, is_deleted, source_created_at, node_id)",
     },

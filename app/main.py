@@ -5,28 +5,35 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, false, func, literal, or_, select, union_all
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from . import bi_export, metrics, orgmap
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .scoring import RULE_VERSION, catalog_dict, effective_config
-from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict, workspace_level
+from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, seed_demo, workspace_dict, workspace_level
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    if get_settings().demo_mode:
-        with SessionLocal() as db: seed_demo(db)
+    def initialize():
+        init_db()
+        if get_settings().demo_mode:
+            with SessionLocal() as db:
+                seed_demo(db)
+    await run_in_threadpool(initialize)
+    read_cache.start()
     yield
+    read_cache.stop()
 
 
 app = FastAPI(title="DingTalk Knowledge Governance", version="1.0.0", lifespan=lifespan)
@@ -77,11 +84,6 @@ class ReviewRequest(BaseModel):
     trigger: str = Field(default="manual_rerun", pattern="^manual_rerun$")
 
 
-class DecisionRequest(BaseModel):
-    decision: str = Field(pattern="^(pass|return|manual_review)$")
-    comment: str = Field(default="", max_length=1000)
-
-
 class ModelRequest(BaseModel):
     name: str
     provider: str = "openai_compatible"
@@ -111,6 +113,17 @@ class RuleEditorsRequest(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "dingtalk_knowledge_governance", "document_body_persistence": "disabled"}
+
+
+@app.get("/api/ready")
+def ready(db: Session = Depends(db_session)):
+    from sqlalchemy import text
+    from sqlalchemy.exc import SQLAlchemyError
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise HTTPException(503, "数据库暂时不可用。") from None
+    return {"status": "ready"}
 
 
 def _bi_export_error(error: bi_export.ExportApiError) -> JSONResponse:
@@ -266,13 +279,21 @@ def metrics_coverage(db: Session = Depends(db_session)):
 @app.get("/api/v1/metrics/increments/tree")
 def metrics_increments_tree(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                             month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                            scope: str = Query(default="", pattern=r"^$|^rd_system$"),
                             department: str = "", biz_group: str = "", person: str = "",
                             db: Session = Depends(db_session)):
     """Drillable increment composition: no params -> years (recent first);
     year -> its months; month -> its days. People filters narrow the
     population via the bi_center employee cache."""
-    return metrics.increments_tree(db, year=year, month=month, department=department,
-                                   biz_group=biz_group, person=person)
+    try:
+        return metrics.increments_tree(db, year=year, month=month, department=department,
+                                       biz_group=biz_group, person=person, scope=scope)
+    except metrics.OrganizationScopeCacheMissingError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "organization_scope_cache_missing",
+            "message": "研发体系组织口径缓存未就绪，请联系管理员同步后重试。",
+            "missing_months": exc.missing_months,
+        }) from exc
 
 
 @app.get("/api/v1/metrics/workspaces/{workspace_id}/months")
@@ -289,14 +310,11 @@ def uploader_months_api(db: Session = Depends(db_session)):
 def uploaders_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                   exclude_unmatched: bool = True, limit: int = Query(default=50, ge=1, le=200),
                   department: str = "", db: Session = Depends(db_session)):
-    preview = metrics.uploaders(db, month, exclude_unmatched=False, limit=200)
-    orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
     return metrics.uploaders(db, month, exclude_unmatched=exclude_unmatched, limit=limit, department=department)
 
 
 @app.get("/api/v1/metrics/uploaders/{user_id}")
 def uploader_detail_api(user_id: str, db: Session = Depends(db_session)):
-    orgmap.ensure_employees(db, get_settings(), [user_id])
     return metrics.uploader_detail(db, user_id)
 
 
@@ -304,7 +322,6 @@ def uploader_detail_api(user_id: str, db: Session = Depends(db_session)):
 def uploader_breakdown_api(user_id: str, year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                            month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                            db: Session = Depends(db_session)):
-    orgmap.ensure_employees(db, get_settings(), [user_id])
     return metrics.uploader_breakdown(db, user_id, year=year, month=month)
 
 
@@ -312,8 +329,6 @@ def uploader_breakdown_api(user_id: str, year: str = Query(default="", pattern=r
 def org_rollup_api(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                    month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                    db: Session = Depends(db_session)):
-    preview = metrics.uploaders(db, "", exclude_unmatched=False, limit=500)
-    orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
     return metrics.org_rollup(db, year=year, month=month)
 
 
@@ -455,6 +470,7 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
 @app.get("/api/v1/files")
 def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
                   department: str = "", uploader: str = "",
+                  month: str = Query(default="", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
                   offset: int = Query(default=0, ge=0),
                   limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     """The single merged document list: primary-baseline snapshot rows plus the
@@ -467,6 +483,9 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     ordered streams are merged in Python — page one costs ~2×(offset+limit)
     indexed rows instead of a 140k-row temp-table sort."""
     snapshot = metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    inventory = read_cache.source_data("file_inventory", {"snapshot": ""}, db)
+    if inventory["snapshot"] != snapshot:
+        inventory = file_inventory(snapshot=snapshot, db=db)
     # 不可见库（连续缺席/404 自动标记）双臂都不进当前检索——基线臂也要滤
     # （codex 第九轮 P1）；历史数据仍可走基线专用接口查询。
     inactive_ws = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
@@ -482,7 +501,7 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         Document.extension, Document.url,
         Document.source_created_at.label("created_at"),
         Document.uploader_key.label("creator"),
-    ).where(Document.is_folder.is_(False), Document.is_deleted.is_(False),
+    ).where(Document.is_folder == false(), Document.is_deleted == false(),
             Document.workspace_id.not_in(inactive_ws))  # 不可见库的增量不进检索
     if workspace_id:
         base = base.where(HistoricalFileNode.workspace_id == workspace_id)
@@ -490,6 +509,9 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     if query:
         base = base.where(HistoricalFileNode.name.contains(query))
         live = live.where(Document.name.contains(query))
+    if month:  # 文档业务入库月，不是评审实例创建月
+        base = base.where(HistoricalFileNode.source_created_at.startswith(month))
+        live = live.where(Document.source_created_at.startswith(month))
     if department:  # 知识库归属部门（workspaces.owner_department_name，宜搭回填）
         dept_ws = select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))
         base = base.where(HistoricalFileNode.workspace_id.in_(dept_ws))
@@ -509,23 +531,52 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         # 形态优化很差，而两次 COUNT(*) 都要过它。改法与 metrics._collect 的
         # live 臂一致（该处已验证走 ix_hfn_snapshot_node）。
         base = base.outerjoin(Document, Document.node_id == HistoricalFileNode.node_id)                    .where(Document.node_id.is_(None))
+        if inventory["baseline_ids"] is not None:
+            base = base.where(HistoricalFileNode.node_id.in_(inventory["baseline_ids"]))
         need = offset + limit
-        merged = sorted(
-            db.execute(base.order_by(HistoricalFileNode.source_created_at.desc(),
-                                     HistoricalFileNode.node_id.desc()).limit(need)).all() +
-            db.execute(live.order_by(Document.source_created_at.desc(),
-                                     Document.node_id.desc()).limit(need)).all(),
-            key=lambda r: ((r.created_at or ""), r.node_id), reverse=True)
-        rows = merged[offset:offset + limit]
-        total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
-                (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
+        # Top N of the merged order can only come from top N of each arm.
+        # Limit BEFORE union/filesort, but only materialize the final page.
+        # Page through narrow covering indexes first. Selecting names/URLs
+        # here forced clustered-row reads for every rejected baseline node.
+        narrow_base = base.with_only_columns(HistoricalFileNode.node_id, HistoricalFileNode.workspace_id,
+                         HistoricalFileNode.source_created_at.label("created_at"), literal("baseline").label("origin"))
+        narrow_live = live.with_only_columns(Document.node_id, Document.workspace_id,
+                         Document.source_created_at.label("created_at"), literal("live").label("origin"))
+        if not workspace_id and not query and not uploader:
+            narrow_base = narrow_base.with_hint(HistoricalFileNode,
+                "FORCE INDEX (ix_hfn_snapshot_node)" if inventory["baseline_ids"] is not None else "FORCE INDEX (ix_hfn_file_page_cover)", "mysql")
+            narrow_live = narrow_live.with_hint(Document, "FORCE INDEX (ix_documents_current_cover)", "mysql")
+        base_page = narrow_base.order_by(HistoricalFileNode.source_created_at.desc(),
+                                  HistoricalFileNode.node_id.desc()).limit(need).subquery()
+        live_page = narrow_live.order_by(Document.source_created_at.desc(),
+                                  Document.node_id.desc()).limit(need).subquery()
+        merged = union_all(select(base_page), select(live_page)).subquery()
+        page = db.execute(select(merged).order_by(merged.c.created_at.desc(), merged.c.node_id.desc())
+                          .offset(offset).limit(limit)).all()
+        page_ids = [r.node_id for r in page]
+        page_docs = {doc.node_id: doc for doc in db.scalars(select(Document).where(Document.node_id.in_(page_ids)))} if page_ids else {}
+        historical = {(node.node_id, node.workspace_id): node for node in db.scalars(select(HistoricalFileNode).where(
+                       HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_id.in_([
+                           r.node_id for r in page if r.origin == "baseline"])))} if page else {}
+        rows = []
+        for row in page:
+            node = page_docs.get(row.node_id) if row.origin == "live" else historical.get((row.node_id, row.workspace_id))
+            if node:
+                rows.append(SimpleNamespace(node_id=row.node_id, workspace_id=row.workspace_id, created_at=row.created_at,
+                            name=node.name, extension=node.extension, url=node.url,
+                            creator=node.uploader_key if row.origin == "live" else node.creator_user_id))
+        if not query and not uploader:
+            base = base.with_hint(HistoricalFileNode,
+                                 "FORCE INDEX (ix_hfn_file_page_cover)" if month else "FORCE INDEX (ix_hfn_file_count_cover)", "mysql")
+            live = live.with_hint(Document, "FORCE INDEX (ix_documents_current_cover)", "mysql")
+        if not any((workspace_id, query, month, department, uploader)):
+            total = inventory["baseline_total"] + inventory["live_total"]
+        else:
+            total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
+                    (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
     ids = [r.node_id for r in rows]
-    docs = {d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {}
-    latest_review: dict[str, ReviewInstance] = {}
-    if ids:
-        for rv in db.scalars(select(ReviewInstance).where(ReviewInstance.node_id.in_(ids))
-                             .order_by(ReviewInstance.created_at.desc())):
-            latest_review.setdefault(rv.node_id, rv)
+    docs = page_docs if not folder else ({d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {})
+    latest_review, _ = _latest_reviews(db, ids)
     creators = {r.creator for r in rows if r.creator and r.node_id not in docs}
     emp = {e.user_id: e for e in db.scalars(select(EmployeeMap).where(EmployeeMap.user_id.in_(creators)))} if creators else {}
     items = []
@@ -544,6 +595,26 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     return {"total": total, "offset": offset, "limit": limit, "snapshot_id": snapshot, "items": items}
 
 
+def file_inventory(db: Session, snapshot: str = ""):
+    """Small local source cache: baseline-only IDs and live count, not bodies.
+
+    Bound IDs to 10k; a larger gap falls back to regular SQL pagination rather
+    than filling RAM/JSON with hundreds of thousands of identifiers.
+    """
+    snapshot = snapshot or metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    inactive = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
+    stmt = select(HistoricalFileNode.node_id).outerjoin(Document,
+            Document.node_id == HistoricalFileNode.node_id).where(
+            HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type == "file",
+            HistoricalFileNode.workspace_id.not_in(inactive), Document.node_id.is_(None))
+    ids = list(db.scalars(stmt.limit(10001)))
+    total = len(ids) if len(ids) <= 10000 else (db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    live_count = db.scalar(select(func.count()).select_from(Document).where(
+        Document.is_folder == false(), Document.is_deleted == false(), Document.workspace_id.not_in(inactive))) or 0
+    return {"snapshot": snapshot, "baseline_ids": ids if len(ids) <= 10000 else None,
+            "baseline_total": total, "live_total": live_count}
+
+
 class NotifyTestRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     title: str = "知识库治理推送测试"
@@ -560,8 +631,9 @@ async def notification_test(payload: NotifyTestRequest):
 
 
 @app.get("/api/v1/reviews")
-def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_review|return)$"),
+def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|return)$"),
                  query: str = "", department: str = "", uploader: str = "",
+                 month: str = Query(default="", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
                  offset: int = Query(default=0, ge=0),
                  limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     stmt = select(ReviewInstance, Document).join(Document, Document.node_id == ReviewInstance.node_id)
@@ -569,6 +641,8 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
         stmt = stmt.where(ReviewInstance.verdict == verdict)
     if query:
         stmt = stmt.where(Document.name.contains(query))
+    if month:  # 文档业务入库月，不是评审实例创建月
+        stmt = stmt.where(Document.source_created_at.startswith(month))
     if department:  # 知识库归属部门
         stmt = stmt.where(Document.workspace_id.in_(
             select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))))
@@ -580,7 +654,8 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
             "items": [{"review_instance_id": r.review_instance_id, "node_id": d.node_id, "document_name": d.name,
                        "workspace_id": d.workspace_id, "uploader_name": d.uploader_name,
                        "department_name": d.department_name, "ai_score": round(r.ai_score, 1),
-                       "verdict": r.verdict, "review_scope": r.review_scope, "trigger": r.trigger,
+                       "document_created_at": d.source_created_at,
+                       "verdict": r.verdict, "genre": r.genre, "tier": r.tier, "review_scope": r.review_scope, "trigger": r.trigger,
                        "rule_version": r.rule_version, "rule_config_ref": r.rule_config_ref,
                        "created_at": r.created_at.isoformat() if r.created_at else None}
                       for r, d in rows]}
@@ -718,7 +793,9 @@ def workspace_detail(workspace_id: str, db: Session = Depends(db_session)):
 
 
 @app.patch("/api/v1/workspaces/{workspace_id}/governance")
-def patch_governance(workspace_id: str, body: GovernancePatch, db: Session = Depends(db_session)):
+def patch_governance(workspace_id: str, body: GovernancePatch, request: Request,
+                     db: Session = Depends(db_session)):
+    require_admin(request)
     ws = db.get(Workspace, workspace_id)
     if not ws: raise HTTPException(404, "知识库不存在")
     ws.owner_department_id, ws.owner_department_name, ws.owner_biz_group_name = body.owner_department_id, body.owner_department_name or "未映射", body.owner_biz_group_name or "未映射"
@@ -733,11 +810,9 @@ def documents(workspace_id: str = "", query: str = "", db: Session = Depends(db_
     stmt = select(Document).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
     if workspace_id: stmt = stmt.where(Document.workspace_id == workspace_id)
     if query: stmt = stmt.where(Document.name.contains(query))
-    items = []
-    for doc in db.scalars(stmt.order_by(Document.discovered_at.desc()).limit(200)).all():
-        review = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == doc.node_id).order_by(ReviewInstance.created_at.desc()))
-        total = db.scalar(select(func.count()).select_from(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)) or 0
-        items.append(document_dict(doc, review, max(0, total - 1)))
+    docs = db.scalars(stmt.order_by(Document.discovered_at.desc()).limit(200)).all()
+    latest, counts = _latest_reviews(db, [doc.node_id for doc in docs])
+    items = [document_dict(doc, latest.get(doc.node_id), max(0, counts.get(doc.node_id, 0) - 1)) for doc in docs]
     return {"items": items}
 
 
@@ -752,11 +827,37 @@ def document_detail(node_id: str, db: Session = Depends(db_session)):
 
 
 @app.post("/api/v1/documents/{node_id}/reviews", status_code=202)
-def enqueue_review(node_id: str, body: ReviewRequest, db: Session = Depends(db_session)):
+def enqueue_review(node_id: str, body: ReviewRequest, request: Request, db: Session = Depends(db_session)):
+    require_admin(request)
+    settings = get_settings()
+    if not settings.review_enabled and not settings.demo_mode:
+        raise HTTPException(423, "评审服务已暂停，不能创建新任务。")
     if not db.get(Document, node_id): raise HTTPException(404, "文档不存在")
-    job = ReviewJob(job_id=str(uuid.uuid4()), node_id=node_id, trigger=body.trigger, requested_by=actor())
+    # Lock the document row so simultaneous clicks cannot queue the same node.
+    db.execute(select(Document.node_id).where(Document.node_id == node_id).with_for_update()).first()
+    job = db.scalar(select(ReviewJob).where(ReviewJob.node_id == node_id,
+                    ReviewJob.status.in_(("pending", "running"))).limit(1))
+    if job:
+        return {"job_id": job.job_id, "status": job.status, "document_body_persistence": "disabled"}
+    if (db.scalar(select(func.count()).select_from(ReviewJob).where(ReviewJob.status.in_(("pending", "running")))) or 0) >= settings.review_queue_limit:
+        raise HTTPException(429, "评审队列已满，请稍后重试。")
+    user = getattr(request.state, "user", None) or {}
+    job = ReviewJob(job_id=str(uuid.uuid4()), node_id=node_id, trigger=body.trigger, requested_by=user.get("union_id") or actor())
     db.add(job); db.commit()
     return {"job_id": job.job_id, "status": job.status, "document_body_persistence": "disabled"}
+
+
+def _latest_reviews(db: Session, ids: list[str]):
+    if not ids:
+        return {}, {}
+    ranked = select(ReviewInstance.review_instance_id,
+                    func.row_number().over(partition_by=ReviewInstance.node_id,
+                        order_by=(ReviewInstance.created_at.desc(), ReviewInstance.review_instance_id.desc())).label("rank"),
+                    func.count().over(partition_by=ReviewInstance.node_id).label("count")).where(
+                        ReviewInstance.node_id.in_(ids)).subquery()
+    rows = db.execute(select(ReviewInstance, ranked.c.count).join(ranked,
+            ranked.c.review_instance_id == ReviewInstance.review_instance_id).where(ranked.c.rank == 1)).all()
+    return {rv.node_id: rv for rv, _ in rows}, {rv.node_id: count for rv, count in rows}
 
 
 @app.get("/api/v1/review-jobs/{job_id}")
@@ -764,13 +865,6 @@ def review_job(job_id: str, db: Session = Depends(db_session)):
     job = db.get(ReviewJob, job_id)
     if not job: raise HTTPException(404, "任务不存在")
     return {"job_id": job.job_id, "status": job.status, "review_instance_id": job.result_review_instance_id, "error_code": job.error_code, "created_at": job.created_at.isoformat(), "finished_at": job.finished_at.isoformat() if job.finished_at else None}
-
-
-@app.post("/api/v1/reviews/{review_instance_id}/decision")
-def review_decision(review_instance_id: str, body: DecisionRequest, db: Session = Depends(db_session)):
-    if not db.get(ReviewInstance, review_instance_id): raise HTTPException(404, "评审实例不存在")
-    db.add(ReviewDecision(review_instance_id=review_instance_id, decision=body.decision, comment=body.comment, reviewer_key=actor())); db.commit()
-    return {"review_instance_id": review_instance_id, "decision": body.decision, "reviewer_key": actor()}
 
 
 def _mask_key(key: str) -> str:
@@ -1131,8 +1225,7 @@ def sync_runs(status: str = "", db: Session = Depends(db_session)):
 
 @app.post("/api/v1/sync-runs", status_code=202, dependencies=[Depends(require_admin)])
 async def start_sync(mode: str = "incremental", db: Session = Depends(db_session)):
-    run = await sync_from_dingtalk(db, get_settings(), mode)
-    return {"run_id": run.run_id, "status": run.status, "error_code": run.error_code, "documents_new": run.documents_new, "documents_changed": run.documents_changed}
+    return await run_watch_now(db)
 
 
 @app.post("/api/v1/watch/run", dependencies=[Depends(require_admin)])
@@ -1140,25 +1233,52 @@ async def run_watch_now(db: Session = Depends(db_session)):
     """On-demand watch cycle (same code path as the worker tick), for testing
     and for ops after adding a workspace to KG_WATCH_WORKSPACES."""
     settings = get_settings()
+    if not settings.full_scan_enabled:
+        raise HTTPException(409, "全量校准已暂停。")
     if not settings.watch_workspaces:
         raise HTTPException(400, "未配置 KG_WATCH_WORKSPACES。")
-    return await run_watch_cycle_async(db, settings)
+    from .scan_scheduler import run_scan_slice_async
+    try:
+        return await run_scan_slice_async(db, settings, force=True)
+    except IntegrationError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v1/diagnostics/api-usage", dependencies=[Depends(require_admin)])
+def api_usage_status(db: Session = Depends(db_session)):
+    from .api_usage import usage_status
+    from .db import ScanCycle, ScanTask
+    settings = get_settings()
+    return {**usage_status(db, settings),
+            "switches": {"full_scan": settings.full_scan_enabled, "audit_pull": settings.audit_pull_enabled,
+                         "bridge": settings.bridge_enabled, "reviews": settings.review_enabled,
+                         "event_tree_walks": settings.bridge_walks_enabled},
+            "scan_days": settings.scan_days,
+            "cycles": [{"month": c.month, "status": c.status} for c in db.scalars(select(ScanCycle)).all()],
+            "scan_tasks": [{"month": t.month, "status": t.status, "attempts": t.attempts,
+                            "error_code": t.error_code} for t in db.scalars(select(ScanTask)).all()]}
 
 
 # Read-only DingTalk proxy endpoints for interactive directory browsing; each request supplies the real operator UnionID.
-@app.get("/api/v1/dingtalk/knowledge-bases")
+def require_live_browse(request: Request):
+    require_admin(request)
+    if not get_settings().live_browse_enabled:
+        raise HTTPException(423, "实时钉钉目录查询已暂停，请使用本地知识库数据。")
+
+
+@app.get("/api/v1/dingtalk/knowledge-bases", dependencies=[Depends(require_live_browse)])
 async def dingtalk_workspaces(operator_id: str, next_token: str = "", max_results: int = 30):
     try: return await DingtalkClient(get_settings()).list_workspaces(operator_id, next_token, max_results)
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
-@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}")
+@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}", dependencies=[Depends(require_live_browse)])
 async def dingtalk_workspace(workspace_id: str, operator_id: str):
     try: return await DingtalkClient(get_settings()).workspace_detail(workspace_id, operator_id)
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
-@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}/nodes")
+@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}/nodes", dependencies=[Depends(require_live_browse)])
 async def dingtalk_nodes(workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 30):
     try: return await DingtalkClient(get_settings()).list_nodes(workspace_id, operator_id, parent_node_id, next_token, max_results)
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
@@ -1210,6 +1330,12 @@ def _static_response(request: Request, path: Path) -> Response:
 @app.get("/")
 def index(request: Request):
     return _static_response(request, ROOT / "static" / "index.html")
+
+
+# Install only after route registration; auth/mutation/config routes are never cached.
+from . import read_cache  # noqa: E402
+read_cache.install(app)
+read_cache.register_source(file_inventory, {"snapshot": ""})
 
 
 @app.get("/{path:path}")

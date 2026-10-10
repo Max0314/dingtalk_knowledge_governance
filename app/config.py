@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", env_prefix="KG_", extra="ignore")
     database_url: str = "sqlite:///./runtime/knowledge_governance.db"
     demo_mode: bool = False
+    # Only local metadata GETs are cached; no DingTalk/BI calls on refresh.
+    read_cache_enabled: bool = True
+    read_cache_ttl_seconds: int = Field(default=600, ge=30, le=600)
+    read_cache_max_age_seconds: int = Field(default=900, ge=60, le=900)
+    live_browse_enabled: bool = False
     default_actor: str = "knowledge-governance-admin"
     public_base_url: str = "http://localhost:39021"
     dingtalk_app_key: str = Field(default="", validation_alias="DINGTALK_APP_KEY")
@@ -50,11 +55,26 @@ class Settings(BaseSettings):
     # cannot starve them (2026-08-13 finding). One at a time: a single big
     # library can already take tens of minutes.
     watch_slice_size: int = 1
-    # Org-wide full-scan days of month (Asia/Shanghai). Continuous rotation is
-    # only for the initial seeding; afterwards scans run on these days, change
-    # detection in between comes from the 10-minute audit-event pull + bridge
-    # (2026-08-14 user decision: full scans twice a month, days 10 and 24).
-    scan_days: str = "10,24"
+    # Monthly calibration day (Asia/Shanghai). Legacy comma lists use the
+    # earliest day only; persistent scan tasks prevent repeating good spaces.
+    scan_days: str = "10"
+    # Starting containers must not implicitly resume paid background work.
+    full_scan_enabled: bool = False
+    review_enabled: bool = False
+    review_queue_limit: int = Field(default=1000, ge=1, le=10000)
+    scan_max_attempts: int = Field(default=3, ge=1, le=3)
+    scan_retry_seconds: int = Field(default=900, ge=60)
+    scan_max_api_calls: int = Field(default=60000, ge=1)
+    # HTTP attempts, shared by all processes/restarts; not billing receipts.
+    dingtalk_daily_limit: int = Field(default=65000, ge=1)
+    dingtalk_monthly_limit: int = Field(default=100000, ge=1)
+    dingtalk_nodes_monthly_limit: int = Field(default=60000, ge=1)
+    dingtalk_search_daily_limit: int = Field(default=500, ge=1)
+    dingtalk_search_monthly_limit: int = Field(default=10000, ge=1)
+    dingtalk_audit_daily_limit: int = Field(default=1000, ge=1)
+    bridge_walks_enabled: bool = False
+    bridge_locator_max_attempts: int = Field(default=3, ge=1, le=3)
+    bridge_locator_retry_seconds: int = Field(default=600, ge=60)
     # Go-live cutoff, ISO time with timezone (e.g. 2026-08-13T18:30+08:00; a
     # bare date = that day 00:00 UTC). Seed walks absorb stock silently EXCEPT
     # files created OR updated at/after this moment: an upload into a
@@ -73,8 +93,7 @@ class Settings(BaseSettings):
     audit_pull_interval_seconds: int = 600
     # Recipient of the audit-silence alarm (workday hours, 30min of no events).
     audit_alert_user_id: str = ""
-    # Audit-event -> workspace bridge: wiki write events ring the doorbell and
-    # a debounced targeted walk of the touched workspace does node-exact diffs.
+    # Audit-event -> single-node locator. Production never falls back to a tree walk.
     bridge_enabled: bool = False
     # Audit ingestion can stay at a conservative 10-minute cadence, but rows
     # already in the database must not wait another 10 minutes for each fair

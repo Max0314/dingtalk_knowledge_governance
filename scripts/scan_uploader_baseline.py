@@ -30,7 +30,7 @@ from sqlalchemy import delete
 
 from app.config import get_settings
 from app.db import HistoricalFileNode, HistoricalSnapshot, SessionLocal, UploaderMonthStat, init_db, utcnow
-from app.integrations import DingtalkClient, normalize_node
+from app.integrations import DingtalkClient, IntegrationError, normalize_node
 
 SNAPSHOT_ID = "wiki-uploader-2026-08-06"
 STATE_PATH = Path("/app/uploader_scan_state.json")
@@ -56,14 +56,11 @@ async def _get_retry(client: DingtalkClient, path: str, params: dict) -> dict:
     last = ""
     for attempt in range(RETRIES):
         try:
-            token = await client._token_value()
-            async with httpx.AsyncClient(timeout=25) as http:
-                response = await http.get(f"https://api.dingtalk.com/v2.0{path}",
-                                          params={k: v for k, v in params.items() if v not in (None, "")},
-                                          headers={"x-acs-dingtalk-access-token": token})
-            if response.status_code == 200:
-                return response.json()
-            last = f"HTTP {response.status_code} {response.text[:120]}"
+            return await client._get(path, params)
+        except IntegrationError as exc:
+            if exc.status_code in (400, 401, 403, 429):
+                raise
+            last = exc.code
         except httpx.HTTPError as exc:
             last = f"{type(exc).__name__}"
         await asyncio.sleep(1.5 * (attempt + 1))
@@ -72,7 +69,7 @@ async def _get_retry(client: DingtalkClient, path: str, params: dict) -> dict:
 
 async def fetch_nodes(client: DingtalkClient, operator: str, workspace_id: str, parent: str, next_token: str) -> dict:
     return await _get_retry(client, "/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator,
-                                                    "parentNodeId": parent, "nextToken": next_token, "maxResults": 100})
+                                                    "parentNodeId": parent, "nextToken": next_token, "maxResults": 30})
 
 
 async def scan_workspace(client: DingtalkClient, operator: str, space: dict, state: dict) -> None:
@@ -141,6 +138,8 @@ async def scan_workspace(client: DingtalkClient, operator: str, space: dict, sta
 
 async def main() -> None:
     settings = get_settings()
+    if not settings.full_scan_enabled or "--approve-paid-baseline" not in sys.argv:
+        raise RuntimeError("Legacy baseline disabled; use the persistent monthly scan scheduler. Explicit approval required.")
     client = DingtalkClient(settings)
     operator = settings.dingtalk_sync_operator_id
     init_db()

@@ -3,7 +3,9 @@
 # is from this user's assigned range 39020-39029.
 services:
   api:
-    build: .
+    build:
+      context: .
+      args: {VCS_REF: "${KG_RELEASE_SHA:-development}"}
     env_file: .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
@@ -14,15 +16,24 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:39021/api/health', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:39021/api/ready', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
     restart: unless-stopped
+    mem_limit: 768m
+    cpus: 2.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
   worker:
-    build: .
+    profiles: ["background"]
+    build:
+      context: .
+      args: {VCS_REF: "${KG_RELEASE_SHA:-development}"}
     command: ["python", "-m", "app.worker"]
     env_file: .env
     environment:
@@ -30,9 +41,18 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
   watcher:
-    build: .
+    profiles: ["background"]
+    build:
+      context: .
+      args: {VCS_REF: "${KG_RELEASE_SHA:-development}"}
     command: ["python", "-m", "app.watcher"]
     env_file: .env
     environment:
@@ -40,3 +60,9 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.5
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

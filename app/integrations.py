@@ -9,7 +9,9 @@ from typing import Any
 from urllib.parse import urlsplit
 import httpx
 
+from . import genre as genre_mod
 from .config import Settings
+from .api_usage import reserve_call
 
 
 class IntegrationError(RuntimeError):
@@ -33,6 +35,7 @@ class DingtalkClient:
         if self._token and self._token_expires_at > time.time() + 30:
             return self._token
         async with httpx.AsyncClient(timeout=15) as client:
+            reserve_call(self.settings, "oauth.accessToken")
             response = await client.post(
                 "https://api.dingtalk.com/v1.0/oauth2/accessToken",
                 json={"appKey": self.settings.dingtalk_app_key, "appSecret": self.settings.dingtalk_app_secret},
@@ -47,6 +50,8 @@ class DingtalkClient:
         return self._token
 
     async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        interface = {"/wiki/nodes": "wiki.nodes", "/wiki/workspaces": "wiki.workspaces"}.get(path, "wiki.workspaceDetail")
+        reserve_call(self.settings, interface)
         token = await self._token_value()
         # httpx serializes None as an empty string; DingTalk rejects e.g. nextToken= with HTTP 400.
         cleaned = {key: value for key, value in params.items() if value not in (None, "")}
@@ -71,9 +76,8 @@ class DingtalkClient:
     async def list_nodes(self, workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 100) -> dict[str, Any]:
         if not parent_node_id:
             parent_node_id = (await self.workspace_detail(workspace_id, operator_id)).get("root_node_id", "")
-        # The documented page cap is 30, but the API accepts 100 (verified live
-        # 2026-08-06) — a 70% cut in enumeration quota.
-        payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 100))})
+        # Respect the provider's documented page cap; all pages share budgets.
+        payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 30))})
         items = payload.get("nodes", payload.get("data", []))
         return {"items": [normalize_node(item) for item in items], "next_token": payload.get("nextToken", ""), "parent_node_id": parent_node_id}
 
@@ -81,6 +85,7 @@ class DingtalkClient:
         """unionId -> userId via the legacy contact endpoint (same access token)."""
         if not union_id:
             return ""
+        reserve_call(self.settings, "contact.getByUnionId")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -99,6 +104,7 @@ class DingtalkClient:
         if not user_ids:
             raise IntegrationError("dingtalk_no_recipient", "缺少接收人 userId。", 400)
         robot_code = self.settings.robot_code or self.settings.dingtalk_app_key
+        reserve_call(self.settings, "robot.batchSend")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -117,6 +123,7 @@ class DingtalkClient:
         """Storage-layer permission roster for one dentry (a KB root node gives
         the workspace's member list with roles). Endpoint per official SDK:
         POST /v2.0/storage/spaces/dentries/{uuid}/permissions/query."""
+        reserve_call(self.settings, "storage.permissions")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -144,6 +151,7 @@ class DingtalkClient:
         carry dentryUuid — which equals the wiki nodeId — plus name and path."""
         if not keyword or not operator_id:
             return []
+        reserve_call(self.settings, "storage.search")
         token = await self._token_value()
         option: dict[str, Any] = {"maxResults": max(1, min(max_results, 50))}
         if space_ids:
@@ -165,6 +173,7 @@ class DingtalkClient:
         """POST /v2.0/wiki/nodes/batchQuery — nodeIds -> full nodes incl. workspaceId."""
         if not node_ids:
             return []
+        reserve_call(self.settings, "wiki.batchQuery")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -190,6 +199,7 @@ class DingtalkClient:
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=30) as client:
             try:
+                reserve_call(self.settings, "storage.downloadInfo")
                 response = await client.post(
                     f"https://api.dingtalk.com/v1.0/storage/spaces/{space_id}/dentries/{numeric_dentry_id}/downloadInfos/query",
                     params={"unionId": operator},
@@ -294,6 +304,7 @@ class DingtalkClient:
 
         async with httpx.AsyncClient(timeout=min(timeout_seconds, 60.0), follow_redirects=False) as client:
             try:
+                reserve_call(self.settings, "doc.exportSubmit")
                 response = await client.post(
                     "https://api.dingtalk.com/v2.0/doc/me/export/submit",
                     headers=headers,
@@ -334,6 +345,7 @@ class DingtalkClient:
                 if time.monotonic() >= deadline:
                     break
                 try:
+                    reserve_call(self.settings, "doc.exportQuery")
                     response = await client.get(
                         "https://api.dingtalk.com/v2.0/doc/me/export/task/query",
                         headers=headers,
@@ -415,6 +427,7 @@ class DingtalkClient:
         template = self.settings.dingtalk_doc_content_url_template
         if not template:
             return ""
+        reserve_call(self.settings, "doc.contentGateway")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=40) as client:
             response = await client.get(template.format(node_id=node_id), headers={"x-acs-dingtalk-access-token": token})
@@ -442,6 +455,58 @@ class BiCenterClient:
         body = response.json()
         data = body.get("data", {}) or {}
         return data.get("results", data.get("items", body.get("items", [])))
+
+    async def employee_directory_month_page(self, month_key: str, limit: int = 500,
+                                            offset: int = 0) -> dict[str, Any]:
+        """Read one authoritative monthly directory page from bi_center.
+
+        bi_center owns snapshot fallback and the ``isRdSystem`` policy.  The
+        caller stores the returned resolved month instead of reimplementing
+        either rule locally.
+        """
+        if not self.configured():
+            raise IntegrationError(
+                "bi_center_not_configured",
+                "未配置 BI_CENTER_BASE_URL 或 BI_CENTER_INTERNAL_TOKEN。",
+                503,
+            )
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{self.settings.bi_center_base_url.rstrip('/')}/api/internal/v1/employee-directory/monthly",
+                params={"month": month_key, "limit": max(1, min(limit, 500)), "offset": max(0, offset)},
+                headers={"Authorization": f"Bearer {self.settings.bi_center_internal_token}"},
+            )
+        if response.is_error:
+            message = "bi_center 月度组织目录读取失败。"
+            try:
+                detail = response.json().get("detail")
+                if isinstance(detail, dict):
+                    message = str(detail.get("message") or message)
+                elif detail:
+                    message = str(detail)
+            except (ValueError, AttributeError):
+                pass
+            raise IntegrationError(
+                "bi_center_monthly_directory_failed",
+                f"{message}（HTTP {response.status_code}）",
+                response.status_code,
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise IntegrationError(
+                "bi_center_monthly_directory_invalid",
+                "bi_center 月度组织目录响应不是有效 JSON。",
+            ) from exc
+        if isinstance(body, dict) and body.get("code") not in (None, 0):
+            raise IntegrationError(
+                "bi_center_monthly_directory_failed",
+                str(body.get("message") or "bi_center 月度组织目录读取失败。"),
+            )
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        if not isinstance(data, dict):
+            raise IntegrationError("bi_center_monthly_directory_invalid", "bi_center 月度组织目录响应格式无效。")
+        return data
 
     async def check(self) -> dict[str, Any]:
         if not self.configured():
@@ -481,53 +546,50 @@ async def model_connection_check(config: dict[str, Any], settings: Settings) -> 
         return {"status": "failed", "message": "模型服务连接失败。"}
 
 
-GENRE_RUBRICS = """· 规范制度：适用范围明确、版本与生效信息完整、条款可执行不含糊、与现行流程无明显冲突
-· 方案设计：背景与目标清楚、方案对比或选型依据充分、实施计划可落地、风险与对策
-· 测试用例：前置条件与环境说明、步骤可复现、每步预期结果与判定标准明确、覆盖点清晰有标识
-· 测试报告：结论先行且明确、测试环境与范围交代完整、数据支撑结论、遗留问题与风险如实列出
-· 操作手册：步骤完整可跟随、关键处有示例或截图说明、异常情况与回退处理、面向读者无前置知识断层
-· 会议纪要：决议明确不含糊、每项决议有责任人与时限、遗留议题清楚
-· 数据报告：数据来源与统计口径说明、结论与数据一致、图表可读
-· 其他知识文档：按通用四维从严评估"""
+FORM_NOTES = {
+    "sheet": "这是一份电子表格，正文是提取出的单元格文本，顺序可能与表格布局不同。",
+    "slide": "这是一份演示文稿，正文是逐页提取的文字。",
+}
 
-JSON_CONTRACT = ("只返回 JSON："
-                 "{\"genre\":\"文体\",\"score\":0-100,"
-                 "\"dimensions\":{\"要素完整\":0-15,\"准确清晰\":0-15,\"结构可读\":0-15,\"规范性\":0-15,\"文体专属\":0-40},"
-                 "\"findings\":[{\"rule\":\"维度名\",\"deduction\":整数,\"message\":\"不引用原文的具体问题与可执行的整改建议\"}]}。"
-                 "不要复述或引用文档原文。")
+
+def _genre_menu() -> str:
+    """文体清单与要点一律由 app.genre 生成。两处各抄一份就会漂移——组织里
+    五份"部门专属"文档标准正文一字不差，就是抄完再没人同步的结果。"""
+    return "\n".join("· " + name + "（" + genre_mod.GENRE_TIERS[name] + " 档）：" + rubric
+                     for name, rubric in genre_mod.GENRE_RUBRICS.items())
+
+
+JSON_CONTRACT = ('只返回 JSON：{"genre":"文体","score":0-100,'
+                 '"dimensions":{"要素完整":0-25,"准确清晰":0-25,"结构可读":0-25,"文体专属":0-25},'
+                 '"findings":[{"rule":"维度名","deduction":整数,'
+                 '"message":"不引用原文的具体问题与可执行的整改建议"}]}。'
+                 '不要复述或引用文档原文。')
 
 
 def build_review_prompt(file_class: str, filename: str) -> str:
-    """Genre-aware two-stage review prompt. The model classifies the genre
-    first, then scores against that genre's rubric — a test case is judged as
-    a test case, not as a missing-abstract essay."""
-    if file_class == "sheet":
-        return ("你是企业知识库评审员。这是一份电子表格（内容为提取出的单元格文本，顺序可能与表格布局不同）。"
-                "文体固定为「电子表格」。评分（总分100）：表头与字段命名清晰完整(0-30)、必要的说明或注释(0-25)、"
-                "术语与格式一致性(0-25)、文件命名规范(0-20)。"
-                "【不要】因缺少摘要、章节结构、版本历史等文档特有要素扣分。"
-                "只返回 JSON：{\"genre\":\"电子表格\",\"score\":0-100,"
-                "\"dimensions\":{\"表头与字段\":0-30,\"说明与注释\":0-25,\"一致性\":0-25,\"命名规范\":0-20},"
-                "\"findings\":[{\"rule\":\"维度名\",\"deduction\":整数,\"message\":\"不引用原文的具体问题与整改建议\"}]}。"
-                "不要复述或引用文档原文。文件名：" + filename)
-    if file_class == "slide":
-        return ("你是企业知识库评审员。这是一份演示文稿（内容为逐页提取的文字）。文体固定为「演示文稿」。"
-                "评分（总分100）：逻辑主线清晰(0-30)、每页要点明确不堆砌(0-25)、标题与层次结构(0-25)、命名与用语规范(0-20)。"
-                "【不要】因缺少摘要、版本历史等文档特有要素扣分。"
-                "只返回 JSON：{\"genre\":\"演示文稿\",\"score\":0-100,"
-                "\"dimensions\":{\"逻辑主线\":0-30,\"每页要点\":0-25,\"层次结构\":0-25,\"规范性\":0-20},"
-                "\"findings\":[{\"rule\":\"维度名\",\"deduction\":整数,\"message\":\"不引用原文的具体问题与整改建议\"}]}。"
-                "不要复述或引用文档原文。文件名：" + filename)
-    return ("你是企业知识库评审员。请先判定文档文体，再按对应标准评分。\n"
-            "第一步·文体判定（从下列选一）：规范制度 / 方案设计 / 测试用例 / 测试报告 / 操作手册 / 会议纪要 / 数据报告 / 其他知识文档\n"
-            "第二步·评分（总分100 = 通用60 + 文体专属40）：\n"
-            "通用四维（各15分）：要素完整（该文体应有的要素是否齐全）、准确清晰（表述明确、术语一致）、"
-            "结构可读（组织合理、便于查阅）、规范性（命名、版本信息、格式统一）。\n"
-            "文体专属要点（40分，按判定的文体取用）：\n" + GENRE_RUBRICS + "\n"
-            + JSON_CONTRACT + "文件名：" + filename)
+    """两段式提词：先判文体，再按该文体的要点评**内容质量**。
+
+    形式合规（版本号、文件命名、段落长度、日期与单位写法）由确定性规则引擎
+    单独计分，这里明确要求模型不要重复扣——两边职责不重叠，合成分才解释得清。
+    """
+    parts = ["你是企业知识库评审员。"]
+    note = FORM_NOTES.get(file_class, "")
+    if note:
+        parts.append(note)
+    parts.append("第一步·文体判定，从下列文体中选一个最贴切的（括号内为约束档位）：")
+    parts.append(_genre_menu())
+    parts.append("第二步·按该文体的要点评内容质量（总分 100，四维各 25）："
+                 "要素完整（该文体应有的要素是否齐全）、准确清晰（表述明确、术语一致、不自相矛盾）、"
+                 "结构可读（组织合理、便于查阅）、文体专属（上表中该文体的要点）。")
+    parts.append("注意：文件命名、版本号格式、段落长度、日期与单位写法由规则引擎另行判定，"
+                 "不要因这些形式问题扣分；也不要因某文体本就不需要的要素（如会议纪要没有摘要）扣分。")
+    parts.append(JSON_CONTRACT)
+    parts.append("文件名：" + filename)
+    return "\n".join(parts)
 
 
-ADVISORY_GENRES = ("测试用例", "测试报告", "会议纪要", "数据报告")
+# ADVISORY_GENRES 已删除：不适用维度现在由 app.genre 的档位机制在评分前
+# 直接排除，而不是先扣分再标注"仅提示"。
 
 
 async def model_score_content(config: dict[str, Any], content: str, filename: str,

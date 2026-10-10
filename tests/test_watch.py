@@ -286,9 +286,9 @@ def test_scan_calendar_and_decision(settings):
     from app.db import Workspace
 
     assert service.current_scan_due(settings, date(2026, 8, 14)) == "2026-08-10"
-    assert service.current_scan_due(settings, date(2026, 8, 24)) == "2026-08-24"
-    assert service.current_scan_due(settings, date(2026, 8, 5)) == "2026-07-24"
-    assert service.current_scan_due(settings, date(2026, 1, 3)) == "2025-12-24"
+    assert service.current_scan_due(settings, date(2026, 8, 24)) == "2026-08-10"
+    assert service.current_scan_due(settings, date(2026, 8, 5)) == "2026-07-10"
+    assert service.current_scan_due(settings, date(2026, 1, 3)) == "2025-12-10"
 
     with SessionLocal() as db:
         pending = db.scalars(select(Workspace.workspace_id).where(Workspace.watch_seeded.is_(False))).all()

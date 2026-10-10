@@ -21,7 +21,8 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, HistoricalSnapshot, UploaderMonthStat, Workspace
+from .db import (Document, EmployeeMap, EmployeeOrgMonth, HistoricalFileNode,
+                 HistoricalSnapshot, ReviewInstance, UploaderMonthStat, Workspace)
 
 
 def robot_ids() -> set[str]:
@@ -30,9 +31,16 @@ def robot_ids() -> set[str]:
 # A person creating this many files in one calendar day is doing a migration,
 # not daily knowledge work. Robots are bulk at any volume.
 PERSON_DAY_BULK_MIN = 200
-CACHE_TTL_SECONDS = 60
+CACHE_TTL_SECONDS = 300
+CACHE_MAX_AGE_SECONDS = 600
 
 _cache: dict[str, Any] = {"stamp": None, "at": 0.0, "value": None}
+
+
+class OrganizationScopeCacheMissingError(RuntimeError):
+    def __init__(self, missing_months: list[str]):
+        super().__init__("研发体系月度组织缓存未就绪。")
+        self.missing_months = missing_months
 
 
 def _change_stamp(db: Session) -> tuple:
@@ -107,32 +115,32 @@ def _collect(db: Session) -> dict[str, Any]:
                                           .group_by(Document.workspace_id)):
         space_totals[workspace_id] += count
 
-    base_month = func.substr(HistoricalFileNode.source_created_at, 1, 7)
     base_day = func.substr(HistoricalFileNode.source_created_at, 1, 10)
-    live_month = func.substr(Document.source_created_at, 1, 7)
     live_day = func.substr(Document.source_created_at, 1, 10)
     dated_base = base_where + (func.length(HistoricalFileNode.source_created_at) >= 10,)
     dated_live = (func.length(Document.source_created_at) >= 10,)
 
-    space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
-    for workspace_id, month, count in db.execute(
-            select(HistoricalFileNode.workspace_id, base_month, func.count()).where(*dated_base)
-            .group_by(HistoricalFileNode.workspace_id, base_month)):
-        space_months[workspace_id][month] += count
-    for workspace_id, month, count in db.execute(
-            live_agg(Document.workspace_id, live_month).where(*dated_live)
-            .group_by(Document.workspace_id, live_month)):
-        space_months[workspace_id][month] += count
+    # Keep the joint dimensions once, then derive both existing aggregates.
+    # This replaces four GROUP BY scans (workspace/month + creator/day for two
+    # source arms) with two.  The joint view is what lets an organization-wide
+    # chart filter by *knowledge-base ownership* without confusing it with the
+    # uploader's department.
+    workspace_creator_day = collections.Counter()  # (workspace, creator, YYYY-MM-DD) -> files
+    for workspace_id, creator, day, count in db.execute(
+            select(HistoricalFileNode.workspace_id, HistoricalFileNode.creator_user_id,
+                   base_day, func.count()).where(*dated_base)
+            .group_by(HistoricalFileNode.workspace_id, HistoricalFileNode.creator_user_id, base_day)):
+        workspace_creator_day[(workspace_id, creator or "", day)] += count
+    for workspace_id, creator, day, count in db.execute(
+            live_agg(Document.workspace_id, Document.uploader_key, live_day).where(*dated_live)
+            .group_by(Document.workspace_id, Document.uploader_key, live_day)):
+        workspace_creator_day[(workspace_id, creator or "", day)] += count
 
+    space_months: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     creator_day = collections.Counter()  # (creator, YYYY-MM-DD) -> files
-    for creator, day, count in db.execute(
-            select(HistoricalFileNode.creator_user_id, base_day, func.count()).where(*dated_base)
-            .group_by(HistoricalFileNode.creator_user_id, base_day)):
-        creator_day[(creator or "", day)] += count
-    for creator, day, count in db.execute(
-            live_agg(Document.uploader_key, live_day).where(*dated_live)
-            .group_by(Document.uploader_key, live_day)):
-        creator_day[(creator or "", day)] += count
+    for (workspace_id, creator, day), count in workspace_creator_day.items():
+        space_months[workspace_id][day[:7]] += count
+        creator_day[(creator, day)] += count
 
     robots = robot_ids()
     monthly = collections.Counter()
@@ -148,6 +156,7 @@ def _collect(db: Session) -> dict[str, Any]:
         "monthly": dict(monthly),
         "bulk_by_month": dict(bulk_by_month),
         "creator_day": dict(creator_day),
+        "workspace_creator_day": dict(workspace_creator_day),
         "robots": robots,
         "space_totals": dict(space_totals),
         "space_months": {ws: dict(months) for ws, months in space_months.items()},
@@ -168,38 +177,36 @@ def _refresh_in_background() -> None:
     from .db import SessionLocal
     try:
         with SessionLocal() as db:
-            stamp = _change_stamp(db)
             value = _collect(db)
-        _cache.update(stamp=stamp, at=time.monotonic(), value=value)
+        _cache.update(stamp=None, at=time.monotonic(), value=value)
+    except Exception:
+        # Leave the timestamp untouched; stale data must expire even on errors.
+        pass
     finally:
         _refresh_lock.release()
 
 
 def collected(db: Session) -> dict[str, Any]:
-    """Stale-while-revalidate：请求路径只读缓存，过期时返回旧值并由后台线程
-    刷新——任何页面都不因指标重算而卡住。冷启动的第一次同步计算（SQL 聚合
-    后为亚秒级）。
+    """Five-minute refresh, ten-minute hard bound; cold callers coalesce.
 
-    TTL 先判、变更戳后判：`_change_stamp` 本身是两次 COUNT(*) 全表扫描（基线
-    表约 28 万行），而它原先跑在每一次读缓存之前——守卫比它保护的缓存还贵，
-    单次总览请求要为此扫 6 次表。命中窗口内现在完全不发 SQL。
-
-    可观测行为不变：戳变化时旧逻辑同样只是"触发后台刷新 + 继续返回旧值"，
-    差别仅是刷新时机推迟到 TTL 边界。"""
+    Never extend freshness based on COUNT: edits and soft deletions do not
+    change it. Warm requests perform no SQL and errors never renew freshness.
+    """
     now = time.monotonic()
     if _cache["value"] is not None and now - _cache["at"] < CACHE_TTL_SECONDS:
         return _cache["value"]
-    stamp = _change_stamp(db)
-    if _cache["value"] is not None:
-        if _cache["stamp"] == stamp:  # 没变：续期，不重算
-            _cache["at"] = now
-            return _cache["value"]
+    if _cache["value"] is not None and now - _cache["at"] < CACHE_MAX_AGE_SECONDS:
         if _refresh_lock.acquire(blocking=False):
             threading.Thread(target=_refresh_in_background, daemon=True).start()
         return _cache["value"]
-    value = _collect(db)
-    _cache.update(stamp=stamp, at=now, value=value)
-    return value
+    # Counts are not a revision: edits/soft deletions leave counts unchanged.
+    # Recompute periodically; serialize cold/hard-expired callers as well.
+    with _refresh_lock:
+        if _cache["value"] is not None and time.monotonic() - _cache["at"] < CACHE_TTL_SECONDS:
+            return _cache["value"]
+        value = _collect(db)
+        _cache.update(stamp=None, at=time.monotonic(), value=value)
+        return value
 
 
 def snapshot_context(db: Session) -> dict[str, Any]:
@@ -242,11 +249,68 @@ def monthly_increments(db: Session, year: str = "") -> dict[str, Any]:
     }
 
 
+def _latest_review_scores_by_period(db: Session, level: str, year: str = "", month: str = "",
+                                    creators: set[str] | None = None,
+                                    workspace_ids: set[str] | None = None) -> dict[str, tuple[float, int]]:
+    """Average the latest AI review per document by its DingTalk entry period.
+
+    Review history is immutable, so reruns must not give one document extra
+    weight.  Unreviewed documents are intentionally absent rather than treated
+    as zero.  The period belongs to the document's ``source_created_at`` (the
+    same business clock as the increment tree), not the review execution time.
+    """
+    period_length = {"year": 4, "month": 7, "day": 10}[level]
+    latest_reviews = (
+        select(
+            ReviewInstance.node_id.label("node_id"),
+            ReviewInstance.ai_score.label("ai_score"),
+            func.row_number().over(
+                partition_by=ReviewInstance.node_id,
+                order_by=(ReviewInstance.created_at.desc(),
+                          ReviewInstance.review_instance_id.desc()),
+            ).label("rank"),
+        )
+        .subquery()
+    )
+    period = func.substr(Document.source_created_at, 1, period_length)
+    conditions = [
+        latest_reviews.c.rank == 1,
+        Document.is_folder.is_(False),
+        Document.is_deleted.is_(False),
+        Workspace.is_active.is_(True),
+        func.length(Document.source_created_at) >= period_length,
+    ]
+    if month:
+        conditions.append(Document.source_created_at.like(f"{month}%"))
+    elif year:
+        conditions.append(Document.source_created_at.like(f"{year}%"))
+    if creators is not None:
+        conditions.append(Document.uploader_key.in_(creators))
+    if workspace_ids is not None:
+        conditions.append(Document.workspace_id.in_(workspace_ids))
+    statement = (
+        select(period.label("period"), func.avg(latest_reviews.c.ai_score), func.count())
+        .select_from(Document)
+        .join(latest_reviews, latest_reviews.c.node_id == Document.node_id)
+        .join(Workspace, Workspace.workspace_id == Document.workspace_id)
+        .where(*conditions)
+        .group_by(period)
+    )
+    return {
+        key: (round(float(average), 1), int(count))
+        for key, average, count in db.execute(statement)
+        if key and average is not None
+    }
+
+
 def increments_tree(db: Session, year: str = "", month: str = "", department: str = "",
-                    biz_group: str = "", person: str = "") -> dict[str, Any]:
-    """Year -> month -> day drill over the cached creator-day counters — no
-    extra SQL beyond the shared 60-second collect cache (plus one small
-    employee_map read when a people filter is active)."""
+                    biz_group: str = "", person: str = "", scope: str = "") -> dict[str, Any]:
+    """Year -> month -> day drill over the cached increment counters.
+
+    ``rd_system`` is a knowledge-base ownership scope.  Uploader organization
+    remains available as an explicit people filter, but never determines
+    whether a department-owned knowledge base enters the scope.
+    """
     data = collected(db)
     robots = data["robots"]
     creators: set[str] | None = None
@@ -260,8 +324,34 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
         creators = {row.user_id for row in picked}
         parts = [part for part in (department, biz_group, person) if part]
         filter_label = " / ".join(parts) + f"（{len(picked)} 人）"
+    rd_workspace_ids: set[str] = set()
+    if scope == "rd_system":
+        latest_scope_month = db.scalar(select(func.max(EmployeeOrgMonth.month))) or ""
+        if not latest_scope_month:
+            raise OrganizationScopeCacheMissingError([])
+        rd_departments = set(db.scalars(
+            select(EmployeeOrgMonth.department_name).where(
+                EmployeeOrgMonth.month == latest_scope_month,
+                EmployeeOrgMonth.is_rd_system.is_(True),
+                EmployeeOrgMonth.department_name != "",
+            ).distinct()
+        ).all())
+        if not rd_departments:
+            raise OrganizationScopeCacheMissingError([latest_scope_month])
+        rd_workspace_ids = set(db.scalars(
+            select(Workspace.workspace_id).where(
+                Workspace.is_active.is_(True),
+                Workspace.owner_department_name.in_(rd_departments),
+            )
+        ).all())
     buckets: dict[str, list[int]] = {}
-    for (creator, day), count in data["creator_day"].items():
+    source_rows = (
+        ((creator, day, count) for (workspace_id, creator, day), count
+         in data["workspace_creator_day"].items() if workspace_id in rd_workspace_ids)
+        if scope == "rd_system"
+        else ((creator, day, count) for (creator, day), count in data["creator_day"].items())
+    )
+    for creator, day, count in source_rows:
         if creators is not None and creator not in creators:
             continue
         if month:
@@ -276,14 +366,26 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
             key = day[:4]
         bucket = buckets.setdefault(key, [0, 0])
         bucket[0] += count
-        if creator in robots or count >= PERSON_DAY_BULK_MIN:
+        # A person's bulk signature is organization-wide for the day; the
+        # scoped workspace count alone must not downgrade part of a migration.
+        person_day_total = data["creator_day"].get((creator, day), 0)
+        if creator in robots or person_day_total >= PERSON_DAY_BULK_MIN:
             bucket[1] += count
     level = "day" if month else ("month" if year else "year")
     keys = sorted(buckets, reverse=(level == "year"))  # recent years on top
+    scores = _latest_review_scores_by_period(
+        db, level, year=year, month=month, creators=creators,
+        workspace_ids=rd_workspace_ids if scope == "rd_system" else None,
+    )
     return {"level": level, "year": year, "month": month, "filter_label": filter_label,
+            "scope": scope,
+            "scope_label": "研发体系七部门（知识库归属口径）" if scope == "rd_system" else "全部部门",
             "person_day_bulk_min": PERSON_DAY_BULK_MIN,
             "rows": [{"key": key, "total": buckets[key][0], "bulk": buckets[key][1],
-                      "routine": buckets[key][0] - buckets[key][1]} for key in keys]}
+                      "routine": buckets[key][0] - buckets[key][1],
+                      "average_ai_score": scores[key][0] if key in scores else None,
+                      "scored_documents": scores[key][1] if key in scores else 0}
+                     for key in keys]}
 
 
 def _scan_status(workspace_id: str, space_totals: dict, live_counts: dict, excluded) -> str:

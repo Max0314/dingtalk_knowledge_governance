@@ -49,7 +49,8 @@ def env(monkeypatch):
         stale_ids = ["bridge-late-doc", "old-same-2", "old-node-same", "dup-a", "dup-b", "stock-doc-1",
                      "late-cp-doc", "unknown-old", "fresh-node-1", "rn-doc-1", "old-touched",
                      "del-doc-1", "same-name-del", "rest-doc-1", "mod-doc-1", "own-doc-1", "nd-doc-1",
-                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1", "adoc-native-1", "bad-audit-ext"]
+                     "matrix-1", "matrix-2", "matrix-3", "cover-doc-1", "adoc-native-1", "bad-audit-ext",
+                     "adoc-native-lifecycle"]
         stale_ids += [row[0] for row in db.execute(select(Document.node_id)
                                                    .where(Document.node_id.like("cp-doc-%")))]
         for node_id in stale_ids:
@@ -70,6 +71,7 @@ def env(monkeypatch):
                           source_created_at=gmt_iso(), source_updated_at=gmt_iso()))
         db.commit()
     settings = get_settings().model_copy(update={"bridge_enabled": True, "bridge_debounce_seconds": 900,
+                                                 "bridge_walks_enabled": True,
                                                  "bridge_locator_enabled": False,
                                                  "bridge_sweep_max_governed": 999})  # 旧测试保留试点兜底扫语义
     return settings, walks, fail_next
@@ -126,7 +128,7 @@ def test_non_wiki_event_never_walks(env):
     assert summary["wiki_events"] == 0 and summary["walks"] == [] and walks == []
 
 
-def test_failed_walk_evicts_debounce_for_retry(env):
+def test_failed_walk_does_not_retry_immediately(env):
     settings, walks, fail_next = env
     fail_next.extend([True] * 10)  # every governed workspace fails this round
     add_event("tb-4", "任意文件.docx")
@@ -135,9 +137,9 @@ def test_failed_walk_evicts_debounce_for_retry(env):
     count_after_failure = len(walks)
     fail_next.clear()
     add_event("tb-5", "任意文件2.docx")
-    second = run_bridge(settings)  # debounce evicted -> walks again immediately
-    assert len(walks) > count_after_failure
-    assert any(walk["status"] == "succeeded" for walk in second["walks"])
+    second = run_bridge(settings)
+    assert len(walks) == count_after_failure
+    assert second["walks"] == []
 
 
 def test_snapshot_join_backfills_match(env):
@@ -429,6 +431,10 @@ def test_unlocated_event_stays_pending_until_locator_confirms(env, monkeypatch):
             return [{"name": "重试到镜像出现.docx", "workspace_id": WS, "node_id": "bridge-late-doc"}]
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", HitSearchClient)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99920000001"))
+        event.next_locate_at = None  # Simulate elapsed retry delay.
+        db.commit()
     s2 = run_bridge(org)
     assert s2["confirmed"] == 1 and s2.get("pending_retry", 0) == 0
     with SessionLocal() as db:
@@ -596,6 +602,7 @@ def test_reopened_dead_letter_gets_fresh_retry_window(env, monkeypatch):
     with SessionLocal() as db:  # 与 reopen_dead_letters.py 相同的重开语义
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99970000001"))
         event.processed, event.resolution, event.last_attempt_at = False, "", None
+        event.locate_attempts, event.next_locate_at = 0, None
         event.retry_started_at = db_utcnow()  # received_at 是入库审计字段，不动
         db.commit()
     second = run_bridge(org)
@@ -640,6 +647,10 @@ def test_unknown_node_corroborates_by_payload_not_by_ignorance(env, monkeypatch)
                      "extension": "docx", "created_at": gmt_iso(now_ms)}]
 
     monkeypatch.setattr(audit_bridge, "DingtalkClient", UnknownFreshSearch)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "99980000001"))
+        event.next_locate_at = None
+        db.commit()
     second = run_bridge(org)
     assert second["confirmed"] == 1  # 载荷时间与事件吻合的全新节点才是本事件的节点
     with SessionLocal() as db:  # 新语义：确认即直建文档——必须清理，否则毒化下次运行
@@ -1641,7 +1652,7 @@ def test_native_locator_filters_proof_before_requiring_unique_title(env, monkeyp
         db.commit()
 
 
-def test_workspace_named_native_event_walks_after_search_index_lag(env, monkeypatch):
+def test_workspace_named_native_event_never_walks_after_search_index_lag(env, monkeypatch):
     """The audit workspace name routes a targeted walk when search lags.
 
     DingTalk can emit ``无标题文档`` and let the user rename the document before
@@ -1678,13 +1689,13 @@ def test_workspace_named_native_event_walks_after_search_index_lag(env, monkeypa
               workspace_name="桥接测试库")
     summary = run_bridge(org)
     assert summary["confirmed"] == 0 and summary["unlocated"] == 1
-    assert any(walk["workspace_id"] == WS and walk["mode"] == "bridge" for walk in walks)
+    assert walks == []
     with SessionLocal() as db:
         event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-native-renamed-map"))
         assert event.processed is False and event.matched_node_id == ""
 
 
-def test_realtime_bridge_persists_walk_for_dedicated_watcher(env):
+def test_realtime_native_event_does_not_enqueue_tree_walk(env):
     settings, walks, _ = env
     with SessionLocal() as db:
         ws = db.get(Workspace, WS)
@@ -1696,11 +1707,11 @@ def test_realtime_bridge_persists_walk_for_dedicated_watcher(env):
         summary = audit_bridge.process_audit_events(
             db, settings.model_copy(update={"bridge_sweep_max_governed": 0}), drain_walks=False)
         from app.db import BridgeWalk
-        assert summary["walks"] == [] and db.get(BridgeWalk, WS) is not None
+        assert summary["walks"] == [] and db.get(BridgeWalk, WS) is None
     with SessionLocal() as db:
         drained = audit_bridge.drain_bridge_walks(db, settings)
-        assert drained["walks"][0]["workspace_id"] == WS
-    assert walks == [{"workspace_id": WS, "mode": "bridge"}]
+        assert drained["walks"] == []
+    assert walks == []
 
 
 def test_same_biz_rename_lifecycle_locates_creation_by_latest_title(env, monkeypatch):
@@ -1741,7 +1752,7 @@ def test_same_biz_rename_lifecycle_locates_creation_by_latest_title(env, monkeyp
               workspace_name="桥接测试库")
     summary = run_bridge(org)
     assert summary["confirmed"] == 2
-    assert any(walk["workspace_id"] == WS for walk in walks)
+    assert walks == []
     with SessionLocal() as db:
         events = db.scalars(select(FileAuditEvent).where(
             FileAuditEvent.biz_id == "tb-native-lifecycle").order_by(FileAuditEvent.gmt_create)).all()
@@ -1755,6 +1766,37 @@ def test_same_biz_rename_lifecycle_locates_creation_by_latest_title(env, monkeyp
             db.delete(job)
         db.delete(doc)
         db.commit()
+
+
+def test_locator_stops_after_three_attempts_with_backoff(env, monkeypatch):
+    settings, walks, _ = env
+    calls = []
+
+    class EmptySearch(_EmptySearchClient):
+        async def search_dentries(self, *args, **kwargs):
+            calls.append(1)
+            return []
+    monkeypatch.setattr(audit_bridge, "DingtalkClient", EmptySearch)
+    org = locator_settings(settings).model_copy(update={"bridge_walks_enabled": False})
+    add_event("tb-limited-search", "unindexed.docx")
+    first = run_bridge(org)
+    n = len(calls)
+    assert first["locator_attempted"] == 1 and n >= 1
+    assert run_bridge(org).get("locator_attempted", 0) == 0
+    assert len(calls) == n
+    for _ in range(2):
+        with SessionLocal() as db:
+            event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-limited-search"))
+            event.next_locate_at = None
+            db.commit()
+        run_bridge(org)
+    with SessionLocal() as db:
+        event = db.scalar(select(FileAuditEvent).where(FileAuditEvent.biz_id == "tb-limited-search"))
+        assert event.locate_attempts == 3
+        assert event.processed and event.resolution == "dead_letter_locator_limit"
+    n = len(calls)
+    run_bridge(org)
+    assert len(calls) == n and walks == []
 
 
 def test_same_biz_lifecycle_reuses_confirmed_node_outside_main_batch(env, monkeypatch):

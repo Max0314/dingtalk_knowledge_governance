@@ -1,0 +1,7 @@
+# Use only an explicitly retained/approved image, never a floating remote tag.
+# --no-build is mandatory. Older releases do not have /api/ready.
+services:
+  api:
+    image: ${KG_ROLLBACK_IMAGE:?Set the approved retained image}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:39021/api/health', timeout=5)"]

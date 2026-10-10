@@ -5,12 +5,13 @@ import re
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 from .config import Settings
 from .db import BridgeWalk, Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, WatchPlan, Workspace, WorkspaceRole, utcnow
+from . import genre as genre_mod
 from .fileclass import classify, review_classes
-from .integrations import ADVISORY_GENRES, BiCenterClient, DingtalkClient, IntegrationError, model_score_content
+from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
 from .scoring import RULE_VERSION, effective_config, score_document, verdict_for
 
@@ -96,11 +97,11 @@ def is_robot_uploader(settings: Settings, *identifiers: str) -> bool:
 
 
 def review_dict(review: ReviewInstance, rerun_count: int = 0) -> dict:
-    return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "review_scope": review.review_scope, "content_note": review.content_note, "rule_version": review.rule_version, "rule_config_ref": review.rule_config_ref, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
+    return {"review_instance_id": review.review_instance_id, "node_id": review.node_id, "ai_score": round(review.ai_score, 1), "verdict": review.verdict, "genre": review.genre, "genre_source": review.genre_source, "tier": review.tier, "review_scope": review.review_scope, "content_note": review.content_note, "rule_version": review.rule_version, "rule_config_ref": review.rule_config_ref, "model_config_version": review.model_config_version, "trigger": review.trigger, "dimensions": review.dimensions, "findings": review.findings, "created_at": iso(review.created_at), "rerun_count": rerun_count}
 
 
 def document_dict(doc: Document, review: ReviewInstance | None = None, rerun_count: int = 0) -> dict:
-    data = {"node_id": doc.node_id, "workspace_id": doc.workspace_id, "name": doc.name, "category": doc.category, "extension": doc.extension, "url": doc.url, "size": doc.size, "word_count": doc.word_count, "is_folder": doc.is_folder, "source_created_at": doc.source_created_at, "source_updated_at": doc.source_updated_at, "uploader_key": doc.uploader_key, "uploader_name": doc.uploader_name, "department_name": doc.department_name, "biz_group_name": doc.biz_group_name, "org_matched": doc.org_matched, "discovered_at": iso(doc.discovered_at), "rerun_count": rerun_count}
+    data = {"node_id": doc.node_id, "workspace_id": doc.workspace_id, "name": doc.name, "category": doc.category, "extension": doc.extension, "url": doc.url, "size": doc.size, "word_count": doc.word_count, "is_folder": doc.is_folder, "genre": doc.genre, "genre_source": doc.genre_source, "source_created_at": doc.source_created_at, "source_updated_at": doc.source_updated_at, "uploader_key": doc.uploader_key, "uploader_name": doc.uploader_name, "department_name": doc.department_name, "biz_group_name": doc.biz_group_name, "org_matched": doc.org_matched, "discovered_at": iso(doc.discovered_at), "rerun_count": rerun_count}
     if review:
         data["latest_review"] = review_dict(review, rerun_count)
     return data
@@ -132,6 +133,10 @@ def rule_config_ref(row: ScoringRuleConfig | None) -> str:
     return f"department:{row.department_name}@v{row.version}" if row.scope == "department" else f"global@v{row.version}"
 
 
+class RegistryOnlyError(RuntimeError):
+    """D 档「仅登记」文体：不评分、不推送，只登记归档状态。异常消息即文体名。"""
+
+
 class ContentUnavailableError(RuntimeError):
     """拿不到正文（无下载键/格式不可解析/下载失败等）：2026-08-17 拍板
     不评审、不推送，任务以 skipped + 原因落日志。异常消息即原因码。"""
@@ -146,6 +151,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     数据允许生成占位评分，生产数据无任何例外。"""
     from .content import fetch_document_content
 
+    if not settings.demo_mode and not settings.review_enabled:
+        raise ContentUnavailableError("review_paused")
     doc = db.get(Document, node_id)
     if not doc:
         raise KeyError("document_not_found")
@@ -187,46 +194,57 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
                 return None
     rule_row = resolve_rule_config(db, doc.department_name)
     rule_cfg = effective_config(rule_row.config if rule_row else None)
-    result = score_document(doc.name, content or f"文档信息\n版本：\n适用范围：\n", doc.file_class or "document", rule_cfg)
     model = active_model(db)
+    model_result = None
+    model_attempted = False
     if content and model and settings.model_allow_content_transfer:
+        model_attempted = True
         model_result = asyncio.run(model_score_content({"base_url": model.base_url, "model_name": model.model_name,
                                                         "api_key": model.api_key, "api_key_env_name": model.api_key_env_name,
                                                         "temperature": model.temperature, "thinking_mode": model.thinking_mode,
                                                         "timeout_seconds": model.timeout_seconds}, content, doc.name,
                                                        doc.file_class or "document"))
-        if model_result:
-            # Dual-track scoring: the rule-compliance score stays reproducible,
-            # the model judges content quality within its detected genre, and
-            # the stored score is their weighted composite. Genres without a
-            # document shape (test cases, reports, minutes) demote the
-            # document-shaped rule dimensions to advisory — flagged, not fined.
-            genre = model_result.get("genre", "")
-            if genre in ADVISORY_GENRES:
-                for key in ("metadata", "abstract", "structure", "rag"):
-                    dim = result["dimensions"].get(key)
-                    if dim and dim.get("deduction"):
-                        dim["advisory"] = True
-            rule_score = 100 - sum(dim["deduction"] for dim in result["dimensions"].values()
-                                   if not dim.get("advisory"))
-            model_score = model_result["score"]
-            configured_weight = rule_cfg.get("rule_weight")
-            weight = min(max(configured_weight if configured_weight is not None else settings.score_rule_weight, 0.0), 1.0)
-            composite = round(weight * rule_score + (1 - weight) * model_score)
-            result["findings"].extend(model_result["findings"])
-            result["dimensions"]["model"] = {
-                "label": "模型内容评审", "deduction": 0, "cap": 0,
-                "genre": genre, "model_score": model_score, "rule_score": rule_score,
-                "composite": composite, "rule_weight": weight,
-                "model_dimensions": model_result.get("dimensions", {}),
-                "findings": model_result["findings"],
-            }
-            result["ai_score"] = composite
-            result["verdict"] = verdict_for(composite, rule_cfg)
+    # 文体判定必须先于评分：它决定用哪套维度和多严的尺子。模型判定优先，
+    # 文件名只作弱先验（53,908 个真实节点实测，命名可识别率仅 27.9%）。
+    genre, genre_source = genre_mod.classify(doc.name, (model_result or {}).get("genre", ""))
+    doc.genre, doc.genre_source = genre, genre_source
+    if genre_mod.is_registry_only(genre):
+        # D 档「仅登记」：台账、BOM、空模板、外部参考资料不出分、不推送，
+        # 只把分类结果记在文档行上。给它们打分既不公平也没人会照着改。
+        db.commit()
+        raise RegistryOnlyError(genre)
+    placeholder = "文档信息\n版本：\n适用范围：\n"
+    result = score_document(doc.name, content or placeholder, doc.file_class or "document", rule_cfg, genre)
+    if model_result:
+        # 双轨评分：合规分确定性、可复现，模型在判定的文体内评内容质量，
+        # 入库分是二者加权合成。权重按约束档位取——约束越弱，形式越不重要
+        # （会议纪要写得规不规范，远不如决议清不清楚重要）。
+        compliance = result["ai_score"]
+        model_score = model_result["score"]
+        configured_weight = rule_cfg.get("rule_weight")
+        weight = configured_weight if configured_weight is not None else genre_mod.form_weight_for(genre)
+        weight = min(max(weight, 0.0), 1.0)
+        composite = round(weight * compliance + (1 - weight) * model_score)
+        result["findings"].extend(model_result["findings"])
+        result["dimensions"]["model"] = {
+            "label": "模型内容评审", "deduction": 0, "cap": 0,
+            "genre": genre, "tier": result["tier"], "model_score": model_score,
+            "rule_score": compliance, "composite": composite, "rule_weight": weight,
+            "model_dimensions": model_result.get("dimensions", {}),
+            "findings": model_result["findings"],
+        }
+        result["ai_score"] = composite
+        result["verdict"] = verdict_for(composite, rule_cfg)
+    # 模型调用失败不再冒充"用了模型"：此前不论 model_result 是否为 None，
+    # 实例一律记 model.version。key 一过期，所有评审静默退化成纯规则分，
+    # 留痕却仍写着模型版本，事后无从分辨。
+    model_version = (model.version if model_result else
+                     "model_unavailable" if model_attempted else "rule-engine")
+
     instance = ReviewInstance(
         review_instance_id=str(uuid.uuid4()), node_id=node_id, ai_score=result["ai_score"], verdict=result["verdict"],
         review_scope=scope, content_note=content_note, rule_version=RULE_VERSION, rule_config_ref=rule_config_ref(rule_row),
-        model_config_version=(model.version if model and content and settings.model_allow_content_transfer else "rule-engine"), trigger=trigger,
+        model_config_version=model_version, genre=genre, genre_source=genre_source, tier=result["tier"], trigger=trigger,
         content_fingerprint=result["fingerprint"], dimensions=result["dimensions"], findings=result["findings"],
     )
     if result["fingerprint"]:
@@ -242,9 +260,18 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
 
 
 def process_next_job(db: Session, settings: Settings) -> bool:
+    if not settings.demo_mode and not settings.review_enabled:
+        return False
     job = db.scalar(select(ReviewJob).where(ReviewJob.status == "pending").order_by(ReviewJob.created_at).limit(1))
     if not job:
         return False
+    claimed = db.execute(update(ReviewJob).where(ReviewJob.job_id == job.job_id,
+                         ReviewJob.status == "pending").values(status="running",
+                         lease_until=utcnow() + timedelta(hours=1)))
+    db.commit()
+    if not claimed.rowcount:
+        return False
+    db.refresh(job)
     # 第二道闸：入队侧漏网（老任务、批量导入）也不评审数字员工文档；
     # 详情页手动重评（manual_rerun）视为明确的人为意图，放行。
     doc = db.get(Document, job.node_id)
@@ -257,14 +284,15 @@ def process_next_job(db: Session, settings: Settings) -> bool:
         job.status, job.error_code, job.finished_at = "skipped", "personal_workspace", utcnow()
         db.commit()
         return True
-    job.status = "running"
-    db.commit()
     try:
         review = run_review(db, settings, job.node_id, job.trigger)
         if review is None:
             job.status, job.error_code, job.finished_at = "skipped", "content_unchanged", utcnow()
         else:
             job.status, job.result_review_instance_id, job.finished_at = "succeeded", review.review_instance_id, utcnow()
+    except RegistryOnlyError as exc:
+        # 「仅登记」文体不出分：任务正常结束，文体已记在文档行上。
+        job.status, job.error_code, job.finished_at = "skipped", f"registry_only:{exc}"[:64], utcnow()
     except ContentUnavailableError as exc:
         # 拿不到正文：不评审不推送，留痕即可（2026-08-17 拍板）。下次该文档
         # 有新事件（上传/修改）会自然重新触发。
@@ -272,7 +300,9 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     except KeyError:
         job.status, job.error_code, job.finished_at = "failed", "document_not_found", utcnow()
     except Exception:
+        db.rollback()
         job.status, job.error_code, job.finished_at = "failed", "review_execution_failed", utcnow()
+    job.lease_until = None
     db.commit()
     return True
 
@@ -400,6 +430,8 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
 
 
 async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incremental") -> SyncRun:
+    if not settings.demo_mode:
+        raise IntegrationError("scan_scheduler_required", "全量同步已停用，请通过月度校准任务执行。", 409)
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode)
     db.add(run); db.commit()
     client = DingtalkClient(settings)
@@ -549,6 +581,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     ``space`` is the normalized workspace listing item; when given, the walk
     trusts its rootNodeId instead of calling the detail endpoint, which fails
     for some personal spaces."""
+    from .api_usage import scan_month
+    if not settings.demo_mode and (not settings.full_scan_enabled or not scan_month.get()):
+        raise IntegrationError("scan_scheduler_required", "全量扫描须启用月度校准并使用持久化调度器。", 409)
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode, workspace_id=workspace_id,
                   workspace_name=(space or {}).get("name", ""))
     db.add(run); db.commit()
@@ -664,6 +699,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
 
 
 async def run_watch_cycle_async(db: Session, settings: Settings) -> dict:
+    if not settings.demo_mode:
+        from .scan_scheduler import run_scan_slice_async
+        return await run_scan_slice_async(db, settings, force=True)
     targets = await resolve_watch_targets(settings)
     runs = []
     for target in targets["resolved"]:
@@ -691,6 +729,9 @@ async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2)
     finding). An exhausted rotation reports cycle_completed and refills on the
     next call. cycle_ids 记录本轮周期的成员：整轮走完时它就是"这次全量真实
     看到的库"，缺席者由结账逻辑自动标记不可见。"""
+    if not settings.demo_mode:
+        from .scan_scheduler import run_scan_slice_async
+        return await run_scan_slice_async(db, settings)
     targets = await resolve_watch_targets(settings)
     by_id = {t["workspace_id"]: t for t in targets["resolved"]}
     if not _watch_rotation["queue"]:
@@ -723,7 +764,7 @@ CN_TZ = timezone(timedelta(hours=8))  # 业务时区（中国无夏令时，固�
 def _scan_days(settings: Settings) -> list[int]:
     days = sorted({int(token) for token in settings.scan_days.split(",")
                    if token.strip().isdigit() and 1 <= int(token) <= 28})
-    return days or [10, 24]
+    return days[:1] or [10]
 
 
 def current_scan_due(settings: Settings, today: date | None = None) -> str:
@@ -774,8 +815,11 @@ def mark_scan_cycle_complete(db: Session, settings: Settings,
     计一次缺席，连续两轮缺席才标记不可见（codex 第八轮 P1：单次列表不完整
     不能误停正常库；中途新注册的库也因此天然豁免）。传空/None 跳过判决，
     防解析瞬时失败误伤全量。"""
+    apply_ignored_workspace_prefixes(db, settings)
     if seen_workspace_ids:
         for ws in db.scalars(select(Workspace).where(Workspace.is_active.is_(True))).all():
+            if workspace_name_is_ignored(settings, ws.name):
+                continue
             if ws.workspace_id in seen_workspace_ids:
                 if ws.unreachable_misses:
                     ws.unreachable_misses = 0
@@ -809,10 +853,12 @@ def sweep_stale_runs(db: Session, *, sync_runs: bool = True,
              if sync_runs else [])
     for run in stale:
         run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
-    zombie_jobs = (db.scalars(select(ReviewJob).where(ReviewJob.status == "running")).all()
+    zombie_jobs = (db.scalars(select(ReviewJob).where(ReviewJob.status == "running",
+                   or_(ReviewJob.lease_until.is_(None), ReviewJob.lease_until < utcnow()))).all()
                    if review_jobs else [])
     for job in zombie_jobs:
         job.status = "pending"
+        job.lease_until = None
     if bridge_walks:
         for row in db.scalars(select(BridgeWalk)).all():
             db.delete(row)

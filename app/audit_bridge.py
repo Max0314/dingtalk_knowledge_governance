@@ -18,7 +18,7 @@ storage-space id, so the event does NOT say in *which* library. 2026-08-14
 
 targetSpaceId is only an org-wide storage-scope tally; workSpaceName uniquely
 resolves the Wiki workspace. Cost model: no wiki writes -> no locator calls;
-slow targeted walks are persisted for the dedicated watcher process.
+production events never enqueue tree walks; monthly calibration owns the tree.
 """
 from __future__ import annotations
 
@@ -626,8 +626,8 @@ def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, sum
 def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool = True) -> dict:
     """One bridge cycle.「完成才消费」生命周期：wiki 事件唯有 locator 确认
     节点、文档入镜像、正文适配器具备定位条件才算 done；到期未确认转 dead_letter_*
-    可观测死信。定位按"最久未尝试"轮转取额（公平），巡走走持久化队列
-    （预算外的库下轮续走），两者都有硬预算，绝不独占 worker。"""
+    可观测死信。定位按"最久未尝试"轮转取额，最多三次并有退避；生产环境
+    不触发整库巡走，目录校准交给独立月度任务。"""
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
@@ -648,15 +648,6 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
         summary["wiki_events"] += 1
         wiki_events.append(event)
         kind = _action_kind(event)
-        if (kind in ("review", "modify")
-                and (event.extension or "").lower() == "adoc"
-                and event.workspace_name):
-            audit_workspace = _workspace_from_event(db, event)
-            if audit_workspace is not None and audit_workspace.watch_seeded:
-                # The audit event is the doorbell; the targeted Wiki walk owns
-                # document identity.  This also catches a native document that
-                # was renamed immediately after creation.
-                _enqueue_walk(db, audit_workspace.workspace_id, queued)
         if kind == "ignore":
             # 协作/分享/权限等纯协同动作：终态忽略，零定位消费（codex P0-1）
             _finish(db, event, "ignored_action")
@@ -731,6 +722,8 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     now = utcnow()
     now_ms = int(time.time() * 1000)
     candidate_conditions = [FileAuditEvent.processed.is_(False), FileAuditEvent.match_status != "confirmed",
+                             FileAuditEvent.locate_attempts < settings.bridge_locator_max_attempts,
+                             or_(FileAuditEvent.next_locate_at.is_(None), FileAuditEvent.next_locate_at <= now),
                             or_(FileAuditEvent.action_view.like("%知识库%"),
                                 FileAuditEvent.module_view == "团队空间")]
     if cutoff_ms is not None:
@@ -775,8 +768,12 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
             return (event.extension or "").lower() == "adoc" or bool(settings.wiki_storage_space_id)
 
         locatable = [event for event in candidates if _can_locate(event)]
-        for event in candidates:
+        for event in locatable:
             event.last_attempt_at = now
+            event.locate_attempts += 1
+            event.next_locate_at = now + timedelta(seconds=settings.bridge_locator_retry_seconds * 2 ** (event.locate_attempts - 1))
+        # Durable reservation: a crash cannot reset event retry counts.
+        db.commit()
 
         async def _locate_one(event: FileAuditEvent):
             # Storage search returns dentryUuids (== wiki nodeIds) plus the
@@ -878,7 +875,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     elif candidates:
         unlocated = len(candidates)
     if unlocated:
-        if len(governed) <= settings.bridge_sweep_max_governed:
+        if settings.demo_mode and settings.bridge_walks_enabled and len(governed) <= settings.bridge_sweep_max_governed:
             for workspace_id in governed:
                 _enqueue_walk(db, workspace_id, queued)  # 试点规模的兜底扫，代价可控
         else:
@@ -891,6 +888,10 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     # 死信裁决：到期仍未完成的事件带原因归档，绝不伪装成功。窗口基准是
     # retry_started_at（重开）→ received_at；池子含批外的 confirmed-pending。
     expiry_pool = {event.id: event for event in pending_wiki}
+    for event in candidates:
+        if not event.processed and event.match_status != "confirmed" and event.locate_attempts >= settings.bridge_locator_max_attempts:
+            _finish(db, event, "dead_letter_locator_limit")
+            summary["dead_letter"] = summary.get("dead_letter", 0) + 1
     for event in confirmed_pending:
         expiry_pool.setdefault(event.id, event)
     for event in expiry_pool.values():
@@ -918,6 +919,18 @@ def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
                                 BridgeWalk.last_attempt_at.asc(),
                                 BridgeWalk.requested_at.asc())).all()
     for row in rows:
+        if row.failures >= settings.scan_max_attempts:
+            row.status = "dead_letter"
+            continue
+        if not settings.demo_mode or not settings.bridge_walks_enabled:
+            row.status = "disabled"
+            continue
+        if row.status != "pending":
+            continue
+        if row.last_attempt_at:
+            delay = settings.scan_retry_seconds * 2 ** max(0, row.failures - 1)
+            if (utcnow() - row.last_attempt_at.replace(tzinfo=timezone.utc)).total_seconds() < delay:
+                continue
         if len(summary["walks"]) >= WALK_BUDGET:
             summary["walks_deferred"] = summary.get("walks_deferred", 0) + 1
             continue
@@ -930,7 +943,8 @@ def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:
             db.delete(row)
         else:
             row.failures += 1
-            _last_walk.pop(row.workspace_id, None)  # 内存去抖立即让路，轮转由 last_attempt_at 保证
+            if row.failures >= settings.scan_max_attempts:
+                row.status = "dead_letter"
         summary["walks"].append({"workspace_id": row.workspace_id, "run_id": run.run_id, "mode": run.mode,
                                  "status": run.status, "new": run.documents_new,
                                  "changed": run.documents_changed, "error_code": run.error_code})
