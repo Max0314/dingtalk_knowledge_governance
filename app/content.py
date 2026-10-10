@@ -16,6 +16,7 @@ skipped.
 from __future__ import annotations
 
 import io
+import multiprocessing
 import os
 import re
 import subprocess
@@ -184,17 +185,62 @@ def _pptx_text(data: bytes) -> str:
     return "\n".join(parts)
 
 
-def _pdf_text(data: bytes) -> str:
+def _pdf_parse(data: bytes) -> str:
     try:
         from pypdf import PdfReader
     except ImportError:
         return ""
     try:
         reader = PdfReader(io.BytesIO(data))
-        pages = [page.extract_text() or "" for page in reader.pages[:100]]
+        pages = []
+        remaining = MAX_CHARS
+        for page in reader.pages[:100]:
+            text = (page.extract_text() or "")[:remaining]
+            pages.append(text)
+            remaining -= len(text) + 1
+            if remaining <= 0:
+                break
         return "\n".join(pages)
     except Exception:
         return ""  # encrypted/corrupt/scanned PDFs are skipped by the body gate
+
+
+def _pdf_child(data: bytes, connection):
+    try:
+        if os.name == "posix":
+            import resource
+            resource.setrlimit(resource.RLIMIT_CPU, (15, 15))
+            resource.setrlimit(resource.RLIMIT_AS, (384 * 1024 * 1024, 384 * 1024 * 1024))
+        connection.send(_pdf_parse(data)[:MAX_CHARS])
+    except Exception:
+        pass
+    finally:
+        connection.close()
+
+
+def _pdf_text(data: bytes) -> str:
+    # Input bytes alone do not bound parser CPU/expansion. No body on disk.
+    context = multiprocessing.get_context("spawn")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(target=_pdf_child, args=(data, send), daemon=True)
+    try:
+        process.start()
+        send.close()
+        if receive.poll(20):
+            return receive.recv()
+        return ""
+    except (EOFError, OSError, RuntimeError):
+        return ""
+    finally:
+        receive.close()
+        send.close()
+        if process.pid:
+            if process.is_alive():
+                process.terminate()
+            process.join(2)
+            if process.is_alive():
+                process.kill()
+                process.join(2)
 
 
 def extract_text(extension: str, data: bytes) -> str:

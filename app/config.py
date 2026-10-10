@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", env_prefix="KG_", extra="ignore")
     database_url: str = "sqlite:///./runtime/knowledge_governance.db"
     demo_mode: bool = False
+    # Only local metadata GETs are cached; no DingTalk/BI calls on refresh.
+    read_cache_enabled: bool = True
+    read_cache_ttl_seconds: int = Field(default=600, ge=30, le=600)
+    read_cache_max_age_seconds: int = Field(default=900, ge=60, le=900)
+    live_browse_enabled: bool = False
     default_actor: str = "knowledge-governance-admin"
     public_base_url: str = "http://localhost:39021"
     dingtalk_app_key: str = Field(default="", validation_alias="DINGTALK_APP_KEY")
@@ -56,6 +61,7 @@ class Settings(BaseSettings):
     # Starting containers must not implicitly resume paid background work.
     full_scan_enabled: bool = False
     review_enabled: bool = False
+    review_queue_limit: int = Field(default=1000, ge=1, le=10000)
     scan_max_attempts: int = Field(default=3, ge=1, le=3)
     scan_retry_seconds: int = Field(default=900, ge=60)
     scan_max_api_calls: int = Field(default=60000, ge=1)

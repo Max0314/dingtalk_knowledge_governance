@@ -123,6 +123,7 @@ class Document(Base):
 
 class ReviewInstance(Base):
     __tablename__ = "review_instances"
+    __table_args__ = (Index("ix_review_instances_node_created", "node_id", "created_at"),)
     review_instance_id: Mapped[str] = mapped_column(id_string(64), primary_key=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("documents.node_id"), index=True)
     ai_score: Mapped[float] = mapped_column(Float)
@@ -170,6 +171,21 @@ class ReviewJob(Base):
     error_code: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Atomic claim and a bounded lease prevent another process's boot sweep
+    # from replaying a running review. Existing legacy jobs have no lease.
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ReadCacheEntry(Base):
+    """Rebuildable metadata responses, never document bodies or credentials."""
+    __tablename__ = "read_cache_entries"
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    endpoint: Mapped[str] = mapped_column(String(128))
+    parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    payload: Mapped[dict | list | None] = mapped_column(JSON, nullable=True)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str] = mapped_column(String(64), default="")
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SyncRun(Base):
@@ -547,7 +563,9 @@ def build_engine():
         return create_engine(settings.database_url, connect_args={"check_same_thread": False})
     # pool_pre_ping is an engine option, not a DBAPI connect arg; pool_recycle
     # keeps pooled connections younger than MySQL's wait_timeout.
-    return create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=3600)
+    return create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=1800,
+                         pool_size=5, max_overflow=5, pool_timeout=3,
+                         connect_args={"connect_timeout": 3, "read_timeout": 15, "write_timeout": 15})
 
 
 engine = build_engine()
@@ -595,6 +613,7 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
 # create_all only creates missing tables; columns added to an existing model
 # need an explicit ALTER. Keep this list tiny and append-only.
 EXTRA_COLUMNS = {
+    "review_jobs": {"lease_until": "DATETIME NULL"},
     "review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''",
                          "content_note": "VARCHAR(64) NOT NULL DEFAULT ''",
                          "genre": "VARCHAR(32) NOT NULL DEFAULT ''",
@@ -630,6 +649,9 @@ EXTRA_COLUMNS = {
 
 
 EXTRA_INDEXES = {
+    "review_instances": {
+        "ix_review_instances_node_created": "CREATE INDEX ix_review_instances_node_created ON review_instances (node_id, created_at)",
+    },
     "historical_file_nodes": {
         "ix_hfn_snapshot_node": "CREATE INDEX ix_hfn_snapshot_node ON historical_file_nodes (snapshot_id, node_id)",
         "ix_hfn_snapshot_file_created": "CREATE INDEX ix_hfn_snapshot_file_created ON historical_file_nodes (snapshot_id, node_type, source_created_at, node_id)",

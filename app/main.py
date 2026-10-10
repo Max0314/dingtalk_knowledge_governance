@@ -9,8 +9,9 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_, select
+from sqlalchemy import and_, case, func, or_, select, union_all
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from . import bi_export, metrics, orgmap
 from .config import get_settings
 from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
@@ -23,10 +24,15 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    if get_settings().demo_mode:
-        with SessionLocal() as db: seed_demo(db)
+    def initialize():
+        init_db()
+        if get_settings().demo_mode:
+            with SessionLocal() as db:
+                seed_demo(db)
+    await run_in_threadpool(initialize)
+    read_cache.start()
     yield
+    read_cache.stop()
 
 
 app = FastAPI(title="DingTalk Knowledge Governance", version="1.0.0", lifespan=lifespan)
@@ -106,6 +112,17 @@ class RuleEditorsRequest(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "service": "dingtalk_knowledge_governance", "document_body_persistence": "disabled"}
+
+
+@app.get("/api/ready")
+def ready(db: Session = Depends(db_session)):
+    from sqlalchemy import text
+    from sqlalchemy.exc import SQLAlchemyError
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise HTTPException(503, "数据库暂时不可用。") from None
+    return {"status": "ready"}
 
 
 def _bi_export_error(error: bi_export.ExportApiError) -> JSONResponse:
@@ -292,14 +309,11 @@ def uploader_months_api(db: Session = Depends(db_session)):
 def uploaders_api(month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                   exclude_unmatched: bool = True, limit: int = Query(default=50, ge=1, le=200),
                   department: str = "", db: Session = Depends(db_session)):
-    preview = metrics.uploaders(db, month, exclude_unmatched=False, limit=200)
-    orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
     return metrics.uploaders(db, month, exclude_unmatched=exclude_unmatched, limit=limit, department=department)
 
 
 @app.get("/api/v1/metrics/uploaders/{user_id}")
 def uploader_detail_api(user_id: str, db: Session = Depends(db_session)):
-    orgmap.ensure_employees(db, get_settings(), [user_id])
     return metrics.uploader_detail(db, user_id)
 
 
@@ -307,7 +321,6 @@ def uploader_detail_api(user_id: str, db: Session = Depends(db_session)):
 def uploader_breakdown_api(user_id: str, year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                            month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                            db: Session = Depends(db_session)):
-    orgmap.ensure_employees(db, get_settings(), [user_id])
     return metrics.uploader_breakdown(db, user_id, year=year, month=month)
 
 
@@ -315,8 +328,6 @@ def uploader_breakdown_api(user_id: str, year: str = Query(default="", pattern=r
 def org_rollup_api(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                    month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
                    db: Session = Depends(db_session)):
-    preview = metrics.uploaders(db, "", exclude_unmatched=False, limit=500)
-    orgmap.ensure_employees(db, get_settings(), [item["user_id"] for item in preview["items"]])
     return metrics.org_rollup(db, year=year, month=month)
 
 
@@ -517,22 +528,14 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         # live 臂一致（该处已验证走 ix_hfn_snapshot_node）。
         base = base.outerjoin(Document, Document.node_id == HistoricalFileNode.node_id)                    .where(Document.node_id.is_(None))
         need = offset + limit
-        merged = sorted(
-            db.execute(base.order_by(HistoricalFileNode.source_created_at.desc(),
-                                     HistoricalFileNode.node_id.desc()).limit(need)).all() +
-            db.execute(live.order_by(Document.source_created_at.desc(),
-                                     Document.node_id.desc()).limit(need)).all(),
-            key=lambda r: ((r.created_at or ""), r.node_id), reverse=True)
-        rows = merged[offset:offset + limit]
+        merged = union_all(base, live).subquery()
+        rows = db.execute(select(merged).order_by(merged.c.created_at.desc(), merged.c.node_id.desc())
+                          .offset(offset).limit(limit)).all()
         total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
                 (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
     ids = [r.node_id for r in rows]
     docs = {d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {}
-    latest_review: dict[str, ReviewInstance] = {}
-    if ids:
-        for rv in db.scalars(select(ReviewInstance).where(ReviewInstance.node_id.in_(ids))
-                             .order_by(ReviewInstance.created_at.desc())):
-            latest_review.setdefault(rv.node_id, rv)
+    latest_review, _ = _latest_reviews(db, ids)
     creators = {r.creator for r in rows if r.creator and r.node_id not in docs}
     emp = {e.user_id: e for e in db.scalars(select(EmployeeMap).where(EmployeeMap.user_id.in_(creators)))} if creators else {}
     items = []
@@ -729,7 +732,9 @@ def workspace_detail(workspace_id: str, db: Session = Depends(db_session)):
 
 
 @app.patch("/api/v1/workspaces/{workspace_id}/governance")
-def patch_governance(workspace_id: str, body: GovernancePatch, db: Session = Depends(db_session)):
+def patch_governance(workspace_id: str, body: GovernancePatch, request: Request,
+                     db: Session = Depends(db_session)):
+    require_admin(request)
     ws = db.get(Workspace, workspace_id)
     if not ws: raise HTTPException(404, "知识库不存在")
     ws.owner_department_id, ws.owner_department_name, ws.owner_biz_group_name = body.owner_department_id, body.owner_department_name or "未映射", body.owner_biz_group_name or "未映射"
@@ -744,11 +749,9 @@ def documents(workspace_id: str = "", query: str = "", db: Session = Depends(db_
     stmt = select(Document).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
     if workspace_id: stmt = stmt.where(Document.workspace_id == workspace_id)
     if query: stmt = stmt.where(Document.name.contains(query))
-    items = []
-    for doc in db.scalars(stmt.order_by(Document.discovered_at.desc()).limit(200)).all():
-        review = db.scalar(select(ReviewInstance).where(ReviewInstance.node_id == doc.node_id).order_by(ReviewInstance.created_at.desc()))
-        total = db.scalar(select(func.count()).select_from(ReviewInstance).where(ReviewInstance.node_id == doc.node_id)) or 0
-        items.append(document_dict(doc, review, max(0, total - 1)))
+    docs = db.scalars(stmt.order_by(Document.discovered_at.desc()).limit(200)).all()
+    latest, counts = _latest_reviews(db, [doc.node_id for doc in docs])
+    items = [document_dict(doc, latest.get(doc.node_id), max(0, counts.get(doc.node_id, 0) - 1)) for doc in docs]
     return {"items": items}
 
 
@@ -763,11 +766,37 @@ def document_detail(node_id: str, db: Session = Depends(db_session)):
 
 
 @app.post("/api/v1/documents/{node_id}/reviews", status_code=202)
-def enqueue_review(node_id: str, body: ReviewRequest, db: Session = Depends(db_session)):
+def enqueue_review(node_id: str, body: ReviewRequest, request: Request, db: Session = Depends(db_session)):
+    require_admin(request)
+    settings = get_settings()
+    if not settings.review_enabled and not settings.demo_mode:
+        raise HTTPException(423, "评审服务已暂停，不能创建新任务。")
     if not db.get(Document, node_id): raise HTTPException(404, "文档不存在")
-    job = ReviewJob(job_id=str(uuid.uuid4()), node_id=node_id, trigger=body.trigger, requested_by=actor())
+    # Lock the document row so simultaneous clicks cannot queue the same node.
+    db.execute(select(Document.node_id).where(Document.node_id == node_id).with_for_update()).first()
+    job = db.scalar(select(ReviewJob).where(ReviewJob.node_id == node_id,
+                    ReviewJob.status.in_(("pending", "running"))).limit(1))
+    if job:
+        return {"job_id": job.job_id, "status": job.status, "document_body_persistence": "disabled"}
+    if (db.scalar(select(func.count()).select_from(ReviewJob).where(ReviewJob.status.in_(("pending", "running")))) or 0) >= settings.review_queue_limit:
+        raise HTTPException(429, "评审队列已满，请稍后重试。")
+    user = getattr(request.state, "user", None) or {}
+    job = ReviewJob(job_id=str(uuid.uuid4()), node_id=node_id, trigger=body.trigger, requested_by=user.get("union_id") or actor())
     db.add(job); db.commit()
     return {"job_id": job.job_id, "status": job.status, "document_body_persistence": "disabled"}
+
+
+def _latest_reviews(db: Session, ids: list[str]):
+    if not ids:
+        return {}, {}
+    ranked = select(ReviewInstance.review_instance_id,
+                    func.row_number().over(partition_by=ReviewInstance.node_id,
+                        order_by=(ReviewInstance.created_at.desc(), ReviewInstance.review_instance_id.desc())).label("rank"),
+                    func.count().over(partition_by=ReviewInstance.node_id).label("count")).where(
+                        ReviewInstance.node_id.in_(ids)).subquery()
+    rows = db.execute(select(ReviewInstance, ranked.c.count).join(ranked,
+            ranked.c.review_instance_id == ReviewInstance.review_instance_id).where(ranked.c.rank == 1)).all()
+    return {rv.node_id: rv for rv, _ in rows}, {rv.node_id: count for rv, count in rows}
 
 
 @app.get("/api/v1/review-jobs/{job_id}")
@@ -1170,19 +1199,25 @@ def api_usage_status(db: Session = Depends(db_session)):
 
 
 # Read-only DingTalk proxy endpoints for interactive directory browsing; each request supplies the real operator UnionID.
-@app.get("/api/v1/dingtalk/knowledge-bases")
+def require_live_browse(request: Request):
+    require_admin(request)
+    if not get_settings().live_browse_enabled:
+        raise HTTPException(423, "实时钉钉目录查询已暂停，请使用本地知识库数据。")
+
+
+@app.get("/api/v1/dingtalk/knowledge-bases", dependencies=[Depends(require_live_browse)])
 async def dingtalk_workspaces(operator_id: str, next_token: str = "", max_results: int = 30):
     try: return await DingtalkClient(get_settings()).list_workspaces(operator_id, next_token, max_results)
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
-@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}")
+@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}", dependencies=[Depends(require_live_browse)])
 async def dingtalk_workspace(workspace_id: str, operator_id: str):
     try: return await DingtalkClient(get_settings()).workspace_detail(workspace_id, operator_id)
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
 
 
-@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}/nodes")
+@app.get("/api/v1/dingtalk/knowledge-bases/{workspace_id}/nodes", dependencies=[Depends(require_live_browse)])
 async def dingtalk_nodes(workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 30):
     try: return await DingtalkClient(get_settings()).list_nodes(workspace_id, operator_id, parent_node_id, next_token, max_results)
     except IntegrationError as exc: raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)})
@@ -1234,6 +1269,11 @@ def _static_response(request: Request, path: Path) -> Response:
 @app.get("/")
 def index(request: Request):
     return _static_response(request, ROOT / "static" / "index.html")
+
+
+# Install only after route registration; auth/mutation/config routes are never cached.
+from . import read_cache  # noqa: E402
+read_cache.install(app)
 
 
 @app.get("/{path:path}")

@@ -5,7 +5,7 @@ import re
 import time
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 from .config import Settings
 from .db import BridgeWalk, Document, FileAuditEvent, ModelConfig, ReviewInstance, ReviewJob, ScoringRuleConfig, SyncRun, WatchPlan, Workspace, WorkspaceRole, utcnow
@@ -265,6 +265,13 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     job = db.scalar(select(ReviewJob).where(ReviewJob.status == "pending").order_by(ReviewJob.created_at).limit(1))
     if not job:
         return False
+    claimed = db.execute(update(ReviewJob).where(ReviewJob.job_id == job.job_id,
+                         ReviewJob.status == "pending").values(status="running",
+                         lease_until=utcnow() + timedelta(hours=1)))
+    db.commit()
+    if not claimed.rowcount:
+        return False
+    db.refresh(job)
     # 第二道闸：入队侧漏网（老任务、批量导入）也不评审数字员工文档；
     # 详情页手动重评（manual_rerun）视为明确的人为意图，放行。
     doc = db.get(Document, job.node_id)
@@ -277,8 +284,6 @@ def process_next_job(db: Session, settings: Settings) -> bool:
         job.status, job.error_code, job.finished_at = "skipped", "personal_workspace", utcnow()
         db.commit()
         return True
-    job.status = "running"
-    db.commit()
     try:
         review = run_review(db, settings, job.node_id, job.trigger)
         if review is None:
@@ -295,7 +300,9 @@ def process_next_job(db: Session, settings: Settings) -> bool:
     except KeyError:
         job.status, job.error_code, job.finished_at = "failed", "document_not_found", utcnow()
     except Exception:
+        db.rollback()
         job.status, job.error_code, job.finished_at = "failed", "review_execution_failed", utcnow()
+    job.lease_until = None
     db.commit()
     return True
 
@@ -846,10 +853,12 @@ def sweep_stale_runs(db: Session, *, sync_runs: bool = True,
              if sync_runs else [])
     for run in stale:
         run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
-    zombie_jobs = (db.scalars(select(ReviewJob).where(ReviewJob.status == "running")).all()
+    zombie_jobs = (db.scalars(select(ReviewJob).where(ReviewJob.status == "running",
+                   or_(ReviewJob.lease_until.is_(None), ReviewJob.lease_until < utcnow()))).all()
                    if review_jobs else [])
     for job in zombie_jobs:
         job.status = "pending"
+        job.lease_until = None
     if bridge_walks:
         for row in db.scalars(select(BridgeWalk)).all():
             db.delete(row)

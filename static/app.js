@@ -11,6 +11,18 @@ let navAbort=null;
 const api=(url,options={})=>fetch(url.replace(/^\//,''),{signal:navAbort&&navAbort.signal,headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));
   if(r.status===401){renderLogin();throw new Error(data.detail?.message||'请先登录')}
   if(!r.ok)throw new Error(data.detail?.message||data.detail||'请求失败');return data});
+// Each region owns its request: same-page filtering must also be last-wins.
+const regionRequests=new Map();
+async function regionFetch(name,url){
+  const previous=regionRequests.get(name);if(previous)previous.abort();
+  const current=new AbortController(),parent=navAbort;regionRequests.set(name,current);
+  const cancel=()=>current.abort();if(parent){if(parent.signal.aborted)cancel();else parent.signal.addEventListener('abort',cancel,{once:true})}
+  try{const data=await api(url,{signal:current.signal});
+    if(current.signal.aborted||regionRequests.get(name)!==current||parent!==navAbort)return null;
+    return data;
+  }catch(e){if(!aborted(e))toast(e.message);return null}
+  finally{if(parent)parent.signal.removeEventListener('abort',cancel)}
+}
 const app=document.querySelector('#app');
 const state={view:'overview',coverageNames:{},depth:0};
 const nf=v=>Number(v||0).toLocaleString('zh-CN');
@@ -62,18 +74,21 @@ function stackedOption(rows,{zoom=false}={}){return{
 /* 图表下钻交互（参考 ai_code_review_web）：点击柱体下钻；点击 x 轴标签区下钻
    对应类目；点击图表空白处回退一级。 */
 function bindChartDrill(id,{keys,labels,onDrill,onBack}){const c=charts.get(id);if(!c)return;
+  // These instances are reused when drilling; do not accumulate handlers.
+  c.off('click');const previousZr=c.getZr&&c.getZr();
+  if(previousZr&&previousZr.__kgDrillHandler)previousZr.off('click',previousZr.__kgDrillHandler);
   c.on('click',p=>{if(!onDrill)return;
     if(p.componentType==='xAxis'){const i=labels.indexOf(String(p.value??p.name??''));if(i>=0&&keys[i]!=null)onDrill(keys[i]);return}
     if(p.componentType==='series'&&keys[p.dataIndex]!=null)onDrill(keys[p.dataIndex])});
   const zr=c.getZr&&c.getZr();if(!zr||!zr.on)return;
-  zr.on('click',p=>{if(p.target)return;
+  const handler=p=>{if(p.target)return;
     let rect=null;try{rect=c.getModel().getComponent('grid',0)?.coordinateSystem?.getRect?.()||null}catch(e){rect=null}
     if(rect&&onDrill){const y=p.offsetY;
       if(y>=rect.y+rect.height&&y<=rect.y+rect.height+42){
         let v=null;try{v=c.convertFromPixel({xAxisIndex:0},[p.offsetX,y])}catch(e){v=null}
         const i=Math.round(Array.isArray(v)?v[0]:v);
         if(Number.isFinite(i)&&i>=0&&i<keys.length){onDrill(keys[i]);return}}}
-    if(onBack)onBack()})}
+    if(onBack)onBack()};zr.__kgDrillHandler=handler;zr.on('click',handler)}
 
 /* ---- scaffolding ---- */
 function shell(title,sub,content,actions=''){disposeCharts();app.innerHTML=`<section class="page-head"><div><h1>${title}</h1><p class="sub">${sub}</p></div><div class="page-actions">${actions}</div></section>${content}`}
@@ -120,7 +135,9 @@ async function renderOverviewTrend(){const title=document.querySelector('#trendT
       onDrill:m=>{state.ovDay=m;renderOverviewTrend()},onBack:null});
     return}
   try{
-    const tree=await api('/api/v1/metrics/increments/tree?'+new URLSearchParams({month:state.ovDay}));
+    const period=state.ovDay;
+    const tree=await regionFetch('overview-trend','/api/v1/metrics/increments/tree?'+new URLSearchParams({month:period}));
+    if(!tree||period!==state.ovDay)return;
     if(!document.querySelector('#trendTitle'))return;
     const rows=tree.rows.slice().sort((a,b)=>a.key<b.key?-1:1).map(r=>({month:r.key.slice(8)+'日',total:r.total,bulk_import:r.bulk,routine:r.routine}));
     title.textContent=`${state.ovDay} 每日新增`;hint.textContent='点击空白处返回月度视图';
@@ -161,8 +178,8 @@ function refreshIncSections(){return Promise.all([renderTreeSection(),renderOrgS
 
 async function renderTreeSection(){const st=state.inc,card=document.querySelector('#treeCard');if(!card)return;
   const treeParams=new URLSearchParams({year:st.month?'':st.year,month:st.month,scope:st.scope||'',department:st.fDept,biz_group:st.fGroup,person:st.fPerson});
-  const tree=await api('/api/v1/metrics/increments/tree?'+treeParams);st._tree=tree;
-  if(!document.querySelector('#treeCard'))return;
+  const tree=await regionFetch('increments-tree','/api/v1/metrics/increments/tree?'+treeParams);if(!tree)return;st._tree=tree;
+  if(document.querySelector('#treeCard')!==card)return;
   const lvl=tree.level,lvlName={year:'年份',month:'月份',day:'日期'}[lvl];
   const crumbs=`<div class="crumbs"><button class="crumb ${lvl==='year'?'current':''}" data-tcrumb="root">全部年份</button>${(st.year||st.month)?`<span class="sep">›</span><button class="crumb ${lvl==='month'?'current':''}" data-tcrumb="year">${(st.month?st.month.slice(0,4):st.year)} 年</button>`:''}${st.month?`<span class="sep">›</span><button class="crumb current" data-tcrumb="month">${st.month.slice(5)} 月</button>`:''}</div>`;
   const treeRows=tree.rows.map(r=>{const label=lvl==='year'?r.key+' 年':lvl==='month'?r.key.slice(5)+' 月':r.key.slice(8)+' 日';
@@ -211,8 +228,8 @@ function fillIncDatalists(){const st=state.inc,org=st&&st._org;if(!org)return;
 
 async function renderOrgSection(){const st=state.inc,card=document.querySelector('#orgCard');if(!card)return;
   const orgYear=st.month?'':(st.year||st.latestYear);
-  const org=await optional(api('/api/v1/metrics/org?'+new URLSearchParams({year:orgYear,month:st.month||''})),{items:[]});
-  if(!document.querySelector('#orgCard'))return;
+  const org=await regionFetch('increments-org','/api/v1/metrics/org?'+new URLSearchParams({year:orgYear,month:st.month||''}));
+  if(!org||document.querySelector('#orgCard')!==card)return;
   st._org=org.items||[];fillIncDatalists();
   const periodLabel=st.month||((st.year||st.latestYear)+' 全年');
   const orgLevel=st.orgDept?(st.orgGroup?'person':'group'):'dept';
@@ -241,8 +258,8 @@ async function renderOrgSection(){const st=state.inc,card=document.querySelector
 
 async function loadOrgEntity(kind,name,year,month){const panel=document.querySelector('#personPanel');if(!panel||!name)return;
   const params=new URLSearchParams({year:month?'':year,month:month||''});params.set(kind,name);
-  const tree=await optional(api('/api/v1/metrics/increments/tree?'+params));
-  if(!document.querySelector('#personPanel'))return;
+  const tree=await regionFetch('person-panel','/api/v1/metrics/increments/tree?'+params);
+  if(document.querySelector('#personPanel')!==panel)return;
   if(!tree){panel.innerHTML='<h2>分布明细</h2><div class="empty">加载失败</div>';return}
   const label=month||(year+' 全年');const unit=tree.level==='day'?'日':'月';
   const series=tree.rows.slice().sort((a,b)=>a.key<b.key?-1:1).map(r=>({k:tree.level==='day'?r.key.slice(8)+'日':r.key.slice(5)+'月',v:r.total,b:r.bulk}));
@@ -257,8 +274,8 @@ async function loadOrgEntity(kind,name,year,month){const panel=document.querySel
     series:[{type:'bar',stack:'t',barMaxWidth:16,data:series.map(x=>x.v-x.b),itemStyle:{color:'#2563eb'}},{type:'bar',stack:'t',barMaxWidth:16,data:series.map(x=>x.b),itemStyle:{color:'#f59e0b',borderRadius:[3,3,0,0]}}]})}
 
 async function loadPerson(personId,year,month){const panel=document.querySelector('#personPanel');if(!panel||!personId)return;
-  const d=await api('/api/v1/metrics/uploaders/'+personId+'/breakdown?'+new URLSearchParams({year:month?'':year,month:month||''}));
-  if(!document.querySelector('#personPanel'))return;
+  const d=await regionFetch('person-panel','/api/v1/metrics/uploaders/'+personId+'/breakdown?'+new URLSearchParams({year:month?'':year,month:month||''}));
+  if(!d||document.querySelector('#personPanel')!==panel)return;
   const label=month||(year+' 全年');
   const series=month?d.days.map(x=>({k:x.day.slice(8)+'日',v:x.count})):d.months.filter(m=>m.month.startsWith(year)).map(x=>({k:x.month.slice(5)+'月',v:x.count}));
   panel.innerHTML=`<div class="card-head" style="margin-bottom:6px"><h2 style="margin:0">${d.name||d.user_id}</h2><span class="chip ${d.matched?'blue':'amber'}">${d.department_name}${d.biz_group_name&&d.biz_group_name!==d.department_name?' · '+d.biz_group_name:''}</span></div>
@@ -284,7 +301,7 @@ function renderFilesBox(d){const box=document.querySelector('#bl-results');if(!b
   if(prev)prev.onclick=()=>{p.offset=Math.max(0,p.offset-50);blSearch()};
   if(next)next.onclick=()=>{p.offset+=50;blSearch()}}
 async function blSearch(){const p=state.bl;const qs=new URLSearchParams({query:p.query||'',workspace_id:p.ws||'',folder:p.folder||'',department:p.dept||'',uploader:p.up||'',month:p.month||'',offset:p.offset,limit:50});
-  const d=await api('/api/v1/files?'+qs);state._filesLast=d;renderFilesBox(d)}
+  const d=await regionFetch('file-results','/api/v1/files?'+qs);if(!d)return;state._filesLast=d;renderFilesBox(d)}
 
 async function documents(){
   const controller=navAbort;

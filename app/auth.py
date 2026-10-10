@@ -35,7 +35,7 @@ SESSION_TTL = timedelta(days=7)
 STATE_TTL_SECONDS = 600
 # The export namespace is handled explicitly at the top of the middleware so
 # it can bypass browser cookies without entering this public-session allowlist.
-PUBLIC_API_PATHS = ("/api/health", "/api/auth/")
+PUBLIC_API_PATHS = ("/api/health", "/api/ready", "/api/auth/")
 
 
 def _sign(settings: Settings, payload: str) -> str:
@@ -161,9 +161,12 @@ def resolve_session(token: str) -> dict | None:
         row = db.scalar(select(AuthSession).where(AuthSession.token_hash == token_hash))
         if not row or (row.expires_at and row.expires_at.replace(tzinfo=None) < utcnow().replace(tzinfo=None)):
             return None
-        row.last_seen_at = utcnow()
-        db.commit()
-        return {"union_id": row.union_id, "name": row.name, "avatar": row.avatar}
+        user = {"union_id": row.union_id, "name": row.name, "avatar": row.avatar}
+        # Avoid a transaction write (and expired-ORM re-read) for every GET.
+        if not row.last_seen_at or utcnow().replace(tzinfo=None) - row.last_seen_at.replace(tzinfo=None) >= timedelta(minutes=5):
+            row.last_seen_at = utcnow()
+            db.commit()
+        return user
 
 
 def revoke_session(token: str) -> None:

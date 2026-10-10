@@ -57,6 +57,6 @@ python -m pytest tests/ -q                  # 全量测试
 
 ## 设计文档
 
-[文档索引与阅读顺序](docs/README.md) · [2026-10-10 工程 Review](docs/reviews/2026-10-10-review.md)（含生产/开发版本差异、风险清单和独立登录页验证；本次登录改造未部署）
+[文档索引与阅读顺序](docs/README.md) · [性能与恢复方案](docs/performance-resilience.md) · [2026-10-10 工程 Review](docs/reviews/2026-10-10-review.md)（原始审查记录，修复状态以发布验收为准）
 
-[可行性与架构](docs/feasibility-and-design.md) · [一期规划](docs/phase-1-plan.md)（历史文档，以当前实现为准） · [评分规则映射](docs/scoring-standard-v1.1-mapping.md) · [增量口径设计](docs/incremental-design.md)
+[可行性与架构](docs/archive/feasibility-and-design.md) · [一期规划](docs/archive/phase-1-plan.md)（历史归档，不作为现行指令） · [评分规则映射](docs/scoring-standard-v1.1-mapping.md) · [增量口径设计](docs/incremental-design.md)

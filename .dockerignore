@@ -11,3 +11,7 @@ __pycache__
 *.db
 *.sqlite*
 *.log
+tests/
+scripts/*probe*.py
+scripts/send_notify_samples.py
+scripts/bizid_crosstest.py
