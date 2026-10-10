@@ -39,6 +39,7 @@ ENDPOINTS = {
 MAX_KEYS = 256
 MAX_BYTES = 32 * 1024 * 1024
 MAX_ENTRY_BYTES = 2 * 1024 * 1024
+MAX_DATABASE_KEYS = 512
 LEASE_SECONDS = 120
 _memory: OrderedDict = OrderedDict()
 _bytes = 0
@@ -102,7 +103,18 @@ def _refresh(key, name, parameters):
         now = utcnow()
         with SessionLocal() as db:
             row = db.get(ReadCacheEntry, key)
+            if row and row.generated_at and row.payload is not None and _age(row.generated_at) < get_settings().read_cache_ttl_seconds:
+                return _remember(key, row.payload, row.generated_at)
             if row is None:
+                from sqlalchemy import func
+                if (db.scalar(select(func.count()).select_from(ReadCacheEntry)) or 0) >= MAX_DATABASE_KEYS:
+                    # Evict only old, reconstructable responses; never business rows.
+                    victim = db.scalar(select(ReadCacheEntry.cache_key).where(
+                        ReadCacheEntry.lease_until.is_(None)).order_by(ReadCacheEntry.generated_at).limit(1))
+                    if not victim:
+                        raise HTTPException(503, "缓存繁忙，请稍后重试。")
+                    db.execute(delete(ReadCacheEntry).where(ReadCacheEntry.cache_key == victim,
+                               ReadCacheEntry.lease_until.is_(None)))
                 db.add(ReadCacheEntry(cache_key=key, endpoint=name, parameters=parameters))
                 try:
                     db.commit()
