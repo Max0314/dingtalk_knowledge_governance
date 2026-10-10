@@ -300,7 +300,8 @@ class HistoricalFileNode(Base):
                       Index("ix_hfn_snapshot_file_created", "snapshot_id", "node_type", "source_created_at", "node_id"),
                       # anti-join for baseline∪live dedup (metrics aggregation, /api/v1/files)
                       Index("ix_hfn_snapshot_node", "snapshot_id", "node_id"),
-                      Index("ix_hfn_file_count_cover", "snapshot_id", "node_type", "node_id", "workspace_id"))
+                      Index("ix_hfn_file_count_cover", "snapshot_id", "node_type", "node_id", "workspace_id"),
+                      Index("ix_hfn_file_page_cover", "snapshot_id", "node_type", "source_created_at", "node_id", "workspace_id"))
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     snapshot_id: Mapped[str] = mapped_column(ForeignKey("historical_snapshots.snapshot_id"), index=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), index=True)
@@ -655,6 +656,7 @@ EXTRA_INDEXES = {
         "ix_review_instances_node_created": "CREATE INDEX ix_review_instances_node_created ON review_instances (node_id, created_at)",
     },
     "historical_file_nodes": {
+        "ix_hfn_file_page_cover": "CREATE INDEX ix_hfn_file_page_cover ON historical_file_nodes (snapshot_id, node_type, source_created_at, node_id, workspace_id)",
         "ix_hfn_file_count_cover": "CREATE INDEX ix_hfn_file_count_cover ON historical_file_nodes (snapshot_id, node_type, node_id, workspace_id)",
         "ix_hfn_snapshot_node": "CREATE INDEX ix_hfn_snapshot_node ON historical_file_nodes (snapshot_id, node_id)",
         "ix_hfn_snapshot_file_created": "CREATE INDEX ix_hfn_snapshot_file_created ON historical_file_nodes (snapshot_id, node_type, source_created_at, node_id)",

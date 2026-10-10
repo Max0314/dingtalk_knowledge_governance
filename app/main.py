@@ -5,11 +5,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, false, func, or_, select, union_all
+from sqlalchemy import and_, case, false, func, literal, or_, select, union_all
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from . import bi_export, metrics, orgmap
@@ -530,17 +531,42 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         need = offset + limit
         # Top N of the merged order can only come from top N of each arm.
         # Limit BEFORE union/filesort, but only materialize the final page.
-        base_page = base.order_by(HistoricalFileNode.source_created_at.desc(),
+        # Page through narrow covering indexes first. Selecting names/URLs
+        # here forced clustered-row reads for every rejected baseline node.
+        narrow_base = base.with_only_columns(HistoricalFileNode.node_id, HistoricalFileNode.workspace_id,
+                         HistoricalFileNode.source_created_at.label("created_at"), literal("baseline").label("origin"))
+        narrow_live = live.with_only_columns(Document.node_id, Document.workspace_id,
+                         Document.source_created_at.label("created_at"), literal("live").label("origin"))
+        if not workspace_id and not query and not uploader:
+            narrow_base = narrow_base.with_hint(HistoricalFileNode, "FORCE INDEX (ix_hfn_file_page_cover)", "mysql")
+            narrow_live = narrow_live.with_hint(Document, "FORCE INDEX (ix_documents_current_cover)", "mysql")
+        base_page = narrow_base.order_by(HistoricalFileNode.source_created_at.desc(),
                                   HistoricalFileNode.node_id.desc()).limit(need).subquery()
-        live_page = live.order_by(Document.source_created_at.desc(),
+        live_page = narrow_live.order_by(Document.source_created_at.desc(),
                                   Document.node_id.desc()).limit(need).subquery()
         merged = union_all(select(base_page), select(live_page)).subquery()
-        rows = db.execute(select(merged).order_by(merged.c.created_at.desc(), merged.c.node_id.desc())
+        page = db.execute(select(merged).order_by(merged.c.created_at.desc(), merged.c.node_id.desc())
                           .offset(offset).limit(limit)).all()
+        page_ids = [r.node_id for r in page]
+        page_docs = {doc.node_id: doc for doc in db.scalars(select(Document).where(Document.node_id.in_(page_ids)))} if page_ids else {}
+        historical = {(node.node_id, node.workspace_id): node for node in db.scalars(select(HistoricalFileNode).where(
+                       HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_id.in_([
+                           r.node_id for r in page if r.origin == "baseline"])))} if page else {}
+        rows = []
+        for row in page:
+            node = page_docs.get(row.node_id) if row.origin == "live" else historical.get((row.node_id, row.workspace_id))
+            if node:
+                rows.append(SimpleNamespace(node_id=row.node_id, workspace_id=row.workspace_id, created_at=row.created_at,
+                            name=node.name, extension=node.extension, url=node.url,
+                            creator=node.uploader_key if row.origin == "live" else node.creator_user_id))
+        if not query and not uploader:
+            base = base.with_hint(HistoricalFileNode,
+                                 "FORCE INDEX (ix_hfn_file_page_cover)" if month else "FORCE INDEX (ix_hfn_file_count_cover)", "mysql")
+            live = live.with_hint(Document, "FORCE INDEX (ix_documents_current_cover)", "mysql")
         total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
                 (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
     ids = [r.node_id for r in rows]
-    docs = {d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {}
+    docs = page_docs if not folder else ({d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {})
     latest_review, _ = _latest_reviews(db, ids)
     creators = {r.creator for r in rows if r.creator and r.node_id not in docs}
     emp = {e.user_id: e for e in db.scalars(select(EmployeeMap).where(EmployeeMap.user_id.in_(creators)))} if creators else {}
