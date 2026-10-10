@@ -182,6 +182,7 @@ umask 077
 read -r -p '应用绝对路径: ' KG_APP_DIR
 read -r -p '批准的只读仓库地址: ' KG_REPO_URL
 read -r -p '批准的完整发布 SHA: ' KG_RELEASE_SHA
+export KG_RELEASE_SHA
 test "${KG_APP_DIR:0:1}" = /
 test ! -e "$KG_APP_DIR"
 git clone "$KG_REPO_URL" "$KG_APP_DIR"
@@ -201,11 +202,13 @@ chmod 600 .env
 read -r -p '登记的 Compose 项目名: ' KG_PROJECT_NAME
 python3 scripts/pause_background_work.py --apply
 docker compose -p "$KG_PROJECT_NAME" config --quiet
-docker compose -p "$KG_PROJECT_NAME" --profile background build api worker watcher
+KG_RELEASE_SHA="$KG_RELEASE_SHA" docker compose -p "$KG_PROJECT_NAME" --profile background build api worker watcher
 docker compose -p "$KG_PROJECT_NAME" up -d --no-deps api
 ```
 
 构建后台镜像不启动容器，避免未来误用旧镜像。暂停脚本产生的 `.env.quota-backup-*` 含原秘密，权限为 600，部署后转入受控秘密备份位置，不作普通附件。脚本会恢复基线预算；若发布单另批预算，在脚本之后应用差异并核对。构建失败不能临时换未批准的依赖或源码版本。
+
+镜像的 `org.opencontainers.image.revision` 标签必须与批准的完整 SHA 相等；使用已导出的 `KG_RELEASE_SHA` 构建，不接受生产标签为 `development`。发布单同时记录 Git SHA、镜像 ID 与标签，回滚按保留的旧镜像 ID/标签，不凭目录里的最新源码判断容器版本。
 
 ### 历史数据初始化
 
@@ -243,6 +246,7 @@ docker compose -p "$KG_PROJECT_NAME" exec -T api python -c \
    read -r -p '现有应用绝对路径: ' KG_APP_DIR
    read -r -p '现有 Compose 项目名: ' KG_PROJECT_NAME
    read -r -p '批准的完整发布 SHA: ' KG_RELEASE_SHA
+   export KG_RELEASE_SHA
    cd "$KG_APP_DIR"
    git status --short
    test -z "$(git status --porcelain)"
@@ -273,7 +277,7 @@ docker compose -p "$KG_PROJECT_NAME" exec -T api python -c \
 
    ```bash
    docker compose -p "$KG_PROJECT_NAME" config --quiet
-   docker compose -p "$KG_PROJECT_NAME" --profile background build api worker watcher
+   KG_RELEASE_SHA="$KG_RELEASE_SHA" docker compose -p "$KG_PROJECT_NAME" --profile background build api worker watcher
    docker compose -p "$KG_PROJECT_NAME" up -d --no-deps --force-recreate api
    ```
 

@@ -20,3 +20,13 @@ test('navigation invalidates a same-page region even if fetch ignores abort',asy
   vm.runInContext('navAbort.abort();navAbort=new AbortController()',context);
   finish({period:'old'});assert.equal(await response,null);
 });
+test('person-panel error retry invokes the original selection callback',async()=>{
+  let retried=0;
+  const button={},notice={dataset:{},append:()=>{},remove:()=>{}},box={querySelector:()=>null,prepend:()=>{}};
+  const context=vm.createContext({AbortController,navAbort:new AbortController(),aborted:()=>false,toast:()=>{},
+    document:{querySelector:()=>box,createElement:tag=>tag==='button'?button:notice},
+    api:async()=>{throw new Error('synthetic failure')},retrySelection:()=>{retried++}});
+  vm.runInContext(section,context);
+  assert.equal(await vm.runInContext("regionFetch('person-panel','failed',retrySelection)",context),null);
+  button.onclick();assert.equal(retried,1);
+});
