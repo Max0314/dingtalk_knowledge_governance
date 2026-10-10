@@ -128,7 +128,8 @@ def _refresh(key, name, parameters):
             got = db.execute(update(ReadCacheEntry).where(
                 ReadCacheEntry.cache_key == key,
                 or_(ReadCacheEntry.lease_until.is_(None), ReadCacheEntry.lease_until < now)
-            ).values(lease_owner=owner, lease_until=now + timedelta(seconds=LEASE_SECONDS)))
+            ).values(lease_owner=owner, lease_until=now + timedelta(seconds=LEASE_SECONDS))
+                .execution_options(synchronize_session=False))
             db.commit()
             if got.rowcount:
                 break
@@ -151,7 +152,8 @@ def _refresh(key, name, parameters):
         with SessionLocal() as db:
             got = db.execute(update(ReadCacheEntry).where(
                 ReadCacheEntry.cache_key == key, ReadCacheEntry.lease_owner == owner
-            ).values(payload=payload, generated_at=generated, lease_owner="", lease_until=None))
+            ).values(payload=payload, generated_at=generated, lease_owner="", lease_until=None)
+                .execution_options(synchronize_session=False))
             db.commit()
             if not got.rowcount:
                 raise HTTPException(503, "刷新租约已过期，请重试。")
@@ -159,7 +161,8 @@ def _refresh(key, name, parameters):
     finally:
         with SessionLocal() as db:
             db.execute(update(ReadCacheEntry).where(ReadCacheEntry.cache_key == key,
-                       ReadCacheEntry.lease_owner == owner).values(lease_owner="", lease_until=None))
+                       ReadCacheEntry.lease_owner == owner).values(lease_owner="", lease_until=None)
+                       .execution_options(synchronize_session=False))
             db.commit()
 
 

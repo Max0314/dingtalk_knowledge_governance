@@ -543,7 +543,8 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         narrow_live = live.with_only_columns(Document.node_id, Document.workspace_id,
                          Document.source_created_at.label("created_at"), literal("live").label("origin"))
         if not workspace_id and not query and not uploader:
-            narrow_base = narrow_base.with_hint(HistoricalFileNode, "FORCE INDEX (ix_hfn_file_page_cover)", "mysql")
+            narrow_base = narrow_base.with_hint(HistoricalFileNode,
+                "FORCE INDEX (ix_hfn_snapshot_node)" if inventory["baseline_ids"] is not None else "FORCE INDEX (ix_hfn_file_page_cover)", "mysql")
             narrow_live = narrow_live.with_hint(Document, "FORCE INDEX (ix_documents_current_cover)", "mysql")
         base_page = narrow_base.order_by(HistoricalFileNode.source_created_at.desc(),
                                   HistoricalFileNode.node_id.desc()).limit(need).subquery()

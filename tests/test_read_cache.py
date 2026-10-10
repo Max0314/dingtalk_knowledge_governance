@@ -144,3 +144,32 @@ def test_readiness_rejects_database_failure():
         assert "synthetic" not in response.text
     finally:
         main.app.dependency_overrides.pop(main.db_session, None)
+
+
+def test_nested_source_refresh_does_not_deadlock_the_two_refresh_threads(caching):
+    suffix = uuid.uuid4().hex
+    names = ["outer_a_" + suffix, "outer_b_" + suffix]
+    original = read_cache._registry["file_inventory"]
+    calls = []
+    def source(db, snapshot):
+        calls.append(1)
+        time.sleep(.05)
+        return {"baseline_total": 129}
+    def outer(db):
+        return read_cache.source_data("file_inventory", {"snapshot": suffix}, db)
+    read_cache._registry["file_inventory"] = (source, {"snapshot": suffix})
+    for name in names:
+        read_cache._registry[name] = (outer, {})
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(read_cache.read, name, {}) for name in names]
+            assert all(json.loads(future.result(timeout=5).body)["baseline_total"] == 129 for future in futures)
+        assert len(calls) == 1
+    finally:
+        read_cache._registry["file_inventory"] = original
+        for name in names:
+            read_cache._registry.pop(name)
+        with SessionLocal() as db:
+            db.execute(delete(ReadCacheEntry).where(ReadCacheEntry.endpoint.in_(names)))
+            db.execute(delete(ReadCacheEntry).where(ReadCacheEntry.cache_key == read_cache._key("file_inventory", {"snapshot": suffix})))
+            db.commit()
