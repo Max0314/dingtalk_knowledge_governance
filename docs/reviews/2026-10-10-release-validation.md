@@ -6,7 +6,7 @@
 
 - 发布分支 `codex/performance-resilience` 保留原有文体/评分/Office 保护改动，整合生产安全修复 `6d904e7`，未回退付费 API 防护。
 - 后端候选 `77ca679` 完成真实 MySQL/HTTP 验证；最终版本还包含明细重试、业务元数据转义、镜像 revision 标签与文档更新。
-- 合并、生产 SHA/镜像与生产压测：部署完成后补录，当前不写成已验收。
+- 已合并至 main（合并提交 `f1f27ad`），同时推送 GitHub origin 与 NeoFlow neoflow。功能验收/初次生产发布版本 `47d557e747e826325ed86131f7a797871f0fb936`；后续本验收文档归档提交不改变业务代码。最终运行 revision 必须与部署目录 HEAD 相同，用下方检查命令核对，不使用文档自引用 SHA。
 - 生产端口 `39021`，同机隔离项目 `kg_validation_20261010` 端口 `39028`。外部 MySQL 8.4.10，没有数据库/Redis 容器，未修改其他子仓库。
 
 ## 回归
@@ -14,7 +14,7 @@
 - Windows 全新临时工作目录：200 项 Python 测试通过，RuntimeWarning 视为错误。
 - 目标 Python 3.11 镜像、只读测试挂载、禁用网络：200 项通过，1 条 Starlette/httpx 测试适配弃用警告，未称零警告。
 - 19 项 Node 测试通过：独立登录、失败关闭、返回地址、筛选竞态、重试、文档/评分理由转义、危险 URL 拒绝。
-- `compileall`、前端 `node --check` 通过；最终 Compose 配置校验在发布阶段完成。
+- `compileall`、前端 `node --check`、最终 Compose `config --quiet` 通过。最终目标镜像 Python 3.11.17 再次完成 200 项回归。
 - 不使用真实正文、人员资料或秘密作为测试夹具。
 
 ## HTTP 压测与查询优化
@@ -26,6 +26,8 @@
 | 初轮缓存 | 1,200；40 req/s；20 并发上限 | 3.67ms | 6.04ms | 9.74ms | 0 |
 | 高负载 | 6,000；100 req/s；50 并发上限 | 4.83ms | 46.52ms | 180.78ms | 0 |
 | 库存差异缓存后 | 1,200；40 req/s；20 并发上限 | 3.03ms | 4.22ms | 5.03ms | 0 |
+| 最终功能版隔离验收 | 6,000；100 req/s；50 并发上限 | 4.26ms | 27.71ms | 110.27ms | 0 |
+| 生产部署后 | 1,200；40 req/s；20 并发上限 | 3.68ms | 5.42ms | 10.15ms | 0 |
 
 这是服务器 loopback HTTP 延时，含会话验证，不是公网首屏/渲染时间或 50 个实际用户。并发值是连接/在途上限。
 
@@ -38,7 +40,7 @@
 - 一致性流式加密逻辑备份：27 张业务表、604,548 行，39,743,312 字节，39.18 秒；排除会话和可重建缓存，无知识库正文。
 - 恢复到随机专属前缀临时表：全部行逐列 SHA-256/行数匹配，外键孤儿 0，51.76 秒，生产表覆盖数 0；工具仅清除本次确切临时表。
 - 是应用逻辑数据验证，不是整机/共享 MySQL 灾备切换。备份不含 DDL；真正恢复需 DBA 在隔离兼容结构上验收再切换，不支持直接覆盖生产表。
-- 受控备份目录 `/home/max/backups/kg-20261010`（0700），文件 0600；密钥分离状态最终发布时补录。配置副本不作为普通附件，不输出秘密。
+- 受控备份目录 `/home/max/backups/kg-20261010`（0700），文件 0600；密钥已移至独立私有目录 `/home/max/private/kg-backup-keys`（0700，密钥 0600）。同机分目录不是异地灾备，负责人仍需在可信秘密管理/异地备份系统分离存管。配置副本不作为普通附件，不输出秘密。
 - 旧镜像保留 `kg-rollback:20261010-6d904e7`；未清理生产数据库、运行数据或旧镜像。
 
 最终后端候选隔离容器演练（每项后 50 请求）：
@@ -78,3 +80,26 @@ R05/R06/R08/R16 剩余项属于后续正确性/后台启用门槛。本次不自
 ## 时效解释
 
 本地库到聚合硬上限约 10 分钟，加响应硬上限 15 分钟，最坏约 25 分钟。只刷新本地元数据，不因浏览外呼钉钉。采集暂停期间不能承诺上游到本地半小时；无评分表示未评审，不用 0 分冒充平均分。
+
+## 生产验收与交接
+
+- 实测功能版本 `47d557e` 的镜像 ID：`sha256:f1907a68bdeedbaae8dc4f7ce50a656c8453bb948df9504c0c568e76a6f56d41`。发布先保留旧镜像，再只替换 API；最终归档提交重新构建时只更新文档/revision，依赖及业务代码层不变。
+- 生产 `knowledge_governance-api-1` healthy，loopback 39021；worker/watcher 不运行。`/api/health`、`/api/ready` 本机及公网均 200。
+- 认证开启、demo 关闭；full_scan/review/audit_pull/bridge/bridge_walks/notify/stream/live_browse 全部 false。评审队列 succeeded 2,533、skipped 390，无 pending/running；近 30 分钟同步失败 0；当前容器近期日志 ERROR/Traceback 标记 0。
+- 压测后 27 张业务表总行数 604,548 未变，钉钉受保护适配器计数 0；临时合成会话有效数 0。缓存即时快照 15 键、183,373 字节。共享 DB 快照 Threads_connected 94、Threads_running 2、累计 Slow_queries 287；这些是全实例数，不能归因于本应用。
+- 生产 API 部署后空闲采样内存 77.27MiB、CPU 0.06%、10 PID；Docker 已核对 2 CPU/768MiB/128 PID 和关闭访问日志。
+- 公网匿名 `#/increments` 正确进入单独登录页，保留反代前缀与业务 hash；无菜单，只加载 login.js，不加载 ECharts/业务数据。桌面及 390px 宽验证无横向溢出，授权按钮可见、可用；未执行真实扫码授权，仍需员工验收。
+- 隔离验证容器/网络与专属临时 worktree 已移除，39028 不再占用；代码可由 Git 恢复，生产目录、备份、旧回滚镜像保留。未知历史 runtime 资料未删除。
+
+最终版本/容器核对（不打印环境或秘密）：
+
+```sh
+cd /home/max/apps/dingtalk_knowledge_governance
+git rev-parse HEAD
+git status --short
+docker compose -p knowledge_governance --profile background ps -a
+docker inspect --format 'image={{.Image}} revision={{index .Config.Labels "org.opencontainers.image.revision"}}' knowledge_governance-api-1
+curl --fail --silent --show-error http://127.0.0.1:39021/api/ready
+```
+
+所有测量均为有界、短时测试，不能证明永不死机/丢数据，也不覆盖评审 worker 的长期负载。后台启用、正式历史组织报表、真实登录、异地备份和告警门槛见前述剩余项及部署指引。
