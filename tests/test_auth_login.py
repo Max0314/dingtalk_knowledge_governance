@@ -138,3 +138,22 @@ def test_callback_success_restores_deep_link(login_settings, monkeypatch):
     assert response.headers["location"] == target
     assert "HttpOnly" in response.headers["set-cookie"]
     assert "Secure" in response.headers["set-cookie"]
+
+
+def test_callback_rejects_state_from_a_different_browser(login_settings, monkeypatch):
+    async def forbidden(*_):
+        raise AssertionError("state mismatch must fail before OAuth network calls")
+    monkeypatch.setattr(auth, "exchange_user", forbidden)
+    state = auth.make_state(login_settings, login_settings.public_base_url + "/")
+    response = TestClient(app).get("/api/auth/dingtalk/callback", params={"code": "synthetic", "state": state}, follow_redirects=False)
+    assert response.status_code == 303
+    assert "state_invalid" in response.headers["location"]
+
+
+def test_login_url_sets_http_only_browser_binding(login_settings):
+    client = TestClient(app)
+    response = client.get("/api/auth/login-url")
+    assert response.status_code == 200
+    state = parse_qs(urlsplit(response.json()["login_url"]).query)["state"][0]
+    assert client.cookies.get(auth.STATE_COOKIE_NAME) == auth.hashlib.sha256(state.encode()).hexdigest()
+    assert "HttpOnly" in response.headers["set-cookie"]

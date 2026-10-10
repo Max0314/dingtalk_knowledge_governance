@@ -129,3 +129,18 @@ def test_paused_review_and_live_browse_fail_closed(monkeypatch):
         assert client.post("/api/v1/documents/demo-001/reviews", json={}).status_code == 423
         assert client.get("/api/v1/dingtalk/knowledge-bases?operator_id=synthetic").status_code == 423
         assert client.get("/api/ready").status_code == 200
+
+
+def test_readiness_rejects_database_failure():
+    import app.main as main
+    from sqlalchemy.exc import OperationalError
+    class FailedDB:
+        def execute(self, statement):
+            raise OperationalError("", {}, Exception("synthetic"))
+    main.app.dependency_overrides[main.db_session] = lambda: FailedDB()
+    try:
+        response = TestClient(app).get("/api/ready")
+        assert response.status_code == 503
+        assert "synthetic" not in response.text
+    finally:
+        main.app.dependency_overrides.pop(main.db_session, None)
