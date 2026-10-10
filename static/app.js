@@ -66,7 +66,7 @@ function renderChart(id,option){const el=document.getElementById(id);if(!el)retu
   if(!c){c=echarts.init(el);charts.set(id,c);
     if(chartObserver){chartWidths.set(el,Math.round(el.getBoundingClientRect().width));chartObserver.observe(el)}}
   /* 复用实例 + notMerge：下钻/筛选时不再 dispose+init 重建画布，掉的就是那一下闪。 */
-  c.setOption(option,{notMerge:true})}
+  c.setOption({...option,animation:false},{notMerge:true})}
 function stackedOption(rows,{zoom=false}={}){return{
   tooltip:{trigger:'axis',axisPointer:{type:'shadow'},formatter:ps=>{const m=ps[0].axisValue;const r=ps.find(p=>p.seriesName==='日常新增')?.value||0;const b=ps.find(p=>p.seriesName==='批量导入')?.value||0;const row=rows.find(x=>x.month===m);const score=row?.average_ai_score;const scoreLine=score==null?'':`<br/>平均 AI 评分：<b>${score}</b>（${nf(row.scored_documents||0)} 篇）`;return `<b>${m}</b><br/>全量新增：<b>${nf(r+b)}</b><br/>日常新增：${nf(r)}<br/>批量导入：${nf(b)}${scoreLine}`}},
   legend:{data:['日常新增','批量导入'],top:0,itemWidth:14,itemHeight:9,textStyle:{fontSize:12,color:'#6b7280'}},

@@ -483,6 +483,9 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     ordered streams are merged in Python — page one costs ~2×(offset+limit)
     indexed rows instead of a 140k-row temp-table sort."""
     snapshot = metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    inventory = read_cache.source_data("file_inventory", {"snapshot": ""}, db)
+    if inventory["snapshot"] != snapshot:
+        inventory = file_inventory(snapshot=snapshot, db=db)
     # 不可见库（连续缺席/404 自动标记）双臂都不进当前检索——基线臂也要滤
     # （codex 第九轮 P1）；历史数据仍可走基线专用接口查询。
     inactive_ws = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
@@ -528,6 +531,8 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         # 形态优化很差，而两次 COUNT(*) 都要过它。改法与 metrics._collect 的
         # live 臂一致（该处已验证走 ix_hfn_snapshot_node）。
         base = base.outerjoin(Document, Document.node_id == HistoricalFileNode.node_id)                    .where(Document.node_id.is_(None))
+        if inventory["baseline_ids"] is not None:
+            base = base.where(HistoricalFileNode.node_id.in_(inventory["baseline_ids"]))
         need = offset + limit
         # Top N of the merged order can only come from top N of each arm.
         # Limit BEFORE union/filesort, but only materialize the final page.
@@ -563,8 +568,11 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
             base = base.with_hint(HistoricalFileNode,
                                  "FORCE INDEX (ix_hfn_file_page_cover)" if month else "FORCE INDEX (ix_hfn_file_count_cover)", "mysql")
             live = live.with_hint(Document, "FORCE INDEX (ix_documents_current_cover)", "mysql")
-        total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
-                (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
+        if not any((workspace_id, query, month, department, uploader)):
+            total = inventory["baseline_total"] + inventory["live_total"]
+        else:
+            total = (db.scalar(select(func.count()).select_from(base.subquery())) or 0) + \
+                    (db.scalar(select(func.count()).select_from(live.subquery())) or 0)
     ids = [r.node_id for r in rows]
     docs = page_docs if not folder else ({d.node_id: d for d in db.scalars(select(Document).where(Document.node_id.in_(ids)))} if ids else {})
     latest_review, _ = _latest_reviews(db, ids)
@@ -584,6 +592,26 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
             "has_detail": doc is not None,
         })
     return {"total": total, "offset": offset, "limit": limit, "snapshot_id": snapshot, "items": items}
+
+
+def file_inventory(db: Session, snapshot: str = ""):
+    """Small local source cache: baseline-only IDs and live count, not bodies.
+
+    Bound IDs to 10k; a larger gap falls back to regular SQL pagination rather
+    than filling RAM/JSON with hundreds of thousands of identifiers.
+    """
+    snapshot = snapshot or metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    inactive = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
+    stmt = select(HistoricalFileNode.node_id).outerjoin(Document,
+            Document.node_id == HistoricalFileNode.node_id).where(
+            HistoricalFileNode.snapshot_id == snapshot, HistoricalFileNode.node_type == "file",
+            HistoricalFileNode.workspace_id.not_in(inactive), Document.node_id.is_(None))
+    ids = list(db.scalars(stmt.limit(10001)))
+    total = len(ids) if len(ids) <= 10000 else (db.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
+    live_count = db.scalar(select(func.count()).select_from(Document).where(
+        Document.is_folder == false(), Document.is_deleted == false(), Document.workspace_id.not_in(inactive))) or 0
+    return {"snapshot": snapshot, "baseline_ids": ids if len(ids) <= 10000 else None,
+            "baseline_total": total, "live_total": live_count}
 
 
 class NotifyTestRequest(BaseModel):
@@ -1306,6 +1334,7 @@ def index(request: Request):
 # Install only after route registration; auth/mutation/config routes are never cached.
 from . import read_cache  # noqa: E402
 read_cache.install(app)
+read_cache.register_source(file_inventory, {"snapshot": ""})
 
 
 @app.get("/{path:path}")

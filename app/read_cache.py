@@ -49,6 +49,11 @@ _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kg-read-cache"
 _registry = {}
 _stop = threading.Event()
 _maintenance = None
+INTERNAL_SOURCES = {"file_inventory"}
+
+
+def _ttl(name):
+    return 300 if name in INTERNAL_SOURCES else get_settings().read_cache_ttl_seconds
 
 
 def enabled():
@@ -103,7 +108,7 @@ def _refresh(key, name, parameters):
         now = utcnow()
         with SessionLocal() as db:
             row = db.get(ReadCacheEntry, key)
-            if row and row.generated_at and row.payload is not None and _age(row.generated_at) < get_settings().read_cache_ttl_seconds:
+            if row and row.generated_at and row.payload is not None and _age(row.generated_at) < _ttl(name):
                 return _remember(key, row.payload, row.generated_at)
             if row is None:
                 from sqlalchemy import func
@@ -129,7 +134,7 @@ def _refresh(key, name, parameters):
                 break
             db.expire_all()
             row = db.get(ReadCacheEntry, key)
-            if row and row.generated_at and row.payload is not None and _age(row.generated_at) < get_settings().read_cache_ttl_seconds:
+            if row and row.generated_at and row.payload is not None and _age(row.generated_at) < _ttl(name):
                 return _remember(key, row.payload, row.generated_at)
         if time.monotonic() >= deadline:
             raise HTTPException(503, "数据正在准备，请稍后重试。", headers={"Retry-After": "2"})
@@ -199,6 +204,30 @@ def read(name, parameters):
     })
 
 
+def register_source(fn, defaults):
+    if fn.__name__ not in INTERNAL_SOURCES:
+        raise ValueError("source_not_allowlisted")
+    _registry[fn.__name__] = (fn, defaults)
+
+
+def source_data(name, parameters, db):
+    if name not in INTERNAL_SOURCES:
+        raise ValueError("source_not_allowlisted")
+    if not enabled():
+        return _registry[name][0](**parameters, db=db)
+    key = _key(name, parameters)
+    entry = _load(key)
+    age = _age(entry[1]) if entry else float("inf")
+    if age >= 300:
+        if entry and age < 600:
+            _launch(key, name, parameters)
+        else:
+            # A source is called inside a refresh thread: never block waiting
+            # on another task in the same bounded executor (nested deadlock).
+            entry = _refresh(key, name, parameters)
+    return json.loads(entry[0])
+
+
 def install(app):
     for route in app.routes:
         if not isinstance(route, APIRoute) or route.endpoint.__name__ not in ENDPOINTS:
@@ -223,7 +252,7 @@ def install(app):
 
 def _maintain():
     # Core screens prewarm after startup, independently of the first viewer.
-    core = ["dashboard", "metrics_monthly", "metrics_increments_tree",
+    core = ["file_inventory", "dashboard", "metrics_monthly", "metrics_increments_tree",
             "uploader_months_api", "files_unified", "workspaces", "reviews_list"]
     while not _stop.is_set():
         if enabled():
@@ -245,7 +274,7 @@ def _maintain():
                     if _stop.is_set():
                         break
                     entry = _load(key)
-                    if not entry or _age(entry[1]) >= get_settings().read_cache_ttl_seconds:
+                    if not entry or _age(entry[1]) >= _ttl(name):
                         try:
                             _launch(key, name, params).result(timeout=25)
                         except Exception:
