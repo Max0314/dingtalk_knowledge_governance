@@ -566,6 +566,8 @@ proxy_pass 末尾 / 用于去掉入口子路径，后端收到 /api/...；不能
 3. `KG_LIVE_BROWSE_ENABLED=false`：实时目录代理暂停，普通浏览只读本地数据。保持其余后台开关 false。`/api/ready` 代替 `/api/health` 作为容器健康检查；存活不等于数据库就绪。
 4. API 资源限额与轮转日志由 Compose 生效；部署后 `docker inspect` 核对内存/CPU/PID 上限，不仅看 YAML。共享 MySQL 不可停机压测，先用独立 Compose 项目在 39028 验证，完成后关闭并移除该临时 API 容器。
 5. 按 `ops_resilience.py` 执行受限 HTTP 压测、加密备份和隔离表恢复。备份立即 `docker cp` 到权限 0700 的受控目录；键文件 0600，后续分离存管。不要把备份/键文件放仓库、发送给 AI 或复制到文档目录。
-6. 回滚：保留部署前 API 镜像，创建受控 Compose override，仅替换 `api.image`、禁用 build，使用 `up -d --no-deps --no-build api`。验证 ready/原数据/额度，再恢复批准版本。严禁 `down -v`、停外部数据库或改代码“回滚”。
+6. 回滚：保留部署前 API 镜像，使用 `ops/compose.rollback.yml` 和明确的 `KG_ROLLBACK_IMAGE`，`up -d --no-deps --no-build api`。旧版没有 `/api/ready`，override 临时改用 `/api/health`；恢复新版后移除 override 再检查 ready/原数据/额度。严禁 `down -v`、停外部数据库或改代码“回滚”。
 7. 冷缓存丢失演练只能清可重建的 `read_cache_entries`，不清 canonical 业务表。数据库不可达仅在临时 API 中设置不可达 URL，再恢复原配置；不操作共享数据库端口/防火墙。生产上线不携带故障注入配置。
 8. 全量/日志/评审再次启用前，评估主表孤儿、组织历史快照缺口、积压任务、历史脚本绕过计数和长期资源曲线；本次性能达标不构成启用授权。
+
+隔离演练可使用 `python3 ops/drill_staging.py --project kg_validation_日期 --directory /home/max/apps/kg-validation-日期 --rollback-image 批准的本地镜像`。脚本仅允许该临时项目/路径前缀和 39028；会清除可重建查询缓存、短时注入临时 API 数据库连接失败、测试旧镜像，再恢复新镜像。严禁绕过前缀检查在生产运行。某些 Docker 对 tmpfs 上 `docker cp` 无法归档，需先在容器内把**加密备份**复制到受控临时层路径再复制出，确认校验后随容器替换清理；正文仍不得持久化。

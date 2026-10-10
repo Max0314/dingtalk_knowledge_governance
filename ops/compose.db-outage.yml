@@ -1,0 +1,6 @@
+# FAULT INJECTION: ONLY for isolated kg_validation_* projects on port 39028.
+# No shared database service is stopped; the temporary API cannot connect.
+services:
+  api:
+    environment:
+      KG_DATABASE_URL: mysql+pymysql://kg_drill:invalid@127.0.0.1:1/kg_drill
