@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_, select, union_all
+from sqlalchemy import and_, case, false, func, or_, select, union_all
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 from . import bi_export, metrics, orgmap
@@ -497,7 +497,7 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
         Document.extension, Document.url,
         Document.source_created_at.label("created_at"),
         Document.uploader_key.label("creator"),
-    ).where(Document.is_folder.is_(False), Document.is_deleted.is_(False),
+    ).where(Document.is_folder == false(), Document.is_deleted == false(),
             Document.workspace_id.not_in(inactive_ws))  # 不可见库的增量不进检索
     if workspace_id:
         base = base.where(HistoricalFileNode.workspace_id == workspace_id)

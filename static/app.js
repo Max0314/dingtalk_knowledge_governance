@@ -20,7 +20,14 @@ async function regionFetch(name,url){
   try{const data=await api(url,{signal:current.signal});
     if(current.signal.aborted||regionRequests.get(name)!==current||parent!==navAbort)return null;
     return data;
-  }catch(e){if(!aborted(e))toast(e.message);return null}
+  }catch(e){if(!aborted(e)&&regionRequests.get(name)===current&&parent===navAbort){
+    toast(e.message);
+    const targets={'increments-tree':'#treeCard','increments-org':'#orgCard','file-results':'#bl-results','person-panel':'#personPanel'};
+    const box=targets[name]&&document.querySelector(targets[name]);
+    if(box){let notice=box.querySelector('[data-load-error]');if(!notice){notice=document.createElement('div');notice.dataset.loadError='true';notice.className='empty';box.prepend(notice)}
+      notice.textContent='加载失败：'+e.message+'。';const retry=document.createElement('button');retry.className='secondary';retry.textContent='重试';notice.append(retry);
+      retry.onclick=()=>{notice.remove();if(name==='increments-tree')renderTreeSection();else if(name==='increments-org')renderOrgSection();else if(name==='file-results')blSearch()};}
+  }return null}
   finally{if(parent)parent.signal.removeEventListener('abort',cancel)}
 }
 const app=document.querySelector('#app');
@@ -178,7 +185,7 @@ function refreshIncSections(){return Promise.all([renderTreeSection(),renderOrgS
 
 async function renderTreeSection(){const st=state.inc,card=document.querySelector('#treeCard');if(!card)return;
   const treeParams=new URLSearchParams({year:st.month?'':st.year,month:st.month,scope:st.scope||'',department:st.fDept,biz_group:st.fGroup,person:st.fPerson});
-  const tree=await regionFetch('increments-tree','/api/v1/metrics/increments/tree?'+treeParams);if(!tree)return;st._tree=tree;
+  const tree=await regionFetch('increments-tree','/api/v1/metrics/increments/tree?'+treeParams);if(!tree)return false;st._tree=tree;
   if(document.querySelector('#treeCard')!==card)return;
   const lvl=tree.level,lvlName={year:'年份',month:'月份',day:'日期'}[lvl];
   const crumbs=`<div class="crumbs"><button class="crumb ${lvl==='year'?'current':''}" data-tcrumb="root">全部年份</button>${(st.year||st.month)?`<span class="sep">›</span><button class="crumb ${lvl==='month'?'current':''}" data-tcrumb="year">${(st.month?st.month.slice(0,4):st.year)} 年</button>`:''}${st.month?`<span class="sep">›</span><button class="crumb current" data-tcrumb="month">${st.month.slice(5)} 月</button>`:''}</div>`;
@@ -205,7 +212,7 @@ async function renderTreeSection(){const st=state.inc,card=document.querySelecto
   card.querySelectorAll('[data-tdrill]').forEach(r=>r.onclick=()=>{const k=r.dataset.tdrill;if(lvl==='year'){st.year=k;st.month=''}else if(lvl==='month'){st.month=k}refreshIncSections()});
   card.querySelectorAll('[data-tcrumb]').forEach(b=>b.onclick=()=>{const c=b.dataset.tcrumb;if(c==='root'){st.year='';st.month=''}else if(c==='year'){if(st.month)st.year=st.month.slice(0,4);st.month=''}refreshIncSections()});
   card.querySelector('#rd-scope').onclick=async()=>{const previous=st.scope;st.scope=previous==='rd_system'?'':'rd_system';
-    try{await renderTreeSection()}catch(e){st.scope=previous;toast(e.message)}};
+    try{if(await renderTreeSection()===false)st.scope=previous}catch(e){st.scope=previous;toast(e.message)}};
   card.querySelector('#tf-go').onclick=()=>{st.fDept=card.querySelector('#tf-dept').value.trim();st.fGroup=card.querySelector('#tf-group').value.trim();st.fPerson=card.querySelector('#tf-person').value.trim();renderTreeSection()};
   card.querySelectorAll('#tf-dept,#tf-group,#tf-person').forEach(i=>{
     i.onkeydown=e=>{if(e.key==='Enter')card.querySelector('#tf-go').click()};
