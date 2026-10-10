@@ -16,7 +16,7 @@ from .config import get_settings
 from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .scoring import RULE_VERSION, catalog_dict, effective_config
-from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict, workspace_level
+from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, seed_demo, workspace_dict, workspace_level
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -261,13 +261,21 @@ def metrics_coverage(db: Session = Depends(db_session)):
 @app.get("/api/v1/metrics/increments/tree")
 def metrics_increments_tree(year: str = Query(default="", pattern=r"^$|^\d{4}$"),
                             month: str = Query(default="", pattern=r"^$|^\d{4}-\d{2}$"),
+                            scope: str = Query(default="", pattern=r"^$|^rd_system$"),
                             department: str = "", biz_group: str = "", person: str = "",
                             db: Session = Depends(db_session)):
     """Drillable increment composition: no params -> years (recent first);
     year -> its months; month -> its days. People filters narrow the
     population via the bi_center employee cache."""
-    return metrics.increments_tree(db, year=year, month=month, department=department,
-                                   biz_group=biz_group, person=person)
+    try:
+        return metrics.increments_tree(db, year=year, month=month, department=department,
+                                       biz_group=biz_group, person=person, scope=scope)
+    except metrics.OrganizationScopeCacheMissingError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "organization_scope_cache_missing",
+            "message": "研发体系组织口径缓存未就绪，请联系管理员同步后重试。",
+            "missing_months": exc.missing_months,
+        }) from exc
 
 
 @app.get("/api/v1/metrics/workspaces/{workspace_id}/months")
@@ -450,6 +458,7 @@ def baseline_files(workspace_id: str = "", folder: str = "", query: str = "", sn
 @app.get("/api/v1/files")
 def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
                   department: str = "", uploader: str = "",
+                  month: str = Query(default="", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
                   offset: int = Query(default=0, ge=0),
                   limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     """The single merged document list: primary-baseline snapshot rows plus the
@@ -485,6 +494,9 @@ def files_unified(workspace_id: str = "", folder: str = "", query: str = "",
     if query:
         base = base.where(HistoricalFileNode.name.contains(query))
         live = live.where(Document.name.contains(query))
+    if month:  # 文档业务入库月，不是评审实例创建月
+        base = base.where(HistoricalFileNode.source_created_at.startswith(month))
+        live = live.where(Document.source_created_at.startswith(month))
     if department:  # 知识库归属部门（workspaces.owner_department_name，宜搭回填）
         dept_ws = select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))
         base = base.where(HistoricalFileNode.workspace_id.in_(dept_ws))
@@ -557,6 +569,7 @@ async def notification_test(payload: NotifyTestRequest):
 @app.get("/api/v1/reviews")
 def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|return)$"),
                  query: str = "", department: str = "", uploader: str = "",
+                 month: str = Query(default="", pattern=r"^$|^\d{4}-(0[1-9]|1[0-2])$"),
                  offset: int = Query(default=0, ge=0),
                  limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
     stmt = select(ReviewInstance, Document).join(Document, Document.node_id == ReviewInstance.node_id)
@@ -564,6 +577,8 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|return)$"),
         stmt = stmt.where(ReviewInstance.verdict == verdict)
     if query:
         stmt = stmt.where(Document.name.contains(query))
+    if month:  # 文档业务入库月，不是评审实例创建月
+        stmt = stmt.where(Document.source_created_at.startswith(month))
     if department:  # 知识库归属部门
         stmt = stmt.where(Document.workspace_id.in_(
             select(Workspace.workspace_id).where(Workspace.owner_department_name.contains(department))))
@@ -575,6 +590,7 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|return)$"),
             "items": [{"review_instance_id": r.review_instance_id, "node_id": d.node_id, "document_name": d.name,
                        "workspace_id": d.workspace_id, "uploader_name": d.uploader_name,
                        "department_name": d.department_name, "ai_score": round(r.ai_score, 1),
+                       "document_created_at": d.source_created_at,
                        "verdict": r.verdict, "genre": r.genre, "tier": r.tier, "review_scope": r.review_scope, "trigger": r.trigger,
                        "rule_version": r.rule_version, "rule_config_ref": r.rule_config_ref,
                        "created_at": r.created_at.isoformat() if r.created_at else None}
@@ -1119,8 +1135,7 @@ def sync_runs(status: str = "", db: Session = Depends(db_session)):
 
 @app.post("/api/v1/sync-runs", status_code=202, dependencies=[Depends(require_admin)])
 async def start_sync(mode: str = "incremental", db: Session = Depends(db_session)):
-    run = await sync_from_dingtalk(db, get_settings(), mode)
-    return {"run_id": run.run_id, "status": run.status, "error_code": run.error_code, "documents_new": run.documents_new, "documents_changed": run.documents_changed}
+    return await run_watch_now(db)
 
 
 @app.post("/api/v1/watch/run", dependencies=[Depends(require_admin)])
@@ -1128,9 +1143,30 @@ async def run_watch_now(db: Session = Depends(db_session)):
     """On-demand watch cycle (same code path as the worker tick), for testing
     and for ops after adding a workspace to KG_WATCH_WORKSPACES."""
     settings = get_settings()
+    if not settings.full_scan_enabled:
+        raise HTTPException(409, "全量校准已暂停。")
     if not settings.watch_workspaces:
         raise HTTPException(400, "未配置 KG_WATCH_WORKSPACES。")
-    return await run_watch_cycle_async(db, settings)
+    from .scan_scheduler import run_scan_slice_async
+    try:
+        return await run_scan_slice_async(db, settings, force=True)
+    except IntegrationError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
+
+
+@app.get("/api/v1/diagnostics/api-usage", dependencies=[Depends(require_admin)])
+def api_usage_status(db: Session = Depends(db_session)):
+    from .api_usage import usage_status
+    from .db import ScanCycle, ScanTask
+    settings = get_settings()
+    return {**usage_status(db, settings),
+            "switches": {"full_scan": settings.full_scan_enabled, "audit_pull": settings.audit_pull_enabled,
+                         "bridge": settings.bridge_enabled, "reviews": settings.review_enabled,
+                         "event_tree_walks": settings.bridge_walks_enabled},
+            "scan_days": settings.scan_days,
+            "cycles": [{"month": c.month, "status": c.status} for c in db.scalars(select(ScanCycle)).all()],
+            "scan_tasks": [{"month": t.month, "status": t.status, "attempts": t.attempts,
+                            "error_code": t.error_code} for t in db.scalars(select(ScanTask)).all()]}
 
 
 # Read-only DingTalk proxy endpoints for interactive directory browsing; each request supplies the real operator UnionID.

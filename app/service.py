@@ -151,6 +151,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     数据允许生成占位评分，生产数据无任何例外。"""
     from .content import fetch_document_content
 
+    if not settings.demo_mode and not settings.review_enabled:
+        raise ContentUnavailableError("review_paused")
     doc = db.get(Document, node_id)
     if not doc:
         raise KeyError("document_not_found")
@@ -258,6 +260,8 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
 
 
 def process_next_job(db: Session, settings: Settings) -> bool:
+    if not settings.demo_mode and not settings.review_enabled:
+        return False
     job = db.scalar(select(ReviewJob).where(ReviewJob.status == "pending").order_by(ReviewJob.created_at).limit(1))
     if not job:
         return False
@@ -419,6 +423,8 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
 
 
 async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incremental") -> SyncRun:
+    if not settings.demo_mode:
+        raise IntegrationError("scan_scheduler_required", "全量同步已停用，请通过月度校准任务执行。", 409)
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode)
     db.add(run); db.commit()
     client = DingtalkClient(settings)
@@ -568,6 +574,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     ``space`` is the normalized workspace listing item; when given, the walk
     trusts its rootNodeId instead of calling the detail endpoint, which fails
     for some personal spaces."""
+    from .api_usage import scan_month
+    if not settings.demo_mode and (not settings.full_scan_enabled or not scan_month.get()):
+        raise IntegrationError("scan_scheduler_required", "全量扫描须启用月度校准并使用持久化调度器。", 409)
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode, workspace_id=workspace_id,
                   workspace_name=(space or {}).get("name", ""))
     db.add(run); db.commit()
@@ -683,6 +692,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
 
 
 async def run_watch_cycle_async(db: Session, settings: Settings) -> dict:
+    if not settings.demo_mode:
+        from .scan_scheduler import run_scan_slice_async
+        return await run_scan_slice_async(db, settings, force=True)
     targets = await resolve_watch_targets(settings)
     runs = []
     for target in targets["resolved"]:
@@ -710,6 +722,9 @@ async def run_watch_slice_async(db: Session, settings: Settings, batch: int = 2)
     finding). An exhausted rotation reports cycle_completed and refills on the
     next call. cycle_ids 记录本轮周期的成员：整轮走完时它就是"这次全量真实
     看到的库"，缺席者由结账逻辑自动标记不可见。"""
+    if not settings.demo_mode:
+        from .scan_scheduler import run_scan_slice_async
+        return await run_scan_slice_async(db, settings)
     targets = await resolve_watch_targets(settings)
     by_id = {t["workspace_id"]: t for t in targets["resolved"]}
     if not _watch_rotation["queue"]:
@@ -742,7 +757,7 @@ CN_TZ = timezone(timedelta(hours=8))  # 业务时区（中国无夏令时，固�
 def _scan_days(settings: Settings) -> list[int]:
     days = sorted({int(token) for token in settings.scan_days.split(",")
                    if token.strip().isdigit() and 1 <= int(token) <= 28})
-    return days or [10, 24]
+    return days[:1] or [10]
 
 
 def current_scan_due(settings: Settings, today: date | None = None) -> str:

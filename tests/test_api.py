@@ -1,4 +1,5 @@
 import os
+from datetime import timedelta
 from fastapi.testclient import TestClient
 
 os.environ["KG_DATABASE_URL"] = "sqlite:///./runtime/test_knowledge_governance.db"
@@ -168,6 +169,134 @@ def test_bulk_classification_and_increments_tree(monkeypatch):
     finally:
         os.environ.pop("KG_ROBOT_USER_IDS", None)
         get_settings.cache_clear()
+
+
+def test_increment_tree_rd_system_scope_uses_workspace_ownership(monkeypatch):
+    from app import metrics
+    from app.db import Document, EmployeeOrgMonth, ReviewInstance, SessionLocal, Workspace, utcnow
+
+    node_ids = ("rd-scope-rd-1", "rd-scope-rd-2", "rd-scope-other")
+    workspace_ids = ("rd-scope-owned", "rd-scope-cd-non-rd")
+    review_ids = ("rd-scope-review-old", "rd-scope-review-latest", "rd-scope-review-other")
+    monkeypatch.setattr(metrics, "PERSON_DAY_BULK_MIN", 2)
+    with TestClient(app) as client:
+        try:
+            with SessionLocal() as db:
+                db.query(ReviewInstance).filter(ReviewInstance.review_instance_id.in_(review_ids)).delete(
+                    synchronize_session=False)
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.query(Workspace).filter(Workspace.workspace_id.in_(workspace_ids)).delete(synchronize_session=False)
+                db.query(EmployeeOrgMonth).filter(EmployeeOrgMonth.employee_key == "rd-scope-policy").delete(
+                    synchronize_session=False)
+                db.add_all([
+                    Workspace(workspace_id=workspace_ids[0], name="普通研发归属库",
+                              owner_department_name="研发测试部", is_active=True),
+                    Workspace(workspace_id=workspace_ids[1], name="CD-非研发归属库",
+                              owner_department_name="其他部门", is_active=True),
+                    Document(node_id=node_ids[0], workspace_id=workspace_ids[0], name="迁移一.docx",
+                             uploader_key="outside-uploader", source_created_at="2031-04-08", file_class="document"),
+                    Document(node_id=node_ids[1], workspace_id=workspace_ids[0], name="迁移二.docx",
+                             uploader_key="outside-uploader", source_created_at="2031-04-08", file_class="document"),
+                    Document(node_id=node_ids[2], workspace_id=workspace_ids[1], name="前缀不参与判定.docx",
+                             uploader_key="outside-uploader", source_created_at="2031-04-08", file_class="document"),
+                    EmployeeOrgMonth(month="2099-12", employee_key="rd-scope-policy",
+                                     department_name="研发测试部", is_rd_system=True,
+                                     resolved_snapshot_month="2099-12"),
+                ])
+                now = utcnow()
+                db.add_all([
+                    ReviewInstance(review_instance_id=review_ids[0], node_id=node_ids[0], ai_score=40,
+                                   verdict="return", review_scope="full_content",
+                                   created_at=now - timedelta(days=1)),
+                    ReviewInstance(review_instance_id=review_ids[1], node_id=node_ids[0], ai_score=80,
+                                   verdict="pass", review_scope="full_content", created_at=now),
+                    ReviewInstance(review_instance_id=review_ids[2], node_id=node_ids[2], ai_score=10,
+                                   verdict="return", review_scope="full_content", created_at=now),
+                ])
+                db.commit()
+                metrics.invalidate_cache()
+
+            all_scope = client.get("/api/v1/metrics/increments/tree", params={"year": "2031"}).json()
+            all_row = next(row for row in all_scope["rows"] if row["key"] == "2031-04")
+            assert all_row["total"] == 3
+            # Each document contributes its latest immutable review once; an
+            # unreviewed document is not silently treated as a zero.
+            assert all_row["average_ai_score"] == 45.0
+            assert all_row["scored_documents"] == 2
+
+            rd_scope = client.get(
+                "/api/v1/metrics/increments/tree", params={"year": "2031", "scope": "rd_system"}
+            )
+            assert rd_scope.status_code == 200
+            rd_payload = rd_scope.json()
+            assert rd_payload["scope"] == "rd_system"
+            assert rd_payload["rows"] == [
+                {"key": "2031-04", "total": 2, "bulk": 2, "routine": 0,
+                 "average_ai_score": 80.0, "scored_documents": 1}
+            ]
+            assert rd_payload["scope_label"] == "研发体系七部门（知识库归属口径）"
+            days = client.get(
+                "/api/v1/metrics/increments/tree", params={"month": "2031-04", "scope": "rd_system"}
+            ).json()
+            assert days["rows"] == [
+                {"key": "2031-04-08", "total": 2, "bulk": 2, "routine": 0,
+                 "average_ai_score": 80.0, "scored_documents": 1}
+            ]
+        finally:
+            with SessionLocal() as db:
+                db.query(ReviewInstance).filter(ReviewInstance.review_instance_id.in_(review_ids)).delete(
+                    synchronize_session=False)
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.query(Workspace).filter(Workspace.workspace_id.in_(workspace_ids)).delete(synchronize_session=False)
+                db.query(EmployeeOrgMonth).filter(EmployeeOrgMonth.employee_key == "rd-scope-policy").delete(
+                    synchronize_session=False)
+                db.commit()
+                metrics.invalidate_cache()
+
+
+def test_files_can_filter_historical_entry_month_and_show_score():
+    from app.db import Document, ReviewInstance, SessionLocal
+
+    node_ids = ("history-score-jan", "history-score-feb")
+    review_id = "history-score-review"
+    with TestClient(app) as client:
+        try:
+            with SessionLocal() as db:
+                db.query(ReviewInstance).filter(ReviewInstance.review_instance_id == review_id).delete(
+                    synchronize_session=False)
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.add_all([
+                    Document(node_id=node_ids[0], workspace_id="demo-workspace", name="历史月评分一.docx",
+                             source_created_at="2034-01-15T10:00:00+08:00", file_class="document"),
+                    Document(node_id=node_ids[1], workspace_id="demo-workspace", name="历史月评分二.docx",
+                             source_created_at="2034-02-15T10:00:00+08:00", file_class="document"),
+                    ReviewInstance(review_instance_id=review_id, node_id=node_ids[0], ai_score=88,
+                                   verdict="pass", review_scope="full_content"),
+                ])
+                db.commit()
+            january = client.get("/api/v1/files", params={"month": "2034-01", "query": "历史月评分"})
+            assert january.status_code == 200
+            assert january.json()["total"] == 1
+            assert january.json()["items"][0]["ai_score"] == 88
+            january_reviews = client.get(
+                "/api/v1/reviews", params={"month": "2034-01", "query": "历史月评分"}
+            )
+            assert january_reviews.status_code == 200
+            assert january_reviews.json()["total"] == 1
+            assert january_reviews.json()["items"][0]["document_created_at"].startswith("2034-01")
+            february = client.get("/api/v1/files", params={"month": "2034-02", "query": "历史月评分"})
+            assert february.json()["total"] == 1
+            assert february.json()["items"][0]["ai_score"] is None
+            assert client.get(
+                "/api/v1/reviews", params={"month": "2034-02", "query": "历史月评分"}
+            ).json()["total"] == 0
+            assert client.get("/api/v1/files", params={"month": "2034-13"}).status_code == 422
+        finally:
+            with SessionLocal() as db:
+                db.query(ReviewInstance).filter(ReviewInstance.review_instance_id == review_id).delete(
+                    synchronize_session=False)
+                db.query(Document).filter(Document.node_id.in_(node_ids)).delete(synchronize_session=False)
+                db.commit()
 
 
 def test_soft_deleted_document_leaves_the_headline_total():

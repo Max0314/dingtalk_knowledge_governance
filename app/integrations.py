@@ -11,6 +11,7 @@ import httpx
 
 from . import genre as genre_mod
 from .config import Settings
+from .api_usage import reserve_call
 
 
 class IntegrationError(RuntimeError):
@@ -34,6 +35,7 @@ class DingtalkClient:
         if self._token and self._token_expires_at > time.time() + 30:
             return self._token
         async with httpx.AsyncClient(timeout=15) as client:
+            reserve_call(self.settings, "oauth.accessToken")
             response = await client.post(
                 "https://api.dingtalk.com/v1.0/oauth2/accessToken",
                 json={"appKey": self.settings.dingtalk_app_key, "appSecret": self.settings.dingtalk_app_secret},
@@ -48,6 +50,8 @@ class DingtalkClient:
         return self._token
 
     async def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        interface = {"/wiki/nodes": "wiki.nodes", "/wiki/workspaces": "wiki.workspaces"}.get(path, "wiki.workspaceDetail")
+        reserve_call(self.settings, interface)
         token = await self._token_value()
         # httpx serializes None as an empty string; DingTalk rejects e.g. nextToken= with HTTP 400.
         cleaned = {key: value for key, value in params.items() if value not in (None, "")}
@@ -72,9 +76,8 @@ class DingtalkClient:
     async def list_nodes(self, workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 100) -> dict[str, Any]:
         if not parent_node_id:
             parent_node_id = (await self.workspace_detail(workspace_id, operator_id)).get("root_node_id", "")
-        # The documented page cap is 30, but the API accepts 100 (verified live
-        # 2026-08-06) — a 70% cut in enumeration quota.
-        payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 100))})
+        # Respect the provider's documented page cap; all pages share budgets.
+        payload = await self._get("/wiki/nodes", {"workspaceId": workspace_id, "operatorId": operator_id, "parentNodeId": parent_node_id, "nextToken": next_token or None, "maxResults": max(1, min(max_results, 30))})
         items = payload.get("nodes", payload.get("data", []))
         return {"items": [normalize_node(item) for item in items], "next_token": payload.get("nextToken", ""), "parent_node_id": parent_node_id}
 
@@ -82,6 +85,7 @@ class DingtalkClient:
         """unionId -> userId via the legacy contact endpoint (same access token)."""
         if not union_id:
             return ""
+        reserve_call(self.settings, "contact.getByUnionId")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
@@ -100,6 +104,7 @@ class DingtalkClient:
         if not user_ids:
             raise IntegrationError("dingtalk_no_recipient", "缺少接收人 userId。", 400)
         robot_code = self.settings.robot_code or self.settings.dingtalk_app_key
+        reserve_call(self.settings, "robot.batchSend")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -118,6 +123,7 @@ class DingtalkClient:
         """Storage-layer permission roster for one dentry (a KB root node gives
         the workspace's member list with roles). Endpoint per official SDK:
         POST /v2.0/storage/spaces/dentries/{uuid}/permissions/query."""
+        reserve_call(self.settings, "storage.permissions")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -145,6 +151,7 @@ class DingtalkClient:
         carry dentryUuid — which equals the wiki nodeId — plus name and path."""
         if not keyword or not operator_id:
             return []
+        reserve_call(self.settings, "storage.search")
         token = await self._token_value()
         option: dict[str, Any] = {"maxResults": max(1, min(max_results, 50))}
         if space_ids:
@@ -166,6 +173,7 @@ class DingtalkClient:
         """POST /v2.0/wiki/nodes/batchQuery — nodeIds -> full nodes incl. workspaceId."""
         if not node_ids:
             return []
+        reserve_call(self.settings, "wiki.batchQuery")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
@@ -191,6 +199,7 @@ class DingtalkClient:
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=30) as client:
             try:
+                reserve_call(self.settings, "storage.downloadInfo")
                 response = await client.post(
                     f"https://api.dingtalk.com/v1.0/storage/spaces/{space_id}/dentries/{numeric_dentry_id}/downloadInfos/query",
                     params={"unionId": operator},
@@ -295,6 +304,7 @@ class DingtalkClient:
 
         async with httpx.AsyncClient(timeout=min(timeout_seconds, 60.0), follow_redirects=False) as client:
             try:
+                reserve_call(self.settings, "doc.exportSubmit")
                 response = await client.post(
                     "https://api.dingtalk.com/v2.0/doc/me/export/submit",
                     headers=headers,
@@ -335,6 +345,7 @@ class DingtalkClient:
                 if time.monotonic() >= deadline:
                     break
                 try:
+                    reserve_call(self.settings, "doc.exportQuery")
                     response = await client.get(
                         "https://api.dingtalk.com/v2.0/doc/me/export/task/query",
                         headers=headers,
@@ -416,6 +427,7 @@ class DingtalkClient:
         template = self.settings.dingtalk_doc_content_url_template
         if not template:
             return ""
+        reserve_call(self.settings, "doc.contentGateway")
         token = await self._token_value()
         async with httpx.AsyncClient(timeout=40) as client:
             response = await client.get(template.format(node_id=node_id), headers={"x-acs-dingtalk-access-token": token})
@@ -443,6 +455,58 @@ class BiCenterClient:
         body = response.json()
         data = body.get("data", {}) or {}
         return data.get("results", data.get("items", body.get("items", [])))
+
+    async def employee_directory_month_page(self, month_key: str, limit: int = 500,
+                                            offset: int = 0) -> dict[str, Any]:
+        """Read one authoritative monthly directory page from bi_center.
+
+        bi_center owns snapshot fallback and the ``isRdSystem`` policy.  The
+        caller stores the returned resolved month instead of reimplementing
+        either rule locally.
+        """
+        if not self.configured():
+            raise IntegrationError(
+                "bi_center_not_configured",
+                "未配置 BI_CENTER_BASE_URL 或 BI_CENTER_INTERNAL_TOKEN。",
+                503,
+            )
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{self.settings.bi_center_base_url.rstrip('/')}/api/internal/v1/employee-directory/monthly",
+                params={"month": month_key, "limit": max(1, min(limit, 500)), "offset": max(0, offset)},
+                headers={"Authorization": f"Bearer {self.settings.bi_center_internal_token}"},
+            )
+        if response.is_error:
+            message = "bi_center 月度组织目录读取失败。"
+            try:
+                detail = response.json().get("detail")
+                if isinstance(detail, dict):
+                    message = str(detail.get("message") or message)
+                elif detail:
+                    message = str(detail)
+            except (ValueError, AttributeError):
+                pass
+            raise IntegrationError(
+                "bi_center_monthly_directory_failed",
+                f"{message}（HTTP {response.status_code}）",
+                response.status_code,
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise IntegrationError(
+                "bi_center_monthly_directory_invalid",
+                "bi_center 月度组织目录响应不是有效 JSON。",
+            ) from exc
+        if isinstance(body, dict) and body.get("code") not in (None, 0):
+            raise IntegrationError(
+                "bi_center_monthly_directory_failed",
+                str(body.get("message") or "bi_center 月度组织目录读取失败。"),
+            )
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        if not isinstance(data, dict):
+            raise IntegrationError("bi_center_monthly_directory_invalid", "bi_center 月度组织目录响应格式无效。")
+        return data
 
     async def check(self) -> dict[str, Any]:
         if not self.configured():
