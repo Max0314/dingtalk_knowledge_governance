@@ -326,10 +326,14 @@ def test_model_score_recomputes_verdict(monkeypatch):
         instance = service.run_review(db, settings, "content-2", "test")
         model_block = instance.dimensions["model"]
         assert model_block["model_score"] == 35 and model_block["rule_score"] > 35
-        expected = round(0.4 * model_block["rule_score"] + 0.6 * 35)
+        # 权重按文体档位取（模型未给 genre，文件名也判不出 → 默认 B 档 0.25），
+        # 不再是全局固定的 0.4。
+        assert model_block["rule_weight"] == 0.25
+        expected = round(0.25 * model_block["rule_score"] + 0.75 * 35)
         assert instance.ai_score == expected  # composite, not a silent override
-        assert instance.verdict == ("pass" if expected >= 70 else "manual_review" if expected >= 60 else "return")
+        assert instance.verdict == ("pass" if expected >= 70 else "return")
         assert instance.model_config_version == "test-v1"
+        assert instance.genre and instance.tier and instance.genre_source
         db.query(ModelConfig).filter(ModelConfig.name == "test-model").delete(synchronize_session=False)
         db.commit()
 
@@ -364,12 +368,14 @@ def test_genre_demotes_document_rules_to_advisory(monkeypatch):
         settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
         instance = service.run_review(db, settings, "content-3", "test")
         dims = instance.dimensions
-        assert dims["model"]["genre"] == "测试用例"
-        assert any(dims.get(key, {}).get("advisory") for key in ("metadata", "structure", "abstract", "rag"))
-        # Advisory deductions do not count: rule score ignores document-shaped dims.
-        counted = sum(d["deduction"] for k, d in dims.items() if k != "model" and not d.get("advisory"))
-        assert dims["model"]["rule_score"] == 100 - counted
-        assert instance.ai_score == round(0.4 * dims["model"]["rule_score"] + 0.6 * 90)
+        assert instance.genre == "测试用例" and instance.genre_source == "model"
+        assert instance.tier == "B"  # 工程资产：要结构和可检索性，不要版本历史表
+        # 档位机制取代了 advisory 标记：不适用的维度根本不参与评分，
+        # 而不是先扣分再标注"仅提示"。
+        assert not {"metadata", "abstract", "rag"} & set(dims)
+        assert {"structure", "retrieval", "format", "quality"} <= set(dims)
+        assert dims["model"]["rule_weight"] == 0.25
+        assert instance.ai_score == round(0.25 * dims["model"]["rule_score"] + 0.75 * 90)
         db.query(ModelConfig).filter(ModelConfig.name == "genre-model").delete(synchronize_session=False)
         db.commit()
 
@@ -425,4 +431,80 @@ def test_fingerprint_dedup_skips_unchanged_content(monkeypatch):
         assert manual is not None  # 人为明确意图永不跳过
         db.query(ReviewInstance).filter(ReviewInstance.node_id == "content-fp").delete(synchronize_session=False)
         db.query(Document).filter(Document.node_id == "content-fp").delete(synchronize_session=False)
+        db.commit()
+
+
+def test_registry_only_genre_produces_no_review_instance(monkeypatch):
+    """台账 / BOM / 合同这类「仅登记」文体不出分也不推送，只把分类结果记在
+    文档行上——给它们打分既不公平，也没人会照着改。"""
+    import pytest
+    import app.content as content_module
+    from app import service
+    from app.db import ReviewInstance, ReviewJob
+
+    async def fake_fetch(settings, doc):
+        return ("型号 数量\nA1 10\nA2 20", "storage_download")
+
+    monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)
+    init_db()
+    with SessionLocal() as db:
+        if not db.get(Workspace, "content-ws"):
+            db.add(Workspace(workspace_id="content-ws", name="抽取测试库"))
+        if not db.get(Document, "content-reg"):
+            db.add(Document(node_id="content-reg", workspace_id="content-ws",
+                            name="整机物料BOM清单.xlsx", extension="xlsx", file_class="sheet"))
+        db.commit()
+        with pytest.raises(service.RegistryOnlyError):
+            service.run_review(db, get_settings(), "content-reg", "test")
+        doc = db.get(Document, "content-reg")
+        assert doc.genre == "数据台账" and doc.genre_source == "filename"
+        assert not db.query(ReviewInstance).filter(ReviewInstance.node_id == "content-reg").count()
+
+        # 走队列时任务正常收尾，不算失败。process_next_job 取的是最旧的 pending
+        # 任务，先清空共享测试库里其它用例遗留的排队任务，本用例才是确定性的。
+        db.query(ReviewJob).filter(ReviewJob.status == "pending").delete(synchronize_session=False)
+        job = ReviewJob(job_id="job-reg", node_id="content-reg", trigger="test", requested_by="t")
+        db.add(job); db.commit()
+        try:
+            service.process_next_job(db, get_settings())
+            db.refresh(job)
+            assert job.status == "skipped" and job.error_code.startswith("registry_only:")
+        finally:
+            db.query(ReviewJob).filter(ReviewJob.job_id == "job-reg").delete(synchronize_session=False)
+            db.commit()
+
+
+def test_failed_model_call_is_not_recorded_as_a_model_review(monkeypatch):
+    """模型挂了就如实记 model_unavailable：此前无论调用成败都写 model.version，
+    key 一过期，全部评审静默退化成规则分而留痕仍称用了模型。"""
+    import app.content as content_module
+    from app import service
+    from app.db import ModelConfig
+
+    async def fake_fetch(settings, doc):
+        return ("版本：V1.0\n1. 目的\n本文说明发布规范，内容足够长可供评审。", "storage_download")
+
+    async def dead_model(config, content, filename, file_class="document"):
+        return None  # 超时 / 鉴权失败 / 返回不合约束，一律 None
+
+    monkeypatch.setattr(content_module, "fetch_document_content", fake_fetch)
+    monkeypatch.setattr(service, "model_score_content", dead_model)
+    init_db()
+    with SessionLocal() as db:
+        if not db.get(Workspace, "content-ws"):
+            db.add(Workspace(workspace_id="content-ws", name="抽取测试库"))
+        db.add(ModelConfig(name="dead-model", base_url="http://x", model_name="m", api_key="k",
+                           enabled=True, version="dead-v1"))
+        if not db.get(Document, "content-dead"):
+            db.add(Document(node_id="content-dead", workspace_id="content-ws",
+                            name="接口发布规范_V1.0.docx", extension="docx", file_class="document"))
+        db.flush()
+        db.get(Document, "content-dead").content_fingerprint = ""
+        db.commit()
+        settings = get_settings().model_copy(update={"model_allow_content_transfer": True})
+        instance = service.run_review(db, settings, "content-dead", "test")
+        assert instance.model_config_version == "model_unavailable"
+        assert "model" not in instance.dimensions
+        assert instance.genre == "规范制度" and instance.tier == "A"  # 文件名先验兜底
+        db.query(ModelConfig).filter(ModelConfig.name == "dead-model").delete(synchronize_session=False)
         db.commit()

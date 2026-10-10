@@ -26,14 +26,19 @@ def test_default_config_reproduces_v11_baseline():
 
 
 def test_disabling_and_reweighting_rules_changes_score():
+    """分数已按适用维度归一化，断言落在扣分本身上——参数生效与否才是被测的
+    契约，ai_score 只是它除以该文体 cap 之后的投影。"""
     baseline = score_document("接口文档.md", SAMPLE)
     assert any(f["rule"] == "5.1" for f in baseline["findings"])  # 文件名缺 _Vx.x
     off = effective_config({"dimensions": {"format": {"rules": {"5.1": {"enabled": False}}}}})
     result = score_document("接口文档.md", SAMPLE, "document", off)
     assert not any(f["rule"] == "5.1" for f in result["findings"])
-    assert result["ai_score"] == baseline["ai_score"] + 3
+    assert result["raw_deduction"] == baseline["raw_deduction"] - 3
+    assert result["ai_score"] > baseline["ai_score"]
     heavier = effective_config({"dimensions": {"format": {"cap": 10, "rules": {"5.1": {"points": 9}}}}})
-    assert score_document("接口文档.md", SAMPLE, "document", heavier)["ai_score"] == baseline["ai_score"] - 6
+    heavy = score_document("接口文档.md", SAMPLE, "document", heavier)
+    assert heavy["raw_deduction"] == baseline["raw_deduction"] + 6
+    assert heavy["ai_score"] < baseline["ai_score"]
 
 
 def test_thresholds_and_verdict_lines_follow_config():

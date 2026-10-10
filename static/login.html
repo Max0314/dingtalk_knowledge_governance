@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>登录 · 知识库治理</title>
+  <link rel="icon" type="image/png" href="assets/brand/app-icon.png?v=20261010-login">
+  <link rel="stylesheet" href="login.css?v=20261010-login">
+  <script src="login.js?v=20261010-login" defer></script>
+</head>
+<body>
+  <main class="login-shell">
+    <section class="intro" aria-labelledby="intro-title">
+      <div class="brand"><img src="assets/brand/app-icon.png" alt=""><span>知识库治理工作台</span></div>
+      <div class="intro-content">
+        <p class="eyebrow">KNOWLEDGE GOVERNANCE</p>
+        <h1 id="intro-title">让知识沉淀<br>有迹可循。</h1>
+        <p class="intro-description">统一查看知识库数据、文档质量与历史增量，<br class="desktop-break">为团队的知识资产提供清晰的治理视图。</p>
+        <div class="capabilities">
+          <div><span aria-hidden="true">01</span><p>数据洞察<small>知识库概览与历史增量</small></p></div>
+          <div><span aria-hidden="true">02</span><p>质量追溯<small>文档评分与评审记录</small></p></div>
+          <div><span aria-hidden="true">03</span><p>安全访问<small>企业账号与服务端会话</small></p></div>
+        </div>
+      </div>
+      <p class="privacy">正文不长期保存 · 登录不会触发全量同步或 AI 评审</p>
+    </section>
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="login-card">
+        <div class="login-icon" aria-hidden="true">知</div>
+        <h2 id="login-title">登录工作台</h2>
+        <p class="login-description">使用企业钉钉账号，安全访问治理数据。</p>
+        <button id="login-button" type="button" disabled>正在检查登录状态…</button>
+        <p id="login-status" class="status" role="status" aria-live="polite">正在连接登录服务，请稍候。</p>
+        <button id="retry-button" class="retry" type="button" hidden>重新检查登录服务</button>
+        <div class="login-note"><span aria-hidden="true">⌁</span><p>登录授权仅用于确认身份。<br>若授权失败，请重试或联系服务管理员。</p></div>
+        <noscript><p class="status error">请启用浏览器 JavaScript 后再登录。</p></noscript>
+      </div>
+      <p class="panel-foot">知识库治理 · 企业内部工作台</p>
+    </section>
+  </main>
+</body>
+</html>

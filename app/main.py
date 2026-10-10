@@ -13,7 +13,7 @@ from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 from . import bi_export, metrics, orgmap
 from .config import get_settings
-from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewDecision, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
+from .db import Document, EmployeeMap, HistoricalFileNode, ModelConfig, Notification, ReviewInstance, ReviewJob, ScoringRuleConfig, ScoringRuleConfigHistory, SessionLocal, SyncRun, Workspace, WorkspaceRole, init_db
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_connection_check
 from .scoring import RULE_VERSION, catalog_dict, effective_config
 from .service import WORKSPACE_LEVEL_LABELS, document_dict, review_dict, run_watch_cycle_async, seed_demo, sync_from_dingtalk, workspace_dict, workspace_level
@@ -75,11 +75,6 @@ class ReviewRequest(BaseModel):
     # Public callers can only request a manual rerun. Internal audit/watch
     # triggers are assigned server-side and must not be spoofable via the API.
     trigger: str = Field(default="manual_rerun", pattern="^manual_rerun$")
-
-
-class DecisionRequest(BaseModel):
-    decision: str = Field(pattern="^(pass|return|manual_review)$")
-    comment: str = Field(default="", max_length=1000)
 
 
 class ModelRequest(BaseModel):
@@ -560,7 +555,7 @@ async def notification_test(payload: NotifyTestRequest):
 
 
 @app.get("/api/v1/reviews")
-def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_review|return)$"),
+def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|return)$"),
                  query: str = "", department: str = "", uploader: str = "",
                  offset: int = Query(default=0, ge=0),
                  limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(db_session)):
@@ -580,7 +575,7 @@ def reviews_list(verdict: str = Query(default="", pattern="^$|^(pass|manual_revi
             "items": [{"review_instance_id": r.review_instance_id, "node_id": d.node_id, "document_name": d.name,
                        "workspace_id": d.workspace_id, "uploader_name": d.uploader_name,
                        "department_name": d.department_name, "ai_score": round(r.ai_score, 1),
-                       "verdict": r.verdict, "review_scope": r.review_scope, "trigger": r.trigger,
+                       "verdict": r.verdict, "genre": r.genre, "tier": r.tier, "review_scope": r.review_scope, "trigger": r.trigger,
                        "rule_version": r.rule_version, "rule_config_ref": r.rule_config_ref,
                        "created_at": r.created_at.isoformat() if r.created_at else None}
                       for r, d in rows]}
@@ -764,13 +759,6 @@ def review_job(job_id: str, db: Session = Depends(db_session)):
     job = db.get(ReviewJob, job_id)
     if not job: raise HTTPException(404, "任务不存在")
     return {"job_id": job.job_id, "status": job.status, "review_instance_id": job.result_review_instance_id, "error_code": job.error_code, "created_at": job.created_at.isoformat(), "finished_at": job.finished_at.isoformat() if job.finished_at else None}
-
-
-@app.post("/api/v1/reviews/{review_instance_id}/decision")
-def review_decision(review_instance_id: str, body: DecisionRequest, db: Session = Depends(db_session)):
-    if not db.get(ReviewInstance, review_instance_id): raise HTTPException(404, "评审实例不存在")
-    db.add(ReviewDecision(review_instance_id=review_instance_id, decision=body.decision, comment=body.comment, reviewer_key=actor())); db.commit()
-    return {"review_instance_id": review_instance_id, "decision": body.decision, "reviewer_key": actor()}
 
 
 def _mask_key(key: str) -> str:

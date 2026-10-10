@@ -25,7 +25,9 @@ from .config import Settings
 from .db import Document, Notification, ReviewInstance, utcnow
 from .integrations import DingtalkClient, IntegrationError
 
-VERDICT_LABEL = {"pass": "通过", "manual_review": "待人工审核", "return": "退回"}
+# 试点期不存在退回流程（2026-08-12 拍板），低分只做质量提示；
+# 人工复核挡位已取消（2026-08-21），结论只剩两档。
+VERDICT_LABEL = {"pass": "通过", "return": "待改进"}
 
 CN_TZ = timezone(timedelta(hours=8))  # 每日推送限额按业务日（Asia/Shanghai）结算
 

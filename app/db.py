@@ -101,6 +101,10 @@ class Document(Base):
     # Asset class from app.fileclass (document/sheet/image/engineering/...).
     # Only configured classes enter the review queue automatically.
     file_class: Mapped[str] = mapped_column(String(32), default="", index=True)
+    # 最近一次判定的文体与依据（app.genre）。缓存在文档行上，便于看板按文体
+    # 切片，也让"仅登记"文档在不产生评审实例的情况下仍可见分类结果。
+    genre: Mapped[str] = mapped_column(String(32), default="", index=True)
+    genre_source: Mapped[str] = mapped_column(String(16), default="")
     # Numeric storage dentry id (== the audit trail's bizId for the upload
     # event — verified by cross-download 2026-08-12). The download API only
     # accepts this numeric form; empty means no event seen yet.
@@ -129,6 +133,11 @@ class ReviewInstance(Base):
     # "department:研发中心@v2" — reviews stay traceable across rule edits.
     rule_config_ref: Mapped[str] = mapped_column(String(160), default="")
     model_config_version: Mapped[str] = mapped_column(String(64), default="rule-engine")
+    # 文体与档位决定了本次用哪套维度和严格度，属于评分口径的一部分，
+    # 必须随不可变实例留痕；genre_source 记录凭什么判的（model/filename/default）。
+    genre: Mapped[str] = mapped_column(String(32), default="")
+    genre_source: Mapped[str] = mapped_column(String(16), default="")
+    tier: Mapped[str] = mapped_column(String(4), default="")
     trigger: Mapped[str] = mapped_column(String(32), default="manual")
     content_fingerprint: Mapped[str] = mapped_column(String(128), default="")
     dimensions: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -531,7 +540,10 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
 # need an explicit ALTER. Keep this list tiny and append-only.
 EXTRA_COLUMNS = {
     "review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''",
-                         "content_note": "VARCHAR(64) NOT NULL DEFAULT ''"},
+                         "content_note": "VARCHAR(64) NOT NULL DEFAULT ''",
+                         "genre": "VARCHAR(32) NOT NULL DEFAULT ''",
+                         "genre_source": "VARCHAR(16) NOT NULL DEFAULT ''",
+                         "tier": "VARCHAR(4) NOT NULL DEFAULT ''"},
     "sync_runs": {"workspace_id": "VARCHAR(128) NOT NULL DEFAULT ''",
                   "workspace_name": "VARCHAR(255) NOT NULL DEFAULT ''",
                   "error_detail": "VARCHAR(512) NOT NULL DEFAULT ''"},
@@ -552,7 +564,9 @@ EXTRA_COLUMNS = {
                   "review_due_at": "DATETIME NULL",
                   "dirty_since": "DATETIME NULL",
                   "deleted_at": "DATETIME NULL",
-                  "last_modifier_key": "VARCHAR(128) NOT NULL DEFAULT ''"},
+                  "last_modifier_key": "VARCHAR(128) NOT NULL DEFAULT ''",
+                  "genre": "VARCHAR(32) NOT NULL DEFAULT ''",
+                  "genre_source": "VARCHAR(16) NOT NULL DEFAULT ''"},
 }
 
 

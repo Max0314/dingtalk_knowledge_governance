@@ -1,7 +1,7 @@
 # DingTalk Knowledge Governance · 钉钉知识库治理
 
 面向"入库可追溯 · 质量可评审 · 增量可统计"的知识库治理服务。
-2026-08-13 起正式运行：全库监控 + AI 评审 + 部门灰度推送。
+运行模式以发布单为准：2026-10-08 调用保护修复后，当前生产仅运行页面/API，后台采集、评审、通知和全量校准保持暂停。历史能力描述不代表已获准启用。
 
 ## 已上线能力
 
@@ -17,7 +17,7 @@
 - FastAPI（api 容器）+ 实时 worker（审计/评审/通知）+ watcher（定向与全量扫描）；无 Redis，两个后台角色通过 MySQL 队列表协作。审计源按配置周期拉取，已入库事件的有界定位默认每 30 秒重试，二者互不阻塞。前端为 vendored ECharts 的原生 JS 单页（hash 路由）。
 - 平台规则：应用栈不含数据库容器，`KG_DATABASE_URL` 指向外部 MySQL；正文只存在于评审进程内存/tmpfs，绝不落库、落盘、进日志。
 - 端口 39021，默认只绑定 127.0.0.1（本机 nginx 反代对外）；`KG_PUBLISH_BIND` 可显式放开。
-- 服务器访问 GitHub 受限，部署走服务器裸仓库双推：`git push origin main && git push neoflow main`，服务器 `git pull && docker compose up --build -d`。详见 [docs/deployment-guide.md](docs/deployment-guide.md)（脱敏版；真实凭据在仓库外的运维手册）。
+- 部署由代码负责人交付批准的完整 SHA 或镜像 digest，部署人员按指定版本执行，不直接部署浮动分支或在服务器改代码。默认仅启动 API，后台功能另行审批；现有后台容器必须显式停止并核对项目名。首次部署、升级、备份恢复、回滚及付费 API 保护见 [部署与运维交接指引](docs/deployment-guide.md)（以 `6d904e7` 安全修复为基线，凭据通过受控渠道另行交接）。
 
 ## 本地开发
 
@@ -46,5 +46,7 @@ python -m pytest tests/ -q                  # 全量测试
 - 不叫"知识库管理"：本服务边界是采集、评审、统计与治理，不替代钉钉知识库本身的增删改。
 
 ## 设计文档
+
+[文档索引与阅读顺序](docs/README.md) · [2026-10-10 工程 Review](docs/reviews/2026-10-10-review.md)（含生产/开发版本差异、风险清单和独立登录页验证；本次登录改造未部署）
 
 [可行性与架构](docs/feasibility-and-design.md) · [一期规划](docs/phase-1-plan.md)（历史文档，以当前实现为准） · [评分规则映射](docs/scoring-standard-v1.1-mapping.md) · [增量口径设计](docs/incremental-design.md)
