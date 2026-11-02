@@ -11,6 +11,7 @@ import httpx
 
 from . import genre as genre_mod
 from .config import Settings
+from .http_client import outbound_client
 from .api_usage import reserve_call
 
 
@@ -34,7 +35,7 @@ class DingtalkClient:
             raise IntegrationError("dingtalk_not_configured", "缺少 DINGTALK_APP_KEY 或 DINGTALK_APP_SECRET。")
         if self._token and self._token_expires_at > time.time() + 30:
             return self._token
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with outbound_client(self.settings, timeout=15) as client:
             reserve_call(self.settings, "oauth.accessToken")
             response = await client.post(
                 "https://api.dingtalk.com/v1.0/oauth2/accessToken",
@@ -55,7 +56,7 @@ class DingtalkClient:
         token = await self._token_value()
         # httpx serializes None as an empty string; DingTalk rejects e.g. nextToken= with HTTP 400.
         cleaned = {key: value for key, value in params.items() if value not in (None, "")}
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with outbound_client(self.settings, timeout=20) as client:
             response = await client.get(f"https://api.dingtalk.com/v2.0{path}", params=cleaned, headers={"x-acs-dingtalk-access-token": token})
         if response.status_code == 403:
             raise IntegrationError("dingtalk_permission_denied", "钉钉权限不足，请检查 Wiki.Workspace.Read、Wiki.Node.Read 和 operatorId 的访问权限。", 403)
@@ -87,7 +88,7 @@ class DingtalkClient:
             return ""
         reserve_call(self.settings, "contact.getByUnionId")
         token = await self._token_value()
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with outbound_client(self.settings, timeout=15) as client:
             response = await client.post(
                 "https://oapi.dingtalk.com/topapi/user/getbyunionid",
                 params={"access_token": token}, json={"unionid": union_id},
@@ -106,7 +107,7 @@ class DingtalkClient:
         robot_code = self.settings.robot_code or self.settings.dingtalk_app_key
         reserve_call(self.settings, "robot.batchSend")
         token = await self._token_value()
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with outbound_client(self.settings, timeout=20) as client:
             response = await client.post(
                 "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
                 headers={"x-acs-dingtalk-access-token": token},
@@ -125,7 +126,7 @@ class DingtalkClient:
         POST /v2.0/storage/spaces/dentries/{uuid}/permissions/query."""
         reserve_call(self.settings, "storage.permissions")
         token = await self._token_value()
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with outbound_client(self.settings, timeout=20) as client:
             response = await client.post(
                 f"https://api.dingtalk.com/v2.0/storage/spaces/dentries/{dentry_uuid}/permissions/query",
                 params={"unionId": operator_union_id},
@@ -156,7 +157,7 @@ class DingtalkClient:
         option: dict[str, Any] = {"maxResults": max(1, min(max_results, 50))}
         if space_ids:
             option["spaceIds"] = space_ids
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with outbound_client(self.settings, timeout=20) as client:
             response = await client.post(
                 "https://api.dingtalk.com/v2.0/storage/dentries/search",
                 params={"operatorId": operator_id},
@@ -175,7 +176,7 @@ class DingtalkClient:
             return []
         reserve_call(self.settings, "wiki.batchQuery")
         token = await self._token_value()
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with outbound_client(self.settings, timeout=20) as client:
             response = await client.post(
                 "https://api.dingtalk.com/v2.0/wiki/nodes/batchQuery",
                 params={"operatorId": operator_id},
@@ -197,7 +198,7 @@ class DingtalkClient:
             raise IntegrationError("dingtalk_operator_missing", "缺少钉钉 operatorId（UnionID），不能下载文件。", 400)
         max_bytes = max(1, int(max_bytes))
         token = await self._token_value()
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with outbound_client(self.settings, timeout=30) as client:
             try:
                 reserve_call(self.settings, "storage.downloadInfo")
                 response = await client.post(
@@ -226,7 +227,7 @@ class DingtalkClient:
         if not isinstance(headers, dict):
             raise IntegrationError("dingtalk_download_info_invalid", "下载信息响应格式无效。")
         data = bytearray()
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        async with outbound_client(self.settings, timeout=60, follow_redirects=True) as client:
             try:
                 async with client.stream("GET", urls[0], headers=headers) as download:
                     if download.is_error:
@@ -302,7 +303,7 @@ class DingtalkClient:
         poll_interval = max(0.0, float(self.settings.adoc_export_poll_interval_seconds))
         deadline = time.monotonic() + timeout_seconds
 
-        async with httpx.AsyncClient(timeout=min(timeout_seconds, 60.0), follow_redirects=False) as client:
+        async with outbound_client(self.settings, timeout=min(timeout_seconds, 60.0), follow_redirects=False) as client:
             try:
                 reserve_call(self.settings, "doc.exportSubmit")
                 response = await client.post(
@@ -429,7 +430,7 @@ class DingtalkClient:
             return ""
         reserve_call(self.settings, "doc.contentGateway")
         token = await self._token_value()
-        async with httpx.AsyncClient(timeout=40) as client:
+        async with outbound_client(self.settings, timeout=40) as client:
             response = await client.get(template.format(node_id=node_id), headers={"x-acs-dingtalk-access-token": token})
         if response.is_error:
             raise IntegrationError("dingtalk_content_fetch_failed", "文档正文临时获取失败。", response.status_code)
@@ -448,7 +449,7 @@ class BiCenterClient:
         if not self.configured():
             return [{"matched": False, "includeInOfficialStats": False, "status": "integration_not_configured"} for _ in items]
         payload = {"items": [{"sourceSystem": "dingtalk_knowledge_governance", "monthKey": month_key, "identity": item} for item in items]}
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with outbound_client(self.settings, timeout=15) as client:
             response = await client.post(f"{self.settings.bi_center_base_url.rstrip('/')}/api/internal/v1/employee-identity/resolve-batch", json=payload, headers={"Authorization": f"Bearer {self.settings.bi_center_internal_token}"})
         if response.is_error:
             raise IntegrationError("bi_center_request_failed", f"bi_center 身份解析失败（HTTP {response.status_code}）。", response.status_code)
@@ -470,7 +471,7 @@ class BiCenterClient:
                 "未配置 BI_CENTER_BASE_URL 或 BI_CENTER_INTERNAL_TOKEN。",
                 503,
             )
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with outbound_client(self.settings, timeout=20) as client:
             response = await client.get(
                 f"{self.settings.bi_center_base_url.rstrip('/')}/api/internal/v1/employee-directory/monthly",
                 params={"month": month_key, "limit": max(1, min(limit, 500)), "offset": max(0, offset)},
@@ -511,7 +512,7 @@ class BiCenterClient:
     async def check(self) -> dict[str, Any]:
         if not self.configured():
             return {"status": "not_configured", "message": "未配置 BI_CENTER_BASE_URL 或 BI_CENTER_INTERNAL_TOKEN。"}
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with outbound_client(self.settings, timeout=10) as client:
             response = await client.get(f"{self.settings.bi_center_base_url.rstrip('/')}/api/internal/v1/employee-directory/current?limit=1&offset=0", headers={"Authorization": f"Bearer {self.settings.bi_center_internal_token}"})
         return {"status": "healthy" if response.is_success else "failed", "message": "目录契约可访问。" if response.is_success else f"HTTP {response.status_code}"}
 
@@ -539,7 +540,7 @@ async def model_connection_check(config: dict[str, Any], settings: Settings) -> 
     if not key:
         return {"status": "not_configured", "message": "未配置 API Key（页面填写或注入环境变量均可）。"}
     try:
-        async with httpx.AsyncClient(timeout=min(int(config.get("timeout_seconds", 30)), 60)) as client:
+        async with outbound_client(settings, timeout=min(int(config.get("timeout_seconds", 30)), 60)) as client:
             response = await client.get(f"{config['base_url'].rstrip('/')}/models", headers={"Authorization": f"Bearer {key}"})
         return {"status": "healthy" if response.is_success else "failed", "message": "模型服务可访问。" if response.is_success else f"HTTP {response.status_code}"}
     except httpx.HTTPError:
@@ -611,7 +612,7 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
     elif config.get("thinking_mode") == "off":
         payload["enable_thinking"] = False
     try:
-        async with httpx.AsyncClient(timeout=min(int(config.get("timeout_seconds", 30)), 120)) as client:
+        async with outbound_client(settings, timeout=min(int(config.get("timeout_seconds", 30)), 120)) as client:
             response = await client.post(
                 f"{config['base_url'].rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {key}"},

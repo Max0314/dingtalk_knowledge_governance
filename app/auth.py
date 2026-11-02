@@ -28,6 +28,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings, get_settings
+from .http_client import outbound_client
 from .db import AuthSession, SessionLocal, utcnow
 
 COOKIE_NAME = "kg_session"
@@ -113,7 +114,7 @@ def build_login_url(settings: Settings, return_url: str) -> str:
 
 
 async def exchange_user(settings: Settings, code: str) -> dict:
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with outbound_client(settings, timeout=15) as client:
         token_response = await client.post(
             "https://api.dingtalk.com/v1.0/oauth2/userAccessToken",
             json={"clientId": settings.dingtalk_app_key, "clientSecret": settings.dingtalk_app_secret,

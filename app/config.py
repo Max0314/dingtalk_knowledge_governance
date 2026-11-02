@@ -1,5 +1,7 @@
 from functools import lru_cache
-from pydantic import AliasChoices, Field
+import re
+
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +16,25 @@ class Settings(BaseSettings):
     live_browse_enabled: bool = False
     default_actor: str = "knowledge-governance-admin"
     public_base_url: str = "http://localhost:39021"
+    # Explicit outbound HTTPS exceptions for legacy enterprise gateways.
+    # These exact hosts skip certificate verification; empty keeps defaults.
+    tls_insecure_hosts: str = ""
+
+    @field_validator("tls_insecure_hosts")
+    @classmethod
+    def validate_tls_insecure_hosts(cls, value: str) -> str:
+        hosts = []
+        label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        for item in value.split(","):
+            host = item.strip().lower()
+            if not host:
+                continue
+            if len(host) > 253 or not re.fullmatch(rf"{label}(?:\.{label})+", host):
+                raise ValueError("TLS exceptions must be exact DNS names, without URLs, ports or wildcards")
+            if host not in hosts:
+                hosts.append(host)
+        return ",".join(hosts)
+
     dingtalk_app_key: str = Field(default="", validation_alias="DINGTALK_APP_KEY")
     dingtalk_app_secret: str = Field(default="", validation_alias="DINGTALK_APP_SECRET")
     dingtalk_sync_operator_id: str = Field(default="", validation_alias="DINGTALK_SYNC_OPERATOR_ID")

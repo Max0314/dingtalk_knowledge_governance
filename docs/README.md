@@ -10,6 +10,7 @@
 4. [部署与运维交接](deployment-guide.md)：发布必须使用批准 SHA，生产默认 API-only。
 5. [发布验收](reviews/2026-10-10-release-validation.md)：版本、实测和遗留事项；[原始 Review](reviews/2026-10-10-review.md) 用于追溯问题，不是现行约束。
 6. [脚本索引](../scripts/README.md)：先按风险选入口，禁止把所有脚本当作开发指令。
+7. [2026-11-02 内网部署记录](reviews/2026-11-02-internal-deployment.md)：公司内网 API 部署、固定版本、常用命令与外部联调待办。
 
 ## 契约和业务参考
 
