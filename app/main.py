@@ -1194,7 +1194,7 @@ async def connectivity(db: Session = Depends(db_session)):
         except IntegrationError as exc: ding_result = {"status": "failed", "message": str(exc), "code": exc.code}
     else: ding_result = {"status": "not_configured", "message": "缺少钉钉应用凭据或 DINGTALK_SYNC_OPERATOR_ID。"}
     model = db.scalar(select(ModelConfig).where(ModelConfig.enabled.is_(True)))
-    model_result = await model_connection_check({"enabled": bool(model), "base_url": model.base_url if model else "", "model_name": model.model_name if model else "", "api_key_env_name": model.api_key_env_name if model else "KG_MODEL_API_KEY", "timeout_seconds": model.timeout_seconds if model else 30}, settings)
+    model_result = await model_connection_check({"enabled": bool(model), "base_url": model.base_url if model else "", "model_name": model.model_name if model else "", "api_key": model.api_key if model else "", "api_key_env_name": model.api_key_env_name if model else "KG_MODEL_API_KEY", "timeout_seconds": model.timeout_seconds if model else 30}, settings)
     if not settings.watch_workspaces:
         watch_result = {"status": "not_configured", "message": "未配置 KG_WATCH_WORKSPACES，定向监控关闭。"}
     else:

@@ -126,6 +126,45 @@ def test_auth_guard_blocks_api_when_enabled():
         get_settings.cache_clear()
 
 
+def test_connectivity_uses_stored_model_key_before_environment(monkeypatch):
+    import asyncio
+    import httpx
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    import app.main as main_module
+    from app import integrations
+    from app.config import Settings
+    from app.db import Base, ModelConfig
+
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    settings = Settings(_env_file=None, DINGTALK_APP_KEY="", DINGTALK_APP_SECRET="",
+                        BI_CENTER_BASE_URL="", BI_CENTER_INTERNAL_TOKEN="", watch_workspaces="")
+    monkeypatch.setattr(main_module, "get_settings", lambda: settings)
+    monkeypatch.setenv("KG_MODEL_API_KEY", "synthetic-environment-fallback")
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        assert request.headers["Authorization"] == "Bearer synthetic-stored-model-key"
+        return httpx.Response(200, json={"data": []})
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(handler)
+    monkeypatch.setattr(integrations.httpx, "AsyncClient",
+                        lambda **kwargs: real_client(transport=transport, **kwargs))
+    try:
+        with Session(engine) as db:
+            db.add(ModelConfig(name="Synthetic model", base_url="https://model.invalid/v1",
+                               model_name="synthetic-model", api_key="synthetic-stored-model-key", enabled=True))
+            db.flush()
+            result = asyncio.run(main_module.connectivity(db))
+            assert next(x for x in result["items"] if x["name"] == "AI 评审模型")["status"] == "healthy"
+            assert len(requests) == 1
+    finally:
+        engine.dispose()
+
+
 def test_connectivity_never_claims_unconfigured_integrations_are_healthy():
     with TestClient(app) as client:
         payload = client.get("/api/v1/diagnostics/connectivity").json()

@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import genre as genre_mod
-from .config import Settings
+from .config import Settings, get_settings
 from .http_client import outbound_client
 from .api_usage import reserve_call
 
@@ -612,7 +612,7 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
     elif config.get("thinking_mode") == "off":
         payload["enable_thinking"] = False
     try:
-        async with outbound_client(settings, timeout=min(int(config.get("timeout_seconds", 30)), 120)) as client:
+        async with outbound_client(get_settings(), timeout=min(int(config.get("timeout_seconds", 30)), 120)) as client:
             response = await client.post(
                 f"{config['base_url'].rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {key}"},

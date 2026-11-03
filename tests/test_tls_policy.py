@@ -1,5 +1,6 @@
 """TLS exceptions never widen to other hosts or redirect destinations."""
 import asyncio
+import json
 import ssl
 
 import httpx
@@ -41,6 +42,9 @@ def recorded_transports(monkeypatch):
             context = self.options.get("verify", True)
             insecure = isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_NONE
             requests.append((str(request.url), insecure))
+            if request.url.path == "/chat/completions":
+                result = {"score": 88, "genre": "guide", "dimensions": {"clarity": 22}, "findings": []}
+                return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(result)}}]})
             if request.url.path == "/redirect":
                 return httpx.Response(302, headers={"Location": "https://other.invalid/final"})
             return httpx.Response(200, content=b"ok")
@@ -89,3 +93,16 @@ def test_exception_keeps_environment_proxy_route(recorded_transports, monkeypatc
     proxy = exception.options.get("proxy")
     assert (str(proxy.url) if proxy is not None else None) == expected_proxy
     assert requests == [("https://example.invalid/", True)]
+
+
+def test_model_scoring_uses_runtime_tls_policy(recorded_transports, monkeypatch):
+    from app import integrations
+
+    _, requests = recorded_transports
+    settings = Settings(_env_file=None, tls_insecure_hosts="example.invalid")
+    monkeypatch.setattr(integrations, "get_settings", lambda: settings)
+    config = {"base_url": "https://example.invalid", "model_name": "synthetic-model",
+              "api_key": "synthetic-test-key", "timeout_seconds": 20}
+    result = asyncio.run(integrations.model_score_content(config, "Synthetic review input.", "synthetic.txt"))
+    assert result is not None and result["score"] == 88
+    assert requests == [("https://example.invalid/chat/completions", True)]
