@@ -256,3 +256,20 @@ def test_month_end_preflight_refuses_crossing_expiring_cycle(local, monkeypatch)
     with sessions() as db:
         result=scan_recovery.budget_preflight(db,settings,[])
         assert result['estimatedMinimumDays']==2 and not result['approved'] and result['daysLeftInMonth']==1
+
+
+def test_paged_scan_commits_inventory_revision_with_each_new_page(local,monkeypatch):
+    from app import bi_projection
+    from app.bi_models import FileInventoryVersion
+    sessions,settings=local
+    monkeypatch.setattr(bi_projection,'get_settings',lambda:settings)
+    bi_projection.install_change_hooks()
+    class Client:
+        def __init__(self,*_):pass
+        async def list_nodes(self,ws,operator,parent,token,**kwargs):
+            return {'items':[node('second' if token else 'first')],'next_token':'' if token else 'second'}
+    monkeypatch.setattr(service,'DingtalkClient',Client)
+    first=run(sessions,settings)
+    with sessions() as db:assert db.get(FileInventoryVersion,'synthetic-space').revision==1
+    assert finish(sessions,settings,first.run_id).status=='succeeded'
+    with sessions() as db:assert db.get(FileInventoryVersion,'synthetic-space').revision==2

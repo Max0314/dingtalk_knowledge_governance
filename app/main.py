@@ -619,7 +619,15 @@ def file_inventory(db: Session, snapshot: str = ""):
     Bound IDs to 10k; a larger gap falls back to regular SQL pagination rather
     than filling RAM/JSON with hundreds of thousands of identifiers.
     """
+    requested_snapshot = snapshot
     snapshot = snapshot or metrics.uploader_snapshot_id(db) or metrics.primary_snapshot_id(db)
+    from . import page_metrics
+    stamp = None
+    if page_metrics.enabled():
+        from .inventory_cache import previous
+        cached, stamp = previous(db, snapshot, {'snapshot': requested_snapshot})
+        if cached is not None:
+            return cached
     inactive = select(Workspace.workspace_id).where(Workspace.is_active.is_(False))
     stmt = select(HistoricalFileNode.node_id).outerjoin(Document,
             Document.node_id == HistoricalFileNode.node_id).where(
@@ -630,7 +638,7 @@ def file_inventory(db: Session, snapshot: str = ""):
     live_count = db.scalar(select(func.count()).select_from(Document).where(
         Document.is_folder == false(), Document.is_deleted == false(), Document.workspace_id.not_in(inactive))) or 0
     return {"snapshot": snapshot, "baseline_ids": ids if len(ids) <= 10000 else None,
-            "baseline_total": total, "live_total": live_count}
+            "baseline_total": total, "live_total": live_count, "inventory_stamp": stamp}
 
 
 class NotifyTestRequest(BaseModel):

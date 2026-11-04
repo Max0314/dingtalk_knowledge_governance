@@ -158,3 +158,9 @@ class PageIdentityState(Base):
     __tablename__ = 'kg_page_identity_state'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     master_hash: Mapped[str] = mapped_column(String(64), default='')
+
+
+class FileInventoryVersion(Base):
+    __tablename__ = 'kg_file_inventory_version'
+    workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    revision: Mapped[int] = mapped_column(BigInteger, default=1)

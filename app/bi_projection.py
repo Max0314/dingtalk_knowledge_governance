@@ -8,7 +8,7 @@ from datetime import timezone
 from decimal import Decimal
 from sqlalchemy import delete, event, func, inspect, or_, select, tuple_
 from sqlalchemy.orm import Session
-from .bi_models import (BIDirtyNode, BIDirtyScope, BIFileFact, BIInventory, BIProjectionState,
+from .bi_models import (BIDirtyNode, BIDirtyScope, BIFileFact, BIInventory, BIProjectionState, FileInventoryVersion,
                         BIQualityMonth, BIUploadDay)
 from .bi_push_contract import canonical, empty_quality
 from .bi_snapshot import CST, SnapshotUnavailable, local_day
@@ -47,12 +47,15 @@ def _change_hook(db, *_):
     s = get_settings()
     if not (s.metadata_only or s.bi_push_enabled):
         return
-    nodes, scopes = set(), set()
+    nodes, scopes, inventories = set(), set(), set()
     for obj in list(db.new) + list(db.dirty) + list(db.deleted):
         state = inspect(obj)
         if isinstance(obj, Document) and (obj in db.new or obj in db.deleted or any(state.attrs[k].history.has_changes() for k in WATCHED)):
             if obj.node_id:
                 nodes.add(obj.node_id)
+            if obj in db.new or obj in db.deleted or any(state.attrs[k].history.has_changes() for k in ('workspace_id', 'is_folder', 'is_deleted')):
+                inventories.add(obj.workspace_id)
+                inventories.update(state.attrs.workspace_id.history.deleted)
         elif isinstance(obj, ReviewInstance) and (obj in db.new or obj in db.deleted):
             nodes.add(obj.node_id)
         elif isinstance(obj, Workspace):
@@ -63,6 +66,13 @@ def _change_hook(db, *_):
                 scopes.add("registry/" + obj.workspace_id)
     enqueue(db, BIDirtyNode, nodes)
     enqueue(db, BIDirtyScope, scopes)
+    inventories.discard(None)
+    if inventories:
+        table = FileInventoryVersion.__table__
+        stmt = _insert_for(db, table, [{'workspace_id': key, 'revision': 1} for key in sorted(inventories)])
+        values = {'revision': table.c.revision+1}
+        db.execute(stmt.on_duplicate_key_update(**values) if db.bind.dialect.name == 'mysql' else
+                   stmt.on_conflict_do_update(index_elements=['workspace_id'], set_=values))
 
 
 def install_change_hooks():

@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import inspect, select, text
 from app.db import EmployeeOrgMonth, engine
 from app import scan_models
-from app.bi_models import BIUploadDay, BIDirtyScope, BIIdentityMonth, PageIdentityState
+from app.bi_models import BIUploadDay, BIDirtyScope, BIIdentityMonth, PageIdentityState, FileInventoryVersion
 from app.bi_projection import enqueue
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ def migrate(bind=engine):
                 model.__table__.create(conn, checkfirst=True)
                 conn.commit()
             PageIdentityState.__table__.create(conn, checkfirst=True)
+            FileInventoryVersion.__table__.create(conn, checkfirst=True)
             conn.commit()
             indexes = inspect(conn).get_indexes(BIIdentityMonth.__tablename__)
             if not any(i['column_names'][:1] == ['employee_key'] for i in indexes):
