@@ -33,3 +33,15 @@
 线上首次验收发现MySQL SUM整数返回Decimal，导致总览均分float/Decimal计算失败；已补类型兼容和定向回归，e8e4bd8发布后全部检查接口200。随后补按库库存版本表，将已实测5.2秒的周期性库存差异重建改为依赖变化时执行；节点拓扑与版本同事务，小版本未变只读小表。库存类型/日期/当前镜像浏览语义保持不变，不用MAX源时间代替变更版本。
 
 补充验证：MySQL Decimal兼容1项、库存版本4项及分页写入版本1项通过，总计101项不同Python定向用例；库存优化另复用21项增量传输与8项页面统计回归。库存版本独立review通过，发布保持worker→API顺序，watcher关闭，避免旧写入者绕过新版本。
+
+## 生产验收
+
+- 最终业务代码417741035f5c969a3d9c16e035a6af1458ef46c3（含7024f91主体、e8e4bd8的MySQL兼容和4177410的库存版本）；已合并main并推送GitHub。镜像knowledge-governance-internal:417741035f5c，ID sha256:db99f7428f312fad997141c5a3dbb166e71da3a9478fbbb10ca81de34cff9dc5。
+- 先迁移，再按worker→API→publisher更新；三角色均running、重启0、同一SHA。watcher备用镜像一致且未运行。6个关键运行文件与冻结Git archive字节一致；.env与备份字节相同，未修改其他服务或数据库全局/binlog配置。
+- 内网入口可访问，登录页200；ready=200。真实临时管理员HTTP会话检查诊断、模型配置、总览、上传月份、增量趋势、部门、知识库和文件列表均200，结束仅撤销本次临时会话。诊断明确模型/全量paused，模型配置仍openai/gpt-6-luna且密钥存在；模型测试返回paused，没有实际模型调用。
+- 服务器本机每个常用缓存接口顺序10次抽样，热路径p95为1.9–72.5毫秒，实际包含并发后台刷新；此处为短链路抽样，未运行20并发/40RPS压测。库存版本已经生成，单次未变库存核验9.6毫秒，SQL观测documents/historical_file_nodes读取为0；首次冷重建或真实依赖变化仍需要重建差异清单。
+- 48个历史月份的组织缓存已准备，页面身份队列0；部门页按事实月显示归属，并标出bi_center返回的回退快照月份。统计范围和文档浏览范围说明已保留，不把不同语义的总量强行对齐。
+- 审计增量继续推进；源确认、接收head和常用6个月看板均sequence46，stateHash为874bc5f1ade832860677ccae14f73f91aed8dacf757275e396086815a74ea5f3，最新帧为delta/acked，无blocked、无force_baseline。24个月缓存为sequence41，核心计数一致，沿用原小时刷新窗口，未人为强制重建。两种实际预计算HTTP响应均200且不含employeeKey。
+- MySQL实际连接验证：显式固定物理连接后跨Session提交保持同connection，扫描会话短锁等待3秒，结束恢复原值。仅验证会话设置，未执行远端分页。采集/发送最近日志无新Traceback或失败信号。
+- review_instances2535、review_jobs2923、notifications2519，与优化前一致。metadata_only/audit_pull/bridge/bi_push=true；full_scan/review/notify/content/model_transfer/stream=false。补采恢复记录和扫描断点均0，历史采集缺口保留。
+- 最新回滚材料/var/backups/knowledge-governance/optimization-20261104T172142，保留上一固定镜像与配置（目录0700、文件0600）。回滚保留新增小表/列/索引；不清quota、不清binlog、不重置增量游标。运行版本记录已标accepted_page_scan_optimization。
