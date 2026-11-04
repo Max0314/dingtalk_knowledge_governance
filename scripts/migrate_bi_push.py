@@ -1,5 +1,8 @@
 """Idempotent additive migration. Run before starting the new API/workers."""
 import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import inspect, text
 from app.db import engine
 from app import bi_models
