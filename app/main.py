@@ -47,6 +47,10 @@ app.middleware("http")(guard_middleware)
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 register_auth_routes(app)
 
+from . import performance  # noqa: E402
+from .db import engine  # noqa: E402
+performance.install(app, engine)
+
 
 def db_session():
     db = SessionLocal()
@@ -218,26 +222,38 @@ def dashboard(db: Session = Depends(db_session)):
     # 存成 pass 的历史），不再参与平均分。口径不变，但取最新和求均值都下推到
     # SQL：这里原先把整张 review_instances（含 dimensions/findings 两个 JSON
     # 列）拉进 Python 只为算两个平均分，正是 metrics._collect 警告过的反模式。
-    ranked = (
-        select(
-            ReviewInstance.ai_score.label("ai_score"),
-            ReviewInstance.created_at.label("created_at"),
-            func.row_number().over(partition_by=ReviewInstance.node_id,
-                                   order_by=ReviewInstance.created_at.desc()).label("rank"),
+    from . import page_metrics
+    if page_metrics.enabled():
+        from .bi_models import BIQualityMonth
+        names = page_metrics.spaces(db)
+        rows = db.execute(select(BIQualityMonth.month, func.sum(BIQualityMonth.score_sum), func.sum(BIQualityMonth.scored_count))
+                          .where(BIQualityMonth.workspace_id.in_(names)).group_by(BIQualityMonth.month)).all()
+        total_score, total_count = sum(float(r[1] or 0) for r in rows), sum(r[2] or 0 for r in rows)
+        average = total_score / total_count if total_count else None
+        current = now.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m')
+        current_row = next((r for r in rows if r[0] == current), None)
+        month_average = float(current_row[1])/current_row[2] if current_row and current_row[2] else None
+    else:
+        ranked = (
+            select(
+                ReviewInstance.ai_score.label("ai_score"),
+                ReviewInstance.created_at.label("created_at"),
+                func.row_number().over(partition_by=ReviewInstance.node_id,
+                                       order_by=ReviewInstance.created_at.desc()).label("rank"),
+            )
+            .join(Document, Document.node_id == ReviewInstance.node_id)
+            .join(Workspace, Workspace.workspace_id == Document.workspace_id)
+            .where(Workspace.is_active.is_(True))
+            .subquery()
         )
-        .join(Document, Document.node_id == ReviewInstance.node_id)
-        .join(Workspace, Workspace.workspace_id == Document.workspace_id)
-        .where(Workspace.is_active.is_(True))
-        .subquery()
-    )
-    latest = select(ranked.c.ai_score, ranked.c.created_at).where(ranked.c.rank == 1).subquery()
-    average, month_average = db.execute(select(
-        func.avg(latest.c.ai_score),
-        # AVG skips NULLs, so the CASE narrows the same population to this month.
-        func.avg(case((and_(latest.c.created_at >= month_start,
-                            latest.c.created_at < next_month), latest.c.ai_score))),
-    )).one()
-    month_row = next((row for row in increments["rows"] if row["month"] == now.strftime("%Y-%m")), None)
+        latest = select(ranked.c.ai_score, ranked.c.created_at).where(ranked.c.rank == 1).subquery()
+        average, month_average = db.execute(select(
+            func.avg(latest.c.ai_score),
+            # AVG skips NULLs, so the CASE narrows the same population to this month.
+            func.avg(case((and_(latest.c.created_at >= month_start,
+                                latest.c.created_at < next_month), latest.c.ai_score))),
+        )).one()
+    month_row = next((row for row in increments["rows"] if row["month"] == now.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m")), None)
     # The snapshot-frozen org note dates from the personal-authorization era
     # (23.5% coverage); rebuild it from whichever snapshot is the primary
     # baseline right now so a baseline switch never leaves a stale banner.
@@ -247,11 +263,13 @@ def dashboard(db: Session = Depends(db_session)):
     definition = baseline["definition"] or {}
     org_context = dict(definition.get("org_context", {}))
     baseline_libs = len(definition.get("workspaces") or {})
-    if baseline["snapshot_id"] and not baseline_libs:  # older snapshots store no workspace map
+    if baseline["snapshot_id"] and not baseline_libs and not page_metrics.enabled():  # older snapshots store no workspace map
         baseline_libs = db.scalar(select(func.count(func.distinct(HistoricalFileNode.workspace_id)))
                                   .where(HistoricalFileNode.snapshot_id == baseline["snapshot_id"])) or 0
     org_context["note"] = (f"文件总量与月度增量按全量基线 {baseline['snapshot_id'] or '—'}"
                            f"（{baseline_libs or '—'} 库）+ 实时增量计算；服务身份已登记 {workspaces} 个知识库。")
+    if page_metrics.enabled():
+        org_context["note"] += " 本页含个人知识库；BI 看板按已确认且非个人的治理范围统计。总览本月均分按北京时间评审发生月统计；趋势评分按文档入库日期统计。"
     return {
         "metrics": {
             "workspace_count": workspaces,
@@ -727,9 +745,7 @@ def workspaces(query: str = "", level: str = "", department: str = "", creator: 
     不可见库（is_active=False，连续缺席/404 自动标记）不进列表。"""
     rows = db.scalars(select(Workspace).where(Workspace.is_active.is_(True))
                       .order_by(Workspace.name)).all()
-    doc_counts = {ws_id: count for ws_id, count in db.execute(
-        select(Document.workspace_id, func.count()).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
-        .group_by(Document.workspace_id)).all()}
+    doc_counts = metrics._live_workspace_counts(db)
     roles: dict[str, dict[str, list[str]]] = {}
     for role_row in db.scalars(select(WorkspaceRole)).all():
         bucket = roles.setdefault(role_row.workspace_id, {"administrator": [], "reviewer": []})
@@ -896,6 +912,7 @@ def _record_history(db: Session, item: ModelConfig, action: str) -> None:
 @app.get("/api/v1/model-configs", dependencies=[Depends(require_admin)])
 def model_configs(db: Session = Depends(db_session)):
     return {"items": [_model_dict(x) for x in db.scalars(select(ModelConfig).order_by(ModelConfig.updated_at.desc())).all()],
+            "automation_paused": get_settings().metadata_only or not get_settings().review_enabled,
             "rule_version": "V1.1",
             "api_key_policy": "API Key 可页面配置（仅存数据库、接口只回掩码）或环境变量注入；留空表示沿用已存密钥。"}
 
@@ -968,12 +985,18 @@ def model_rollback(config_id: int, history_id: int, db: Session = Depends(db_ses
 
 
 @app.post("/api/v1/model-configs/{config_id}/connection-check", dependencies=[Depends(require_admin)])
-async def model_check(config_id: int, db: Session = Depends(db_session)):
-    item = db.get(ModelConfig, config_id)
-    if not item: raise HTTPException(404, "模型配置不存在")
-    return await model_connection_check({"enabled": item.enabled, "base_url": item.base_url, "model_name": item.model_name,
-                                         "api_key": item.api_key, "api_key_env_name": item.api_key_env_name,
-                                         "timeout_seconds": item.timeout_seconds}, get_settings())
+async def model_check(config_id: int):
+    config = await run_in_threadpool(_load_model_probe_config, config_id)
+    from .diagnostics import probe
+    return await probe("model", config, get_settings())
+
+
+def _load_model_probe_config(config_id=None):
+    with SessionLocal() as db:
+        item = db.get(ModelConfig, config_id) if config_id is not None else db.scalar(select(ModelConfig).where(ModelConfig.enabled.is_(True)).limit(1))
+        if config_id is not None and not item:
+            raise HTTPException(404, "模型配置不存在")
+        return _model_snapshot(item) if item else {"enabled": False}
 
 
 # ---------------------------------------------------------------------------
@@ -1187,25 +1210,20 @@ def scoring_rule_rollback(config_id: int, history_id: int, request: Request, db:
 
 
 @app.get("/api/v1/diagnostics/connectivity", dependencies=[Depends(require_admin)])
-async def connectivity(db: Session = Depends(db_session)):
-    settings = get_settings(); ding = DingtalkClient(settings)
-    if ding.configured() and settings.dingtalk_sync_operator_id:
-        try: await ding.list_workspaces(settings.dingtalk_sync_operator_id, max_results=1); ding_result = {"status": "healthy", "message": "知识库读取权限与 operatorId 可用。"}
-        except IntegrationError as exc: ding_result = {"status": "failed", "message": str(exc), "code": exc.code}
-    else: ding_result = {"status": "not_configured", "message": "缺少钉钉应用凭据或 DINGTALK_SYNC_OPERATOR_ID。"}
-    model = db.scalar(select(ModelConfig).where(ModelConfig.enabled.is_(True)))
-    model_result = await model_connection_check({"enabled": bool(model), "base_url": model.base_url if model else "", "model_name": model.model_name if model else "", "api_key": model.api_key if model else "", "api_key_env_name": model.api_key_env_name if model else "KG_MODEL_API_KEY", "timeout_seconds": model.timeout_seconds if model else 30}, settings)
-    if not settings.watch_workspaces:
-        watch_result = {"status": "not_configured", "message": "未配置 KG_WATCH_WORKSPACES，定向监控关闭。"}
-    else:
-        last_watch = db.scalar(select(SyncRun).where(SyncRun.mode.in_(("watch", "watch_seed", "bridge", "bridge_seed"))).order_by(SyncRun.created_at.desc()).limit(1))
-        if not last_watch:
-            watch_result = {"status": "pending", "message": f"已配置目标「{settings.watch_workspaces}」，等待 worker 首轮扫描。"}
-        elif last_watch.status == "succeeded":
-            watch_result = {"status": "healthy", "message": f"最近扫描（{last_watch.mode}）：文件 {last_watch.documents_seen}，新增 {last_watch.documents_new}，变更 {last_watch.documents_changed}，{last_watch.created_at.isoformat()}。"}
-        else:
-            watch_result = {"status": "failed", "message": f"最近扫描失败：{last_watch.error_code}", "code": last_watch.error_code}
-    return {"items": [{"name": "钉钉知识库", **ding_result}, {"name": "bi_center 组织架构", **(await BiCenterClient(settings).check())}, {"name": "AI 评审模型", **model_result}, {"name": "定向监控 watcher", **watch_result}], "body_storage": "正文仅在 worker 内存/tmpfs 临时处理，数据库不保存正文。"}
+def connectivity(db: Session = Depends(db_session)):
+    from .diagnostics import local_status
+    return local_status(db, get_settings())
+
+
+@app.post("/api/v1/diagnostics/connectivity/{target}", dependencies=[Depends(require_admin)])
+async def connectivity_probe(target: str):
+    if target not in {"dingtalk", "bi_center", "model"}:
+        raise HTTPException(404, "连接测试项不存在。")
+    from .diagnostics import probe
+    config = {}
+    if target == "model":
+        config = await run_in_threadpool(_load_model_probe_config)
+    return await probe(target, config, get_settings())
 
 
 @app.get("/api/v1/diagnostics/sync-runs", dependencies=[Depends(require_admin)])
@@ -1221,6 +1239,11 @@ def sync_runs(status: str = "", db: Session = Depends(db_session)):
                        "created_at": x.created_at.isoformat(),
                        "finished_at": x.finished_at.isoformat() if x.finished_at else None}
                       for x in db.scalars(stmt).all()]}
+
+
+@app.get("/api/v1/diagnostics/performance", dependencies=[Depends(require_admin)])
+def performance_status():
+    return performance.snapshot()
 
 
 @app.post("/api/v1/sync-runs", status_code=202, dependencies=[Depends(require_admin)])

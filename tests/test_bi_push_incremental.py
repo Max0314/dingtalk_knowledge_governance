@@ -69,7 +69,8 @@ def test_seed_dedup_cst_and_atomic_parts(local):
         assert v["data"]["monthly"][0]["uploadedFileCount"] == 2
         assert len(v["data"]["employees"]) == 2
         assert db.get(BIProjectionState, 1).seed_complete
-        assert not db.scalars(select(BIDirtyScope)).all()
+        assert not db.scalars(select(BIDirtyScope).where(~BIDirtyScope.scope_key.like('page_month/%'))).all()
+        assert db.scalar(select(BIDirtyScope.scope_key).where(BIDirtyScope.scope_key.like('page_month/%')))
 
 
 def test_idle_has_no_source_reads_or_business_writes(local):

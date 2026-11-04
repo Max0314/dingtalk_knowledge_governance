@@ -11,6 +11,7 @@ PAYLOAD = Text().with_variant(LONGTEXT(), "mysql")
 
 class BIIdentityMonth(Base):
     __tablename__ = "kg_bi_identity_month"
+    __table_args__ = (Index('ix_kg_bi_identity_employee', 'employee_key', 'month'),)
     month: Mapped[str] = mapped_column(String(7), primary_key=True)
     identity_kind: Mapped[str] = mapped_column(String(16), primary_key=True)
     source_key: Mapped[str] = mapped_column(id_string(), primary_key=True)
@@ -151,3 +152,9 @@ class BIProjectionState(Base):
     seed_complete: Mapped[bool] = mapped_column(Boolean, default=False)
     initialized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_projected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PageIdentityState(Base):
+    __tablename__ = 'kg_page_identity_state'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    master_hash: Mapped[str] = mapped_column(String(64), default='')

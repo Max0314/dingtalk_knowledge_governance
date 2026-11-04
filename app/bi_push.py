@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import threading
+from contextlib import contextmanager
 import random
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from uuid import uuid4
 import httpx
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, update, text
 from .bi_models import BIIdentityMonth, BIPushOutbox, BIPushPayload, BIPushState, BIStatPartition
 from .bi_push_contract import (MAX_BYTES, canonical, delta_hash, materialize_parts, partition_manifest,
                               state_hash, utc_text, validate_frame)
@@ -107,12 +109,47 @@ class RemoteClient:
         return sorted(rows, key=lambda r: r["index"])
 
 
+_identity_lock = threading.Lock()
+
+
+@contextmanager
+def identity_lock(sessions):
+    with sessions() as db:
+        bind = db.get_bind()
+    if bind.dialect.name != 'mysql':
+        got = _identity_lock.acquire(blocking=False)
+        if not got:
+            raise SnapshotUnavailable('identity_prepare_busy')
+        try:
+            yield
+        finally:
+            _identity_lock.release()
+        return
+    with bind.connect() as conn:
+        got = conn.scalar(text("SELECT GET_LOCK('kg_identity_prepare',0)")) == 1
+        conn.commit()
+        if not got:
+            raise SnapshotUnavailable('identity_prepare_busy')
+        try:
+            yield
+        finally:
+            conn.execute(text("SELECT RELEASE_LOCK('kg_identity_prepare')"))
+            conn.commit()
+
+
 async def prepare_identities(sessions, inputs_by_month, remote):
+    with identity_lock(sessions):
+        return await _prepare_identities(sessions, inputs_by_month, remote)
+
+
+async def _prepare_identities(sessions, inputs_by_month, remote):
     """Only affected aggregate months; commits bounded cache batches."""
     before = await remote.master_status()
-    versions = {}
+    versions, org_shared = {}, {}
     for month, inputs in inputs_by_month.items():
         version = await remote.directory_version(month)
+        from .org_month_cache import prepare_month
+        await prepare_month(sessions, month, version, remote, org_shared)
         versions[month] = version
         wanted = identity_keys(inputs)
         with sessions() as db:

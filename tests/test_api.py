@@ -158,8 +158,8 @@ def test_connectivity_uses_stored_model_key_before_environment(monkeypatch):
             db.add(ModelConfig(name="Synthetic model", base_url="https://model.invalid/v1",
                                model_name="synthetic-model", api_key="synthetic-stored-model-key", enabled=True))
             db.flush()
-            result = asyncio.run(main_module.connectivity(db))
-            assert next(x for x in result["items"] if x["name"] == "AI 评审模型")["status"] == "healthy"
+            result = asyncio.run(integrations.model_connection_check(main_module._model_snapshot(db.query(ModelConfig).one()), settings))
+            assert result["status"] == "healthy"
             assert len(requests) == 1
     finally:
         engine.dispose()

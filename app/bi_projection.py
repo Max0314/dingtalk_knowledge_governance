@@ -35,7 +35,8 @@ def enqueue(db, model, keys):
         return
     table = model.__table__
     pk = list(table.primary_key)[0].name
-    rows = [{pk: key, "generation": 1, "requested_at": utcnow()} for key in keys]
+    requested = utcnow()
+    rows = [{pk: key, "generation": 1, "requested_at": requested} for key in keys]
     stmt = _insert_for(db, table, rows)
     values = {"generation": table.c.generation + 1, "requested_at": utcnow()}
     stmt = stmt.on_duplicate_key_update(**values) if db.bind.dialect.name == "mysql" else stmt.on_conflict_do_update(index_elements=[pk], set_=values)
@@ -189,7 +190,7 @@ def apply_projections(db, projections):
         _counter_upsert(db, BIUploadDay, days, ["workspace_id", "identity_kind", "source_key", "day"], ["file_count"])
         _counter_upsert(db, BIInventory, inventory, ["workspace_id"], ["file_count", "undated_count"])
         _counter_upsert(db, BIQualityMonth, quality, ["workspace_id", "identity_kind", "source_key", "month"], list(Q_MAP.values()))
-        enqueue(db, BIDirtyScope, scopes)
+        enqueue(db, BIDirtyScope, scopes | {'page_month/'+s[6:] for s in scopes if s.startswith('month/')})
     return len(writes)
 
 

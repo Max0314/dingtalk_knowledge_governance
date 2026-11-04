@@ -27,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import get_settings
 from .db import ReadCacheEntry, SessionLocal, utcnow
+from .performance import measure_refresh
 
 # Explicit allowlist: adding a route never implicitly enables its caching.
 ENDPOINTS = {
@@ -66,7 +67,7 @@ def _age(generated):
 
 
 def _key(name, parameters):
-    raw = json.dumps(["metadata-v1", name, parameters], sort_keys=True, ensure_ascii=False)
+    raw = json.dumps(["metadata-v2", name, parameters], sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -101,6 +102,7 @@ def _load(key):
     return None
 
 
+@measure_refresh
 def _refresh(key, name, parameters):
     owner = uuid.uuid4().hex
     deadline = time.monotonic() + 20
@@ -263,11 +265,11 @@ def _maintain():
                 targets = {(name, _key(name, _registry[name][1])): _registry[name][1]
                            for name in core if name in _registry}
                 with SessionLocal() as db:
-                    rows = db.scalars(select(ReadCacheEntry).where(
+                    rows = db.execute(select(ReadCacheEntry.endpoint, ReadCacheEntry.cache_key, ReadCacheEntry.parameters).where(
                         ReadCacheEntry.generated_at > utcnow() - timedelta(hours=1)
                     ).order_by(ReadCacheEntry.generated_at.desc()).limit(MAX_KEYS)).all()
                     targets.update({(row.endpoint, row.cache_key): row.parameters for row in rows
-                                    if row.endpoint in _registry})
+                                    if row.endpoint in _registry and row.cache_key == _key(row.endpoint, row.parameters)})
                     db.execute(delete(ReadCacheEntry).where(
                         ReadCacheEntry.lease_until.is_(None),
                         or_(ReadCacheEntry.generated_at < utcnow() - timedelta(days=1),

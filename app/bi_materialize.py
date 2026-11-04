@@ -94,7 +94,7 @@ def dirty_plan(db, settings, now=None):
     if db.scalar(select(BIDirtyNode.node_id).limit(1)):
         raise SnapshotUnavailable("projection_pending")
     headers = partition_headers(db)
-    scopes = db.execute(select(BIDirtyScope.scope_key, BIDirtyScope.generation)).all()
+    scopes = db.execute(select(BIDirtyScope.scope_key, BIDirtyScope.generation).where(~BIDirtyScope.scope_key.like('page_month/%'))).all()
     names, unconfirmed = eligible_spaces(db, settings)
     old_meta = read_meta(db)
     current = now.astimezone(CST).strftime("%Y-%m")

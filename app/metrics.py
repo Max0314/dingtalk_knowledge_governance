@@ -85,6 +85,9 @@ def _collect(db: Session) -> dict[str, Any]:
         whole person-day bulk (the migration signature);
       * everything else is routine.
     """
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.collect(db)
     baseline = primary_snapshot_id(db)
     deleted_ids = select(Document.node_id).where(Document.is_deleted.is_(True))
     # 不可见库（is_active=False，连续缺席/404）双臂退出当前统计（codex 第九
@@ -311,6 +314,9 @@ def increments_tree(db: Session, year: str = "", month: str = "", department: st
     remains available as an explicit people filter, but never determines
     whether a department-owned knowledge base enters the scope.
     """
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.increments_tree(db, year=year, month=month, department=department, biz_group=biz_group, person=person, scope=scope)
     data = collected(db)
     robots = data["robots"]
     creators: set[str] | None = None
@@ -399,6 +405,9 @@ def _scan_status(workspace_id: str, space_totals: dict, live_counts: dict, exclu
 
 
 def _live_workspace_counts(db: Session) -> dict[str, int]:
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.counts(db)
     return {row[0]: row[1] for row in db.execute(
         select(Document.workspace_id, func.count()).where(Document.is_folder.is_(False), Document.is_deleted.is_(False))
         .group_by(Document.workspace_id))}
@@ -492,6 +501,9 @@ def _person(user_id: str, employee: EmployeeMap | None) -> dict[str, Any]:
 
 
 def uploader_months(db: Session) -> dict[str, Any]:
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.uploader_months(db)
     snapshot = uploader_snapshot_id(db)
     rows = db.execute(select(UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
                       .where(UploaderMonthStat.snapshot_id == snapshot)
@@ -514,6 +526,9 @@ def uploader_breakdown(db: Session, user_id: str, year: str = "", month: str = "
     and workspace distribution for the chosen period. Day granularity reads the
     node table through the (snapshot, creator) index — a few thousand rows at
     most for one person."""
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.uploader_breakdown(db, user_id, year=year, month=month)
     snapshot = uploader_snapshot_id(db)
     period = month or year
     months = db.execute(select(UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
@@ -547,6 +562,9 @@ def uploader_breakdown(db: Session, user_id: str, year: str = "", month: str = "
 def org_rollup(db: Session, year: str = "", month: str = "") -> dict[str, Any]:
     """Department -> business-group -> person tree with stock (all-time) and
     period delta. Built from the small aggregate table plus the identity cache."""
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.org_rollup(db, year=year, month=month)
     snapshot = uploader_snapshot_id(db)
     period = month or year
     rows = db.execute(select(UploaderMonthStat.creator_user_id, UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
@@ -589,6 +607,9 @@ def org_rollup(db: Session, year: str = "", month: str = "") -> dict[str, Any]:
 
 
 def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limit: int = 50, department: str = "") -> dict[str, Any]:
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.uploaders(db, month=month, exclude_unmatched=exclude_unmatched, limit=limit, department=department)
     snapshot = uploader_snapshot_id(db)
     stmt = (select(UploaderMonthStat.creator_user_id,
                    func.sum(UploaderMonthStat.file_count).label("files"),
@@ -626,6 +647,9 @@ def uploaders(db: Session, month: str = "", exclude_unmatched: bool = True, limi
 
 
 def uploader_detail(db: Session, user_id: str) -> dict[str, Any]:
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.uploader_detail(db, user_id)
     snapshot = uploader_snapshot_id(db)
     months = db.execute(select(UploaderMonthStat.month, func.sum(UploaderMonthStat.file_count))
                         .where(UploaderMonthStat.snapshot_id == snapshot, UploaderMonthStat.creator_user_id == user_id)
@@ -641,6 +665,9 @@ def uploader_detail(db: Session, user_id: str) -> dict[str, Any]:
 
 
 def department_rollup(db: Session, month: str = "") -> dict[str, Any]:
+    from . import page_metrics
+    if page_metrics.enabled():
+        return page_metrics.department_rollup(db, month=month)
     snapshot = uploader_snapshot_id(db)
     stmt = select(UploaderMonthStat.creator_user_id, func.sum(UploaderMonthStat.file_count)) \
         .where(UploaderMonthStat.snapshot_id == snapshot)

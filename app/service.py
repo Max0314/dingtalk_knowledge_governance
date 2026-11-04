@@ -14,6 +14,7 @@ from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError, model_score_content
 from .notify import enqueue_review_notification
 from .scoring import RULE_VERSION, effective_config, score_document, verdict_for
+from . import scan_models  # Register additive checkpoint tables before init_db.
 
 
 # 正文修改的合并评审窗（2026-08-14 拍板）：30 分钟无后续修改评一次；
@@ -584,7 +585,7 @@ async def resolve_watch_targets(settings: Settings, force: bool = False) -> dict
 
 
 async def watch_workspace(db: Session, settings: Settings, workspace_id: str, space: dict | None = None,
-                          mode: str = "watch") -> SyncRun:
+                          mode: str = "watch", resume_run_id: str | None = None) -> SyncRun:
     """One complete walk of one workspace. The first walk (empty mirror) seeds
     without queueing reviews — pre-existing files must not flood the queue.
     Later targeted walks queue genuinely new native adoc nodes by nodeId;
@@ -597,6 +598,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
     from .api_usage import scan_month
     if not settings.demo_mode and (not settings.full_scan_enabled or not scan_month.get()):
         raise IntegrationError("scan_scheduler_required", "全量扫描须启用月度校准并使用持久化调度器。", 409)
+    if settings.metadata_only:
+        from .scan_pages import watch_paged
+        return await watch_paged(db, settings, workspace_id, space, mode, DingtalkClient(settings), resume_run_id)
     run = SyncRun(run_id=str(uuid.uuid4()), status="running", mode=mode, workspace_id=workspace_id,
                   workspace_name=(space or {}).get("name", ""))
     db.add(run); db.commit()
@@ -868,6 +872,7 @@ def sweep_stale_runs(db: Session, *, sync_runs: bool = True,
     - BridgeWalk 可由显式维护调用清理；生产 watcher 启动保留持久队列。"""
     stale = (db.scalars(select(SyncRun).where(SyncRun.status == "running")).all()
              if sync_runs else [])
+    stale = [run for run in stale if not db.get(scan_models.ScanProgress, run.run_id)]
     for run in stale:
         run.status, run.error_code, run.finished_at = "failed", "interrupted_by_restart", utcnow()
     zombie_jobs = (db.scalars(select(ReviewJob).where(ReviewJob.status == "running",

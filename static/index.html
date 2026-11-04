@@ -10,7 +10,7 @@
 /* 首屏并发：总览接口在这里就发出，而不是等 1MB 的 echarts 下载+解析完、
    app.js 执行、再串行等一次 auth/me 之后才开始。未登录时这次预取拿到 401
    并作废，登录跳转仍由 app.js 的 auth/me 分支统一负责。 */
-window.__boot=fetch('api/v1/dashboard/overview').then(function(r){return r.ok?r.json():null}).catch(function(){return null});
+window.__boot=(!location.hash||/^#\/?overview$/.test(location.hash))?fetch('api/v1/dashboard/overview').then(function(r){return r.ok?r.json():null}).catch(function(){return null}):null;
 </script>
 </head>
 <body>
@@ -60,7 +60,6 @@ window.__boot=fetch('api/v1/dashboard/overview').then(function(r){return r.ok?r.
   </div></main>
 </div>
 <div id="toast" class="toast"></div>
-<script src="vendor/echarts.min.js?v=20260818a"></script>
-<script src="app.js?v=20261010-login"></script>
+<script src="app.js?v=20261104-performance"></script>
 </body>
 </html>

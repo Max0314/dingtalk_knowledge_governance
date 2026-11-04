@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from sqlalchemy import delete, select, text, update
 from .bi_models import BIDirtyScope, BIProjectionState, BIPushOutbox, BIPushPayload, BIPushState
@@ -126,6 +127,8 @@ def reconcile_remote(db, remote):
 async def refresh_versions(sessions, remote):
     status = await remote.master_status()
     with sessions.begin() as db:
+        from .page_identity import refresh_versions as refresh_page_versions
+        refresh_page_versions(db, status)
         meta = read_meta(db)
         for row in meta.get("identityVersions", []):
             directory = status["monthlyDirectoryVersions"].get(row["resolvedSnapshotMonth"], "missing")
@@ -197,8 +200,22 @@ def run():
     init_db()
     remote = RemoteClient(settings)
     next_build = next_status = next_cleanup = 0.0
+    page_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='kg-page-identities')
+    page_future, next_page = None, 0.0
     while True:
         try:
+            if page_future is None or page_future.done():
+                if page_future is not None:
+                    try:
+                        page_future.result()
+                    except Exception as exc:
+                        logger.warning('Page identity cache deferred: %s', type(exc).__name__)
+                        next_page = max(next_page, time.monotonic()+60)
+                    page_future = None
+                if time.monotonic() >= next_page:
+                    from .page_identity import run_slice as prepare_page_slice
+                    page_future = page_executor.submit(prepare_page_slice, SessionLocal, settings)
+                    next_page = time.monotonic()+5
             with publisher_lock() as got:
                 if got:
                     with SessionLocal.begin() as db:

@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import calendar
 import os
 from datetime import datetime
 from uuid import UUID
@@ -34,11 +35,15 @@ def budget_preflight(db, settings, ids):
     calls = {(r['period'], r['interface']): r['calls'] for r in usage['items']}
     now = datetime.now(CST)
     day, month = now.strftime('day:%Y-%m-%d'), now.strftime('month:%Y-%m')
-    remaining = min(settings.dingtalk_daily_limit - calls.get((day, 'total'), 0),
-                    settings.dingtalk_monthly_limit - calls.get((month, 'total'), 0),
+    daily_remaining = max(0, settings.dingtalk_daily_limit - settings.scan_daily_reserve - calls.get((day, 'total'), 0))
+    remaining = min(settings.dingtalk_monthly_limit - settings.scan_monthly_reserve - calls.get((month, 'total'), 0),
                     settings.dingtalk_nodes_monthly_limit - calls.get((month, 'wiki.nodes'), 0),
                     settings.scan_max_api_calls - calls.get((now.strftime('scan:%Y-%m'), 'total'), 0))
-    return {'estimatedCalls': estimate, 'remainingCalls': max(0, remaining), 'approved': estimate <= remaining}
+    capacity = max(1, settings.dingtalk_daily_limit - settings.scan_daily_reserve)
+    minimum_days = 1 + math.ceil(max(0, estimate - daily_remaining)/capacity)
+    return {'estimatedCalls': estimate, 'remainingCalls': max(0, remaining), 'dailyRemainingCalls': daily_remaining,
+            'estimatedMinimumDays': minimum_days, 'daysLeftInMonth': calendar.monthrange(now.year, now.month)[1] - now.day + 1,
+            'approved': estimate <= remaining and daily_remaining > 0 and minimum_days <= calendar.monthrange(now.year, now.month)[1] - now.day + 1}
 
 
 def prepare_recovery(db, settings, recovery_id, reason):

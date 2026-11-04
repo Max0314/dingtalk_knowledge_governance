@@ -3,14 +3,17 @@ import asyncio
 import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from datetime import timezone
+from uuid import uuid4
 import threading
 
 from sqlalchemy import select, text
 
 from .api_usage import CST, scan_budget
-from .db import AuditState, ScanCycle, ScanTask, SyncRun, utcnow
+from .db import ApiUsage, AuditState, ScanCycle, ScanTask, SyncRun, utcnow
 from .integrations import IntegrationError
 from .service import resolve_watch_targets, watch_workspace
+from .scan_models import ScanProgress
 
 _local_lock = threading.Lock()
 
@@ -22,11 +25,13 @@ def scan_lock(db):
     if db.bind.dialect.name == "mysql":
         with db.bind.connect() as conn:
             got = conn.execute(text("SELECT GET_LOCK('kg_monthly_scan', 0)")).scalar()
+            conn.commit()
             try:
                 yield bool(got)
             finally:
                 if got:
                     conn.execute(text("SELECT RELEASE_LOCK('kg_monthly_scan')"))
+                    conn.commit()
     else:
         got = _local_lock.acquire(blocking=False)
         try:
@@ -49,6 +54,8 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
     with scan_lock(db) as got:
         if not got:
             return {"status": "busy", "walked": []}
+        from .scan_pages import cleanup_completed
+        cleanup_completed(db)
         cycle = db.get(ScanCycle, month)
         for old in db.scalars(select(ScanCycle).where(ScanCycle.month < month, ScanCycle.status == "running")).all():
             old.status, old.finished_at = "expired", utcnow()
@@ -57,8 +64,13 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
             return {"status": "idle", "walked": []}
         if cycle is not None and cycle.status != "running":
             return {"status": cycle.status, "month": month, "walked": []}
+        used = db.get(ApiUsage, (datetime.now(CST).strftime('day:%Y-%m-%d'), 'total'))
+        if (used.calls if used else 0) >= max(0, settings.dingtalk_daily_limit - settings.scan_daily_reserve):
+            db.rollback()
+            return {'status': 'daily_budget_wait', 'month': month, 'walked': []}
         with scan_budget(month):
             if cycle is None:
+                db.commit()
                 targets = await resolve_watch_targets(settings, force=True)
                 if not targets["resolved"]:
                     return {"status": "no_targets", "walked": []}
@@ -78,9 +90,9 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
             for task in tasks:
                 if task.status == "running":
                     # We own the global lock: previous owner was interrupted.
-                    task.status = "dead_letter" if task.attempts >= settings.scan_max_attempts else "pending"
+                    task.status = "pending" if settings.metadata_only and task.run_id else ("dead_letter" if task.attempts >= settings.scan_max_attempts else "pending")
                     task.error_code = "interrupted_by_restart"
-                    task.next_attempt_at = now + timedelta(seconds=settings.scan_retry_seconds)
+                    task.next_attempt_at = None if settings.metadata_only else now + timedelta(seconds=settings.scan_retry_seconds)
             db.commit()
             walked = []
             for task in tasks:
@@ -88,12 +100,20 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
                     continue
                 if task.next_attempt_at and task.next_attempt_at.replace(tzinfo=None) > now:
                     continue
-                task.status, task.attempts = "running", task.attempts + 1
+                prior_run = db.get(SyncRun, task.run_id) if settings.metadata_only and task.run_id else None
+                continuation = bool(settings.metadata_only and task.run_id and (prior_run is None or prior_run.status in ('running', 'paused')))
+                task.status = 'running'
+                if not continuation:
+                    task.attempts += 1
+                if settings.metadata_only and not task.run_id:
+                    task.run_id = str(uuid4())
                 db.commit()  # Reserve attempt durably BEFORE touching DingTalk.
                 space = {"workspace_id": task.workspace_id, "name": task.workspace_name,
                          "root_node_id": task.root_node_id}
+                run = None
                 try:
-                    run = await watch_workspace(db, settings, task.workspace_id, space, mode="watch")
+                    options = {'resume_run_id': task.run_id} if settings.metadata_only else {}
+                    run = await watch_workspace(db, settings, task.workspace_id, space, mode="watch", **options)
                     task.run_id, task.error_code = run.run_id, run.error_code
                     success = run.status == "succeeded"
                 except IntegrationError as exc:
@@ -104,8 +124,12 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
                     db.rollback()
                     task.error_code = "scan_execution_failed"
                     success = False
-                task.status = "succeeded" if success else ("dead_letter" if task.attempts >= settings.scan_max_attempts else "pending")
-                task.next_attempt_at = None if success else now + timedelta(seconds=settings.scan_retry_seconds * 2 ** (task.attempts - 1))
+                in_progress = bool(settings.metadata_only and run and run.run_id == task.run_id and run.status in ('running', 'paused'))
+                task.status = 'pending' if in_progress else ('succeeded' if success else ('dead_letter' if task.attempts >= settings.scan_max_attempts else 'pending'))
+                task.next_attempt_at = None if success or in_progress else utcnow() + timedelta(seconds=settings.scan_retry_seconds * 2 ** max(0, task.attempts - 1))
+                if task.error_code.startswith('dingtalk_scan_daily_reserved'):
+                    tomorrow = datetime.now(CST).replace(hour=0, minute=1, second=0, microsecond=0) + timedelta(days=1)
+                    task.next_attempt_at = tomorrow.astimezone(timezone.utc).replace(tzinfo=None)
                 walked.append({"workspace_id": task.workspace_id, "status": task.status,
                                "attempts": task.attempts, "error_code": task.error_code})
                 if task.error_code.startswith("dingtalk_budget_"):

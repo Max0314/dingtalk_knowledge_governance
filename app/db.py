@@ -372,6 +372,8 @@ class EmployeeOrgMonth(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     month: Mapped[str] = mapped_column(String(7), index=True)
     employee_key: Mapped[str] = mapped_column(id_string(), index=True)
+    employee_name: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    details_ready: Mapped[bool] = mapped_column(Boolean, default=False, server_default='0')
     department_name: Mapped[str] = mapped_column(String(255), default="")
     biz_group_name: Mapped[str] = mapped_column(String(255), default="")
     is_rd_system: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -637,6 +639,7 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
 # create_all only creates missing tables; columns added to an existing model
 # need an explicit ALTER. Keep this list tiny and append-only.
 EXTRA_COLUMNS = {
+    "employee_org_month_cache": {"employee_name": "VARCHAR(128) NOT NULL DEFAULT ''", "details_ready": "BOOLEAN NOT NULL DEFAULT 0"},
     "review_jobs": {"lease_until": "DATETIME NULL"},
     "review_instances": {"rule_config_ref": "VARCHAR(160) NOT NULL DEFAULT ''",
                          "content_note": "VARCHAR(64) NOT NULL DEFAULT ''",

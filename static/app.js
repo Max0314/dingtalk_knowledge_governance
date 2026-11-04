@@ -8,9 +8,21 @@ const optional=(promise,fallback=null)=>promise.catch(e=>{if(aborted(e))throw e;
 function ensureCurrentNav(controller){if(controller&&(controller!==navAbort||controller.signal.aborted)){
   const e=new Error('Navigation aborted');e.name='AbortError';throw e}}
 let navAbort=null;
-const api=(url,options={})=>fetch(url.replace(/^\//,''),{signal:navAbort&&navAbort.signal,headers:{'Content-Type':'application/json'},...options}).then(async r=>{const data=await r.json().catch(()=>({}));
-  if(r.status===401){renderLogin();throw new Error(data.detail?.message||'请先登录')}
-  if(!r.ok)throw new Error(data.detail?.message||data.detail||'请求失败');return data});
+const api=async(url,options={})=>{
+  const {timeout=30000,signal=navAbort&&navAbort.signal,...rest}=options;
+  const controller=new AbortController();let timedOut=false;
+  const cancel=()=>controller.abort();if(signal){if(signal.aborted)cancel();else signal.addEventListener('abort',cancel,{once:true})}
+  const timer=setTimeout(()=>{timedOut=true;controller.abort()},timeout);
+  try{const r=await fetch(url.replace(/^\//,''),{headers:{'Content-Type':'application/json'},...rest,signal:controller.signal});
+    const data=await r.json().catch(e=>{if(aborted(e))throw e;return null});
+    if(controller.signal.aborted){const e=new Error('Navigation aborted');e.name='AbortError';throw e}
+    if(r.status===401){renderLogin();throw new Error('请先登录')}
+    if(!r.ok){const detail=data&&data.detail;const message=typeof detail==='string'?detail:detail?.message;
+      const e=new Error(message||(r.status===503?'数据正在准备或服务繁忙，请稍后重试。':`请求失败（HTTP ${r.status}），请重试。`));e.status=r.status;throw e}
+    if(data===null)throw new Error('接口返回格式异常，请重试。');return data;
+  }catch(e){if(timedOut&&!(signal&&signal.aborted))throw new Error('请求超时，请稍后重试。');throw e}
+  finally{clearTimeout(timer);if(signal)signal.removeEventListener('abort',cancel)}
+};
 // Each region owns its request: same-page filtering must also be last-wins.
 const regionRequests=new Map();
 async function regionFetch(name,url,onRetry){
@@ -54,6 +66,16 @@ function toast(msg){const x=document.querySelector('#toast');x.textContent=msg;x
    一个 ResizeObserver 驱动全部图表，且只在宽度真的变了时重绘。旧实现里
    全局 window 'resize' 监听没有节流，滚动条每出现/消失一次就同步重绘所有
    图表；而 init 后那个 requestAnimationFrame(resize) 每次渲染都多画一帧。 */
+let chartScript=null;
+function ensureCharts(){
+  if(window.echarts)return Promise.resolve();
+  if(!chartScript)chartScript=new Promise((resolve,reject)=>{
+    const script=document.createElement('script');script.src='vendor/echarts.min.js?v=20260818a';
+    const timer=setTimeout(()=>{script.remove();chartScript=null;reject(new Error('图表组件加载超时，请重试。'))},12000);
+    script.onload=()=>{clearTimeout(timer);if(window.echarts&&typeof window.echarts.init==='function')resolve();else{script.remove();chartScript=null;reject(new Error('图表组件初始化失败，请重试。'))}};script.onerror=()=>{clearTimeout(timer);script.remove();chartScript=null;reject(new Error('图表组件加载失败，请重试。'))};
+    document.head.append(script)
+  });return chartScript
+}
 const charts=new Map();
 const chartWidths=new WeakMap();
 const chartObserver=window.ResizeObserver?new ResizeObserver(entries=>{
@@ -64,7 +86,7 @@ const chartObserver=window.ResizeObserver?new ResizeObserver(entries=>{
 if(!chartObserver)window.addEventListener('resize',()=>charts.forEach(c=>c.resize()));
 function untrack(c){const el=c&&!c.isDisposed()&&c.getDom();if(el&&chartObserver)chartObserver.unobserve(el)}
 function disposeCharts(){charts.forEach(c=>{untrack(c);c.dispose()});charts.clear()}
-function renderChart(id,option){const el=document.getElementById(id);if(!el)return;if(!window.echarts){el.outerHTML='<div class="chart-fallback">图表组件未加载（/vendor/echarts.min.js）。数据见下方表格。</div>';return}
+function renderChart(id,option){const el=document.getElementById(id);if(!el)return;if(!window.echarts){el.textContent='正在加载图表…';ensureCharts().then(()=>{if(el.isConnected)renderChart(id,option)}).catch(e=>{if(el.isConnected)el.textContent=e.message+' 数据见页面表格。'});return}
   let c=charts.get(id);
   if(c&&(c.isDisposed()||c.getDom()!==el)){untrack(c);c.dispose();c=null}
   if(!c){c=echarts.init(el);charts.set(id,c);
@@ -84,7 +106,7 @@ function stackedOption(rows,{zoom=false}={}){return{
   ]}}
 /* 图表下钻交互（参考 ai_code_review_web）：点击柱体下钻；点击 x 轴标签区下钻
    对应类目；点击图表空白处回退一级。 */
-function bindChartDrill(id,{keys,labels,onDrill,onBack}){const c=charts.get(id);if(!c)return;
+function bindChartDrill(id,{keys,labels,onDrill,onBack}){const c=charts.get(id);if(!c){const el=document.getElementById(id);if(el)ensureCharts().then(()=>{if(el.isConnected&&charts.has(id))bindChartDrill(id,{keys,labels,onDrill,onBack})}).catch(()=>{});return}
   // These instances are reused when drilling; do not accumulate handlers.
   c.off('click');const previousZr=c.getZr&&c.getZr();
   if(previousZr&&previousZr.__kgDrillHandler)previousZr.off('click',previousZr.__kgDrillHandler);
@@ -255,7 +277,7 @@ async function renderOrgSection(){const st=state.inc,card=document.querySelector
     :orgLevel==='group'
     ?`<table class="data-table"><thead><tr><th>业务组</th><th class="num">保有量</th><th class="num">${periodLabel}增量</th><th class="num hide-sm">上传人数</th></tr></thead><tbody>${orgRows.map(g=>`<tr class="rowlink" data-ogroup="${esc(g.biz_group_name)}"><td><b>${esc(g.biz_group_name)}</b></td><td class="num">${nf(g.stock)}</td><td class="num ${g.delta?'delta-pos':'delta-zero'}">${g.delta?'+'+nf(g.delta):'0'}</td><td class="num hide-sm">${g.uploaders}</td></tr>`).join('')||'<tr><td colspan="4"><div class="empty">无匹配</div></td></tr>'}</tbody></table>`
     :`<table class="data-table"><thead><tr><th>成员</th><th class="num">保有量</th><th class="num">${periodLabel}增量</th></tr></thead><tbody>${orgRows.map(pp=>`<tr class="rowlink" data-operson="${esc(pp.user_id)}"><td><b>${esc(pp.name)}</b>${pp.matched?'':'<span class="row-tag">未映射</span>'}</td><td class="num">${nf(pp.stock)}</td><td class="num ${pp.delta?'delta-pos':'delta-zero'}">${pp.delta?'+'+nf(pp.delta):'0'}</td></tr>`).join('')||'<tr><td colspan="3"><div class="empty">无匹配</div></td></tr>'}</tbody></table>`;
-  card.innerHTML=`<div class="card-head">${orgCrumbs}<span style="flex:1"></span>
+  card.innerHTML=`${org.organization_fallbacks?.length?`<p class="hint">组织归属含 ${org.organization_fallbacks.length} 个回退月份，使用 bi_center 返回的可用快照。</p>`:''}<div class="card-head">${orgCrumbs}<span style="flex:1"></span>
       <input class="input" id="org-q" placeholder="搜索${orgLevel==='dept'?'部门':orgLevel==='group'?'业务组':'成员'}" value="${esc(st.orgQ)}" style="width:140px">
       <label class="chip" style="cursor:pointer;margin-left:6px"><input type="checkbox" id="org-excl" ${st.excl?'checked':''} style="margin-right:4px">排除系统/未映射</label></div>
       <p class="hint" style="margin:4px 0 8px">${periodLabel}口径 · 点击行下钻：部门 → 业务组 → 成员</p>
@@ -318,7 +340,7 @@ async function documents(){
   const controller=navAbort;
   state.bl={query:'',ws:'',dept:'',up:'',month:'',offset:0};
   ensureCurrentNav(controller);
-  shell('文档列表','基线快照与实时增量合并去重后的全部文档；可按历史入库月份查看当月已有评分，未生成评审实例的文档明确显示“未评审”。',`
+  shell('文档列表','按当前镜像的分类和日期浏览，重叠节点展示镜像记录；统计报表按基线归属加增量计算。未生成评审实例的文档显示“未评审”。',`
   <section class="card"><div class="card-head"><h2>全部文档（<span id="fl-total">…</span>）</h2><div class="controls" style="flex-wrap:wrap;gap:8px">
     <select class="input" id="bl-ws"><option value="">全部知识库</option></select>
     <select class="input" id="fl-dept" title="知识库归属部门"><option value="">全部部门</option></select>
@@ -513,7 +535,7 @@ async function models(editing){const controller=navAbort;const d=await api('/api
   const cur=editing?d.items.find(x=>x.id===editing):null;
   const f=cur||{name:'',provider:'openai_compatible',base_url:'',model_name:'',temperature:null,thinking_mode:'',timeout_seconds:60,enabled:false,version:'v1',has_key:false,api_key_masked:''};
   ensureCurrentNav(controller);
-  shell('模型配置',`评分规则 ${d.rule_version} · ${d.api_key_policy}`,`
+  shell('模型配置',`评分规则 ${d.rule_version}${d.automation_paused?' · 自动评审已暂停':''} · ${d.api_key_policy}`,`
   <div class="grid two-cols">
   <form class="card" id="model-form"><div class="card-head"><h2>${esc(cur?'编辑：'+cur.name:'新建模型配置')}</h2>${cur?'<button type="button" class="secondary" id="cancel-edit">取消编辑</button>':''}</div>
     <div class="form-grid">
@@ -553,35 +575,36 @@ async function models(editing){const controller=navAbort;const d=await api('/api
     document.querySelectorAll('[data-rb]').forEach(r=>r.onclick=async()=>{if(!confirm('回滚到该历史版本？当前状态会先留档。'))return;
       await api('/api/v1/model-configs/'+r.dataset.cfg+'/rollback/'+r.dataset.rb,{method:'POST'});toast('已回滚');models()})})}
 
-async function diagnostics(){const controller=navAbort;const[d,n,sr,u]=await Promise.all([api('/api/v1/diagnostics/connectivity'),optional(api('/api/v1/notifications?limit=10')),optional(api('/api/v1/diagnostics/sync-runs?status=failed')),optional(api('/api/v1/diagnostics/api-usage'))]);
-  ensureCurrentNav(controller);
-  shell('连接诊断',d.body_storage,`
-  ${u?`<section class="card"><h2>钉钉接口调用量保护</h2><p class="hint">${esc(u.measurement)}。总预算 ${fmt(u.limits.daily)} 次/日、${fmt(u.limits.monthly)} 次/月；节点列表 ${fmt(u.limits.nodes_monthly)} 次/月；文件搜索 ${fmt(u.limits.search_daily)} 次/日。达到限额自动停止请求。</p>
-    <p class="hint">全量校准：${u.switches.full_scan?'已启用，每月一轮':'已暂停'} · 审计拉取：${u.switches.audit_pull?'已启用':'已暂停'} · 自动评审：${u.switches.reviews?'已启用':'已暂停'} · 审计事件不触发整库扫描。</p>
-    ${u.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>统计期间</th><th>接口</th><th>请求次数</th></tr></thead><tbody>${u.items.map(x=>`<tr><td>${esc(x.period)}</td><td>${esc(x.interface)}</td><td>${fmt(x.calls)}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">修复部署后尚无钉钉接口请求。</p>'}</section>`:''}
-  <section class="card"><h2>外部接口状态</h2>${d.items.map(x=>`<div class="diagnostic"><span class="health ${esc(x.status)}"></span><div><b>${esc(x.name)}</b><br><small>${esc(x.status)}</small></div><span class="message">${esc(x.message)}</span></div>`).join('')}<div class="section-gap"><button class="primary" id="refresh">刷新诊断</button></div></section>
-  ${sr&&sr.items&&sr.items.length?`<section class="card section-gap"><div class="card-head"><h2>最近监控异常</h2><span class="hint">近 30 条运行里的失败记录，含所属知识库与异常详情</span></div>
-    <div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>模式</th><th>错误码</th><th>详情</th><th>时间</th></tr></thead><tbody>
-    ${sr.items.slice(0,10).map(x=>`<tr><td><b>${esc(x.workspace_name||x.workspace_id||'—')}</b></td><td><small>${esc(x.mode)}</small></td><td><small>${esc(x.error_code||'—')}</small></td><td><small>${esc((x.error_detail||'').slice(0,90)||'—')}</small></td><td><small>${esc((x.created_at||'').replace('T',' ').slice(0,19))}</small></td></tr>`).join('')}
-  </tbody></table></div></section>`:''}
-  ${n?`<section class="card section-gap"><div class="card-head"><h2>评审结果推送（机器人）</h2><span class="chip ${n.notify_enabled?'green':'gray'}">${n.notify_enabled?'已启用':'未启用（KG_NOTIFY_ENABLED）'}</span></div>
-    <p class="hint">robotCode：${esc(n.robot_code)} · 不合格评审自动入队，worker 逐条发送并留痕。</p>
-    <div class="controls"><input class="input" id="test-uid" placeholder="接收人 userId（如 01115324500438248944）" style="min-width:280px"><button class="secondary" id="test-send">发送测试消息</button></div>
-    ${n.items.length?`<div class="table-wrap section-gap"><table class="data-table"><thead><tr><th>时间</th><th>标题</th><th>接收人</th><th>状态</th><th>错误码</th></tr></thead><tbody>${n.items.map(x=>`<tr><td><small>${esc((x.created_at||'').replace('T',' ').slice(0,19))}</small></td><td>${esc(x.title||'—')}</td><td><small>${esc(x.target_user_id||'—')}</small></td><td><span class="badge ${x.status==='sent'?'pass':x.status==='failed'?'return':''}">${esc(x.status)}</span></td><td><small>${esc(x.error_code||'—')}</small></td></tr>`).join('')}</tbody></table></div>`:'<p class="hint section-gap">暂无推送记录。</p>'}</section>`:''}
-  <section class="card section-gap"><div class="card-head"><h2>月度目录校准</h2></div>
-    <p class="hint">每月仅一轮，按知识库保存进度；失败只重试失败库，最多 3 次。重复点击继续本月剩余任务，不重新扫描已完成的库。</p>
-    <button class="secondary" id="manual-sync" ${!u||!u.switches.full_scan?'disabled':''}>${u&&u.switches.full_scan?'推进本月校准':'全量校准已暂停'}</button></section>
-  <section class="card section-gap"><h2>上线前检查</h2>
-    <p class="hint">1. 钉钉企业应用开通知识库读取与机器人发送权限，并发布版本；operatorId 使用数字员工 UnionID。</p>
-    <p class="hint">2. 数字员工需为目标知识库成员；缺失的库在「知识库管理」的待授权清单中。</p>
-    <p class="hint">3. bi_center 只读 Token 用于员工/部门归属映射（employeeKey=UnionID）。</p>
-    <p class="hint">4. 仅在合规确认后配置正文临时获取网关与模型正文传输策略。</p></section>`);
-  document.querySelector('#refresh').onclick=diagnostics;
-  document.querySelector('#manual-sync').onclick=async()=>{
-    toast('校准任务执行中…');try{const r=await api('/api/v1/sync-runs',{method:'POST'});toast(({completed:'本月校准已完成',completed_with_errors:'本月校准结束，部分库待处理',budget_exhausted:'调用预算已用尽，已停止校准',running:'已推进本月校准',busy:'已有校准正在执行'})[r.status]||'校准状态：'+r.status)}catch(e){toast(e.message)}};
-  const send=document.querySelector('#test-send');
-  if(send)send.onclick=async()=>{const uid=document.querySelector('#test-uid').value.trim();if(!uid)return toast('请填写 userId');
-    try{await api('/api/v1/notifications/test',{method:'POST',body:JSON.stringify({user_id:uid})});toast('已发送，请在钉钉查收')}catch(e){toast(e.message)}}}
+function diagnosticItems(d){
+  const labels={healthy:'连接正常',configured:'已配置，未测试',paused:'已暂停',disabled:'未启用',failed:'测试失败',not_configured:'未配置',pending:'等待执行'};
+  return `<h2>外部接口状态</h2><p class="hint">打开页面只读取本地状态；点击测试才访问对应服务。</p>${d.items.map(x=>`<div class="diagnostic"><span class="health ${esc(x.status)}"></span><div><b>${esc(x.name)}</b><br><small class="probe-status">${esc(labels[x.status]||x.status)}</small></div><span class="message">${esc(x.message)}</span>${x.target?`<button class="secondary" data-probe="${esc(x.target)}" ${['paused','disabled','not_configured'].includes(x.status)?'disabled':''}>测试连接</button>`:''}</div>`).join('')}`
+}
+async function diagnostics(){const controller=navAbort;
+  const sections=['connectivity','usage','sync','notifications','performance'];
+  shell('连接诊断','查看本地运行状态，按需测试外部连接。',sections.map(name=>`<section class="card section-gap" id="diagnostic-${name}"><div class="empty loading">正在读取状态…</div></section>`).join(''));
+  function section(name,path,renderSection){const box=document.getElementById('diagnostic-'+name);let generation=0;
+    const bindProbes=d=>box.querySelectorAll('[data-probe]').forEach(button=>button.onclick=async()=>{
+      button.disabled=true;const target=button.dataset.probe,attempt=generation;
+      try{const result=await api('/api/v1/diagnostics/connectivity/'+target,{method:'POST',timeout:12000});ensureCurrentNav(controller);
+        if(attempt!==generation)return;Object.assign(d.items.find(x=>x.target===target),result);
+        const row=button.closest('.diagnostic');row.querySelector('.probe-status').textContent=({healthy:'连接正常',failed:'测试失败',paused:'已暂停',not_configured:'未配置',disabled:'未启用'})[result.status]||'测试完成';row.querySelector('.message').textContent=result.message;row.querySelector('.health').className='health '+(['healthy','failed','paused','disabled','not_configured'].includes(result.status)?result.status:'failed');
+      }catch(e){if(!aborted(e)&&controller===navAbort)toast(e.message)}finally{button.disabled=false}
+    });
+    const load=async()=>{const attempt=++generation;
+      try{const d=await api(path);ensureCurrentNav(controller);if(attempt!==generation)return;
+        box.innerHTML=renderSection(d);bindProbes(d);
+      }catch(e){if(aborted(e)||controller!==navAbort||attempt!==generation)return;
+        box.innerHTML=`<h2>此项暂时无法加载</h2><p class="hint">${esc(e.message)}</p><button class="secondary">重试此项</button>`;box.querySelector('button').onclick=load}
+    };return load()
+  }
+  await Promise.allSettled([
+    section('connectivity','/api/v1/diagnostics/connectivity',diagnosticItems),
+    section('usage','/api/v1/diagnostics/api-usage',u=>`<h2>接口额度与采集状态</h2><p class="hint">${esc(u.measurement)}。总预算 ${nf(u.limits.daily)} 次/日、${nf(u.limits.monthly)} 次/月；目录节点 ${nf(u.limits.nodes_monthly)} 次/月。</p><p>全量校准：${u.switches.full_scan?'已启用':'已暂停'} · 审计增量：${u.switches.audit_pull?'运行中':'已暂停'} · 自动评审：${u.switches.reviews?'已启用':'已暂停'}</p><div class="table-wrap"><table class="data-table"><thead><tr><th>统计期间</th><th>接口</th><th>请求次数</th></tr></thead><tbody>${u.items.map(x=>`<tr><td>${esc(x.period)}</td><td>${esc(x.interface)}</td><td>${nf(x.calls)}</td></tr>`).join('')}</tbody></table></div>`),
+    section('sync','/api/v1/diagnostics/sync-runs?status=failed',d=>`<h2>最近采集异常</h2>${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>错误码</th><th>时间</th></tr></thead><tbody>${d.items.slice(0,10).map(x=>`<tr><td>${esc(x.workspace_name||'—')}</td><td>${esc(x.error_code||'—')}</td><td>${esc(x.created_at||'—')}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无失败记录。</p>'}`),
+    section('notifications','/api/v1/notifications?limit=10',d=>`<h2>评审结果通知</h2><p>${d.notify_enabled?'已启用':'已暂停'}</p><p class="hint">暂停期间不发送通知。</p><div class="table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>标题</th><th>状态</th><th>错误码</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${esc(x.created_at||'—')}</td><td>${esc(x.title||'—')}</td><td>${esc(x.status||'—')}</td><td>${esc(x.error_code||'—')}</td></tr>`).join('')}</tbody></table></div>`),
+    section('performance','/api/v1/diagnostics/performance',d=>`<h2>页面接口性能</h2><p class="hint">本次进程运行期间的有界采样，接口耗时包含会话校验和等待；前台 SQL 列不含后台缓存刷新，刷新任务单独列出。</p><div class="table-wrap"><table class="data-table"><thead><tr><th>接口</th><th>采样数</th><th>p95 毫秒</th><th>平均前台 SQL 毫秒</th><th>缓存命中</th><th>失败</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${esc(x.route)}</td><td>${nf(x.samples)}</td><td>${x.p95_ms}</td><td>${x.db_avg_ms}</td><td>${nf(x.cache_hits)}</td><td>${nf(x.errors)}</td></tr>`).join('')}</tbody></table></div><h3>缓存刷新</h3>${d.refreshes.map(x=>`<p class="hint">${esc(x.endpoint)}：p95 ${x.p95_ms} 毫秒，平均 SQL ${x.db_avg_ms} 毫秒，失败 ${x.errors} 次。</p>`).join('')}`)
+  ])
+}
 
 /* ---- 评分规则配置：全局默认 + 部门覆盖，参数级编辑 ---- */
 function rcDimsHtml(cat,cfg,canEdit){const dis=canEdit?'':'disabled';

@@ -92,6 +92,9 @@ class Settings(BaseSettings):
     scan_max_attempts: int = Field(default=3, ge=1, le=3)
     scan_retry_seconds: int = Field(default=900, ge=60)
     scan_max_api_calls: int = Field(default=60000, ge=1)
+    scan_slice_pages: int = Field(default=25, ge=1, le=100)
+    scan_daily_reserve: int = Field(default=5000, ge=0)
+    scan_monthly_reserve: int = Field(default=10000, ge=0)
     # HTTP attempts, shared by all processes/restarts; not billing receipts.
     dingtalk_daily_limit: int = Field(default=65000, ge=1)
     dingtalk_monthly_limit: int = Field(default=100000, ge=1)

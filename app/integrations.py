@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlsplit
 import httpx
@@ -26,6 +27,23 @@ class DingtalkClient:
         self.settings = settings
         self._token = ""
         self._token_expires_at = 0.0
+        self._shared_http = None
+
+    @asynccontextmanager
+    async def reuse_http(self):
+        """A scan slice reuses TCP/TLS connections and closes them on every exit."""
+        async with outbound_client(self.settings, timeout=20) as client:
+            self._shared_http = client
+            try:
+                yield
+            finally:
+                self._shared_http = None
+
+    async def _request(self, method, url, **kwargs):
+        if self._shared_http is not None:
+            return await self._shared_http.request(method, url, **kwargs)
+        async with outbound_client(self.settings, timeout=20) as client:
+            return await client.request(method, url, **kwargs)
 
     def configured(self) -> bool:
         return bool(self.settings.dingtalk_app_key and self.settings.dingtalk_app_secret)
@@ -35,9 +53,8 @@ class DingtalkClient:
             raise IntegrationError("dingtalk_not_configured", "缺少 DINGTALK_APP_KEY 或 DINGTALK_APP_SECRET。")
         if self._token and self._token_expires_at > time.time() + 30:
             return self._token
-        async with outbound_client(self.settings, timeout=15) as client:
-            reserve_call(self.settings, "oauth.accessToken")
-            response = await client.post(
+        reserve_call(self.settings, "oauth.accessToken")
+        response = await self._request("POST",
                 "https://api.dingtalk.com/v1.0/oauth2/accessToken",
                 json={"appKey": self.settings.dingtalk_app_key, "appSecret": self.settings.dingtalk_app_secret},
             )
@@ -56,8 +73,7 @@ class DingtalkClient:
         token = await self._token_value()
         # httpx serializes None as an empty string; DingTalk rejects e.g. nextToken= with HTTP 400.
         cleaned = {key: value for key, value in params.items() if value not in (None, "")}
-        async with outbound_client(self.settings, timeout=20) as client:
-            response = await client.get(f"https://api.dingtalk.com/v2.0{path}", params=cleaned, headers={"x-acs-dingtalk-access-token": token})
+        response = await self._request("GET", f"https://api.dingtalk.com/v2.0{path}", params=cleaned, headers={"x-acs-dingtalk-access-token": token})
         if response.status_code == 403:
             raise IntegrationError("dingtalk_permission_denied", "钉钉权限不足，请检查 Wiki.Workspace.Read、Wiki.Node.Read 和 operatorId 的访问权限。", 403)
         if response.is_error:
@@ -584,8 +600,8 @@ async def model_connection_check(config: dict[str, Any], settings: Settings) -> 
         return {"status": "disabled", "message": "模型配置未启用，评审将使用规则引擎。"}
     if not config.get("base_url") or not config.get("model_name"):
         return {"status": "not_configured", "message": "缺少模型基础地址或模型名称。"}
-    if getattr(get_settings(), "metadata_only", False):
-        raise IntegrationError("model_paused", "元数据采集模式不调用模型。", 423)
+    if settings.metadata_only:
+        return {"status": "paused", "message": "模型调用已暂停，已保存的模型配置保留。"}
     key = resolve_model_key(config)
     if not key:
         return {"status": "not_configured", "message": "未配置 API Key（页面填写或注入环境变量均可）。"}

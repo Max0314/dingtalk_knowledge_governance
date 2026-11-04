@@ -29,8 +29,9 @@ def reserve_call(settings: Settings, interface: str) -> None:
     from .integrations import IntegrationError
     now = datetime.now(CST)
     day, month = now.strftime("day:%Y-%m-%d"), now.strftime("month:%Y-%m")
-    limits = [(day, "total", settings.dingtalk_daily_limit),
-              (month, "total", settings.dingtalk_monthly_limit)]
+    scanning = bool(scan_month.get())
+    limits = [(day, "total", max(0, settings.dingtalk_daily_limit - (settings.scan_daily_reserve if scanning else 0))),
+              (month, "total", max(0, settings.dingtalk_monthly_limit - (settings.scan_monthly_reserve if scanning else 0)))]
     endpoint_limits = {
         "wiki.nodes": (settings.dingtalk_daily_limit, settings.dingtalk_nodes_monthly_limit),
         "storage.search": (settings.dingtalk_search_daily_limit, settings.dingtalk_search_monthly_limit),
@@ -56,6 +57,10 @@ def reserve_call(settings: Settings, interface: str) -> None:
                 ).values(calls=ApiUsage.calls + 1, updated_at=utcnow())).rowcount
                 if not changed:
                     logger.warning("DingTalk budget exhausted: %s %s limit=%s", period, name, limit)
+                    if scanning and name == 'total' and period == day and settings.scan_daily_reserve:
+                        raise IntegrationError('dingtalk_scan_daily_reserved', '本日补采额度已用尽，预留额度供增量采集；次日继续断点。', 429)
+                    if scanning and name == 'total' and period == month and settings.scan_monthly_reserve:
+                        raise IntegrationError('dingtalk_budget_scan_monthly_reserved', '补采触及月度增量预留额度，已停止。', 429)
                     raise IntegrationError("dingtalk_budget_exhausted", "钉钉接口调用预算已达上限，已停止外部请求。", 429)
     except IntegrationError:
         raise
@@ -73,5 +78,6 @@ def usage_status(db, settings: Settings) -> dict:
                        "search_daily": settings.dingtalk_search_daily_limit,
                        "search_monthly": settings.dingtalk_search_monthly_limit,
                        "audit_daily": settings.dingtalk_audit_daily_limit,
-                       "scan": settings.scan_max_api_calls},
+                       "scan": settings.scan_max_api_calls,
+                       "scan_daily_reserve": settings.scan_daily_reserve, "scan_monthly_reserve": settings.scan_monthly_reserve},
             "items": [{"period": r.period, "interface": r.interface, "calls": r.calls} for r in rows]}
