@@ -53,7 +53,7 @@ def test_metadata_delete_preserves_paused_tasks(collected):
         db.add(ReviewJob(job_id="synthetic-job", node_id="synthetic-doc", trigger="test", status="pending"))
         db.add(Notification(node_id="synthetic-doc", status="pending"))
     with sessions.begin() as db:
-        event = FileAuditEvent(event_key="synthetic-event", biz_id="1", gmt_create=1, matched_node_id="synthetic-doc", match_status="confirmed")
+        event = FileAuditEvent(event_key="synthetic-event", biz_id="1", gmt_create=int(utcnow().timestamp()*1000), matched_node_id="synthetic-doc", match_status="confirmed")
         db.add(event)
         summary = {}
         audit_bridge._handle_delete_restore(db, s, event, "delete", summary)
@@ -61,6 +61,27 @@ def test_metadata_delete_preserves_paused_tasks(collected):
         assert db.get(Document, "synthetic-doc").review_due_at is not None
         assert db.get(ReviewJob, "synthetic-job").status == "pending"
         assert db.scalars(select(Notification)).one().status == "pending"
+
+
+def test_old_metadata_events_never_mutate_docs_or_call_locator(collected,monkeypatch):
+    sessions,s=collected
+    old=int((utcnow()-timedelta(days=2)).timestamp()*1000)
+    with sessions.begin() as db:
+        db.add(Document(node_id='synthetic-old',workspace_id='synthetic-space',name='unchanged'))
+        for i,action in enumerate(['知识库删除','知识库恢复','知识库重命名','知识库上传']):
+            db.add(FileAuditEvent(event_key='synthetic-expired-'+str(i),biz_id=str(i),gmt_create=old,action_view=action,
+                                 module_view='团队空间',matched_node_id='synthetic-old',match_status='confirmed' if i<3 else ''))
+    class Forbidden:
+        def __init__(self,*a,**k):raise AssertionError('expired metadata must not make API calls')
+    monkeypatch.setattr(audit_bridge,'DingtalkClient',Forbidden)
+    with sessions() as db:
+        result=audit_bridge.process_audit_events(db,s,drain_walks=False)
+        assert result['metadata_expired']==4
+        doc=db.get(Document,'synthetic-old')
+        assert not doc.is_deleted and doc.name=='unchanged' and doc.metadata_applied_at is None
+        events=db.scalars(select(FileAuditEvent)).all()
+        assert len(events)==4 and all(e.processed and e.resolution=='metadata_event_expired' for e in events)
+        assert db.scalars(select(ReviewJob)).all()==[]
 
 
 def test_metadata_audit_pages_resume_paired_cursor(collected, monkeypatch):

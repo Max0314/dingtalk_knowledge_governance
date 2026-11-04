@@ -285,11 +285,13 @@ def _route_review_event(db: Session, settings: Settings, doc: Document,
 
 
 def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEvent,
-                           node: dict, path: str) -> Document:
+                           node: dict, path: str) -> Document | None:
     """审计事件确认后的直接建档/更新：一个事件只动一个节点，绝不整库遍历
     （2026-08-14 流程定稿，取代早期"门铃+整库确认"）。batchQuery 不返回
     父节点——先记存储搜索给的 path、置 directory_pending，父节点关系由
     每月 10/24 全量核对补准。"""
+    if _metadata_event_expired(db, settings, event):
+        return None
     workspace_id = node.get("workspace_id") or ""
     if workspace_id and db.get(Workspace, workspace_id) is None:
         # 未补种的新库连注册行都没有：建占位（名称由首次完整巡走
@@ -413,6 +415,8 @@ def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEven
                            kind: str, summary: dict) -> None:
     """软删除/恢复（2026-08-14 拍板）：删除只翻 is_deleted 位并取消在途任务
     与未发通知，全部评审历史保留可查；恢复翻回位即可，绝不触发评审。"""
+    if _metadata_event_expired(db, settings, event):
+        return
     node_id = event.matched_node_id or _resolve_node_locally(db, event)
     if not node_id:
         return  # pending：bizId 映射可能晚到，重试到 48h 死信
@@ -458,6 +462,8 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
     """成功终态按动作类型收口：评审/修改类须"文档入镜像 + 正文适配器
     已具备定位条件"才 done。上传文件需要数字下载键；原生 .adoc 只需要
     node id。元数据/删除/恢复/忽略各归专属终态。"""
+    if _metadata_event_expired(db, settings, event):
+        return True
     if _finish_pre_cutover_event(db, event, summary, cutoff_ms):
         return True
     if event.match_status != "confirmed" or not event.matched_node_id:
@@ -649,14 +655,41 @@ def _provisional_match(db: Session, event: FileAuditEvent, snapshot_id: str, sum
         summary["matched"] += 1
 
 
+def _metadata_window(settings):
+    if not getattr(settings, 'metadata_only', False):
+        return []
+    now_ms=int(time.time()*1000)
+    return [FileAuditEvent.gmt_create >= now_ms-24*60*60*1000, FileAuditEvent.gmt_create <= now_ms+300000]
+
+
+def _metadata_event_expired(db, settings, event):
+    if not getattr(settings, 'metadata_only', False):
+        return False
+    now_ms=int(time.time()*1000)
+    if not event.gmt_create or not now_ms-24*60*60*1000 <= event.gmt_create <= now_ms+300000:
+        _finish(db,event,'metadata_event_expired')
+        return True
+    return False
+
+
 def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool = True) -> dict:
     """One bridge cycle.「完成才消费」生命周期：wiki 事件唯有 locator 确认
     节点、文档入镜像、正文适配器具备定位条件才算 done；到期未确认转 dead_letter_*
     可观测死信。定位按"最久未尝试"轮转取额，最多三次并有退避；生产环境
     不触发整库巡走，目录校准交给独立月度任务。"""
-    events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
+    eligibility=_metadata_window(settings)
+    expired_count=0
+    if eligibility:
+        expired=db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False),
+            ~and_(*eligibility)).order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
+        for event in expired:
+            _finish(db,event,'metadata_event_expired')
+        expired_count=len(expired)
+        db.commit()
+    events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False),*eligibility)
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
+    summary['metadata_expired']=expired_count
     cutoff_ms = None if getattr(settings, "metadata_only", False) else _cutoff_ms(settings.audit_review_since)
     snapshot_id = _latest_snapshot_id(db)
     queued: set[str] = set()  # 本轮事务内的巡走去重
@@ -708,6 +741,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     lifecycle_pending = db.scalars(
         select(FileAuditEvent)
         .where(FileAuditEvent.processed.is_(False),
+               *eligibility,
                FileAuditEvent.match_status != "confirmed",
                FileAuditEvent.biz_id.in_(confirmed_biz_ids))
         .order_by(FileAuditEvent.gmt_create.desc())
@@ -728,7 +762,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     # 不得堵死后来者，每次尝试盖 last_attempt_at 章自然转到队尾。
     confirmed_pending = db.scalars(
         select(FileAuditEvent)
-        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed")
+        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed", *eligibility)
         .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
                   FileAuditEvent.last_attempt_at.asc(),
                   FileAuditEvent.gmt_create.asc())
@@ -752,6 +786,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
                              or_(FileAuditEvent.next_locate_at.is_(None), FileAuditEvent.next_locate_at <= now),
                             or_(FileAuditEvent.action_view.like("%知识库%"),
                                 FileAuditEvent.module_view == "团队空间")]
+    candidate_conditions.extend(eligibility)
     if cutoff_ms is not None:
         # Plan A: old backlog is retained terminally by the bounded main pass;
         # never let it consume remote locator capacity before that happens.
@@ -879,6 +914,8 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
                 hit_path = next((d.get("path") or "" for d in dentries
                                  if d.get("dentry_uuid") == confirmed_id), "")
                 doc = _upsert_audit_document(db, settings, event, hit, hit_path)
+                if doc is None:
+                    continue
                 summary["direct_upserts"] = summary.get("direct_upserts", 0) + 1
                 # 完成语义按类型收口：上传文件须有数字下载键，原生
                 # .adoc 由 node id 导出正文；元数据类只更新镜像。
@@ -943,6 +980,7 @@ def _refresh_confirmed_metadata(db, settings, summary):
     """Node identity is not proof that this event's metadata was refreshed."""
     now = utcnow()
     rows = db.scalars(select(FileAuditEvent).where(
+        *_metadata_window(settings),
         FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed",
         FileAuditEvent.matched_node_id != "", FileAuditEvent.metadata_applied_at.is_(None),
         FileAuditEvent.locate_attempts < settings.bridge_locator_max_attempts,
@@ -967,7 +1005,8 @@ def _refresh_confirmed_metadata(db, settings, summary):
     for e in rows:
         node = confirmed.get(e.matched_node_id)
         if node:
-            _upsert_audit_document(db, settings, e, node, "")
+            if _upsert_audit_document(db, settings, e, node, "") is None:
+                continue
             _finish(db, e, "metadata_applied_review_paused")
             summary["metadata_refreshed"] = summary.get("metadata_refreshed", 0) + 1
         elif e.locate_attempts >= settings.bridge_locator_max_attempts:
