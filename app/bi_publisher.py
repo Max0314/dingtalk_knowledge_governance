@@ -105,6 +105,10 @@ def reconcile_remote(db, remote):
             known.status, known.acked_at = "acked", utcnow()
             known.lease_owner = known.lease_until = None
             state.acked_sequence, state.acked_manifest_json = seq, manifest_json
+            state.force_baseline = False
+            state.last_success_at = utcnow()
+            if not state.send_blocked_code:
+                state.send_failures, state.send_not_before = 0, None
             db.execute(update(BIPushOutbox).where(BIPushOutbox.status == "pending", BIPushOutbox.base_sequence != seq).values(status="superseded"))
             return
     # Actual restore/divergence: one controlled baseline from materialized parts.

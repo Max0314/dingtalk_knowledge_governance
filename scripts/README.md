@@ -12,6 +12,7 @@ AI 和部署人员先读 [工程约束](../AGENTS.md)、[部署指引](../docs/d
 | 月度校准 | `run_watch_once.py` | 走持久任务和额度保护，不重复开同月已完成的库 |
 | 主动统计发布 | `python -m app.bi_publisher seed/run/retry/rebuild` | seed仅在采集暂停时按主键游标播种；run仅在双端发布准入后启动；retry/rebuild需管理员及原因，不扫描原始大表 |
 | 暂停后补采 | `python -m app.scan_recovery --recovery-id <UUID> --reason <原因>` | 一次预算预估、冻结监控范围和旧任务留档；同ID恢复不重置成功任务，随后watcher接续本月周期 |
+| 采集查询索引 | `migrate_collector_lookup_index.py` | 显式部署前执行；仅增加下载键索引，在线LOCK=NONE且锁等待3秒，失败不强制重建表，不开启补采 |
 | 遗留全量基线 | `scan_uploader_baseline.py` | 非常规任务；默认拒绝，显式参数 `--approve-paid-baseline` + 全量开关，仍受共享额度限制 |
 | 评审/推送 | `run_review_once.py`、`notify_pump_once.py`、`send_notify_samples.py` | 外呼收费/真实消息；未批准不执行，样例不进入生产镜像 |
 | 数据维护 | `cleanup_*.py`、`reopen_dead_letters.py`、`switch_primary_baseline.py`、`seed_space_map.py`、`import_historical_snapshot.py`、`migrate_*.py` | 可能删除/改口径/重放/迁移；精确范围、备份、审批先于执行 |

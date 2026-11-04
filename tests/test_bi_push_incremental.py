@@ -1,11 +1,13 @@
 """Synthetic facts only: incremental load, transport and paused side effects."""
 import copy
+import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import pytest
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
+import httpx
 from app import bi_projection
 from app.bi_models import (BIIdentityMonth, BIPushState, BIPushOutbox, BIProjectionState, BIUploadDay,
                           BIDirtyNode, BIDirtyScope, BIFileFact)
@@ -13,8 +15,8 @@ from app.bi_materialize import publish_partitions, read_partitions
 from app.bi_projection import enqueue, project_dirty, seed_slice
 from app.bi_push import claim_frame, finish_frame, queue_current, queue_frame, RemoteFailure
 from app.bi_push_contract import (ContractError, canonical, content_hash, materialize_parts, partition_manifest,
-                                  state_hash, validate_delta, validate_snapshot)
-from app.bi_publisher import reconcile_remote
+                                  state_hash, split_snapshot, validate_delta, validate_snapshot)
+from app.bi_publisher import reconcile_remote, send_once
 from app.bi_snapshot import SnapshotUnavailable
 from app.config import Settings
 from app.db import Base, Document, HistoricalFileNode, HistoricalSnapshot, Workspace, utcnow
@@ -209,3 +211,105 @@ def test_source_block_cannot_be_bypassed_by_new_frame(local):
     with sessions.begin() as db:
         assert claim_frame(db) is None
         assert db.get(BIPushState, 1).send_blocked_code == "invalid_push_credential"
+
+
+@pytest.mark.parametrize('status,body,blocked',[(429,'gateway throttled',False),(503,'gateway unavailable',False),
+    (401,'unauthorized',True),(403,'denied',True),(413,'too large',True),(422,'invalid frame',True),
+    (200,{'ok':True,'code':'accepted','data':[]},True),(200,'invalid success body',True),
+    (200,{'ok':True,'code':[],'data':{}},True)])
+def test_gateway_errors_honor_backoff_or_block_without_reading_file_tables(local,monkeypatch,status,body,blocked):
+    from app import bi_push
+    sessions,bind,s=local
+    def response(request):
+        args={'json':body} if isinstance(body,dict) else {'text':body}
+        return httpx.Response(status,headers={'Retry-After':'1200'},**args)
+    monkeypatch.setattr(bi_push,'outbound_client',lambda *a,**k:httpx.AsyncClient(transport=httpx.MockTransport(response)))
+    remote=bi_push.RemoteClient(s.model_copy(update={'bi_push_base_url':'https://synthetic.invalid','bi_push_token':'synthetic-token'}))
+    with sessions.begin() as db:queue_current(db)
+    result=asyncio.run(send_once(sessions,remote))
+    assert not result['confirmed']
+    with sessions.begin() as db:
+        state=db.get(BIPushState,1)
+        row=db.scalars(select(BIPushOutbox)).one()
+        assert row.status==('blocked' if blocked else 'pending')
+        if status!=200:assert (state.send_not_before.replace(tzinfo=timezone.utc)-utcnow()).total_seconds()>1190
+        assert claim_frame(db) is None
+        assert bool(state.send_blocked_code)==blocked
+
+
+def confirmation(v):
+    return {'snapshotId':v['snapshotId'],'sequence':v['sequence'],'contentHash':v['contentHash'],
+            'resultHash':state_hash(partition_manifest(split_snapshot(v)))}
+
+
+def test_lost_ack_reuses_same_immutable_request_and_counts_remote_acceptance_once(local):
+    sessions,_,_=local
+    class Remote:
+        def __init__(self):self.calls=[];self.accepted=set()
+        async def send(self,v):
+            self.calls.append(canonical(v));self.accepted.add(v['snapshotId'])
+            if len(self.calls)==1:raise httpx.ReadTimeout('synthetic lost acknowledgement')
+            return confirmation(v)
+    remote=Remote()
+    with sessions.begin() as db:queue_current(db)
+    assert not asyncio.run(send_once(sessions,remote))['confirmed']
+    with sessions.begin() as db:
+        db.get(BIPushState,1).send_not_before=utcnow()-timedelta(seconds=1)
+        db.scalars(select(BIPushOutbox)).one().next_attempt_at=utcnow()-timedelta(seconds=1)
+    assert asyncio.run(send_once(sessions,remote))['confirmed']
+    assert len(remote.calls)==2 and remote.calls[0]==remote.calls[1] and len(remote.accepted)==1
+
+
+def test_expired_lease_old_sender_cannot_overwrite_current_ack(local):
+    sessions,_,_=local
+    with sessions.begin() as db:
+        queue_current(db)
+    with sessions.begin() as db:first=claim_frame(db)
+    with sessions.begin() as db:assert claim_frame(db) is None
+    with sessions.begin() as db:db.get(BIPushOutbox,first['snapshotId']).lease_until=utcnow()-timedelta(seconds=1)
+    with sessions.begin() as db:second=claim_frame(db)
+    assert first['lease']!=second['lease'] and first['request']==second['request']
+    with sessions.begin() as db:
+        assert not finish_frame(db,first,confirmation(first['request']))
+        assert finish_frame(db,second,confirmation(second['request']))
+
+
+def test_ack_database_failure_rolls_back_then_replays_original_request(local):
+    from sqlalchemy.exc import OperationalError
+    sessions,bind,_=local
+    calls=[]
+    class Remote:
+        async def send(self,v):calls.append(canonical(v));return confirmation(v)
+    def fail_ack(_,__,statement,*a):
+        if calls and statement.lower().startswith('update kg_bi_push_state') and 'acked_sequence' in statement.lower():
+            raise OperationalError('synthetic ack write failure',None,Exception('synthetic DB unavailable'))
+    with sessions.begin() as db:queue_current(db)
+    event.listen(bind,'before_cursor_execute',fail_ack)
+    try:
+        with pytest.raises(OperationalError):asyncio.run(send_once(sessions,Remote()))
+    finally:event.remove(bind,'before_cursor_execute',fail_ack)
+    with sessions.begin() as db:
+        assert db.get(BIPushState,1).acked_sequence==0
+        row=db.scalars(select(BIPushOutbox)).one()
+        assert row.status=='sending'
+        row.lease_until=utcnow()-timedelta(seconds=1)
+    assert asyncio.run(send_once(sessions,Remote()))['confirmed']
+    assert len(calls)==2 and calls[0]==calls[1]
+
+
+def test_verified_recovery_ack_loss_does_not_create_another_full_baseline(local):
+    sessions,_,_=local
+    with sessions.begin() as db:queue_current(db)
+    ack_claim(sessions)
+    with sessions.begin() as db:
+        reconcile_remote(db,{'acceptedSequence':'0','stateHash':None})
+        queue_current(db)
+    with sessions.begin() as db:claim=claim_frame(db)
+    with sessions.begin() as db:finish_frame(db,claim,error=RemoteFailure('transport_ReadTimeout'))
+    remote={'acceptedSequence':str(claim['sequence']),'acceptedSnapshotId':claim['snapshotId'],
+            'contentHash':claim['request']['contentHash'],'stateHash':claim['resultHash']}
+    with sessions.begin() as db:
+        reconcile_remote(db,remote)
+        state=db.get(BIPushState,1)
+        assert not state.force_baseline and state.send_not_before is None
+        assert queue_current(db) is None

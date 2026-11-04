@@ -26,6 +26,7 @@ import asyncio
 import logging
 import time
 import uuid as uuid_module
+import httpx
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -184,15 +185,17 @@ def _confirmed_lifecycle_node(db: Session, event: FileAuditEvent) -> str:
             FileAuditEvent.id != event.id,
             FileAuditEvent.match_status == "confirmed",
             FileAuditEvent.matched_node_id != "",
-        ).limit(2)
+        ).distinct().limit(2)
     ).all()}
     return nodes.pop() if len(nodes) == 1 else ""
 
 
 def _governed_workspaces(db: Session) -> list[str]:
+    # Start from the small registry; EXISTS stops at the first workspace-index
+    # hit instead of deduplicating every row in the live document inventory.
     return [row[0] for row in db.execute(
-        select(Document.workspace_id).join(Workspace, Workspace.workspace_id == Document.workspace_id)
-        .where(Workspace.is_active.is_(True)).distinct()
+        select(Workspace.workspace_id).where(Workspace.is_active.is_(True),
+            select(Document.node_id).where(Document.workspace_id == Workspace.workspace_id).limit(1).exists())
     ).all() if row[0]]
 
 
@@ -404,10 +407,12 @@ def _resolve_node_locally(db: Session, event: FileAuditEvent) -> str:
     if lifecycle_node:
         return lifecycle_node
     if (event.biz_id or "").isdigit():
-        node_id = db.scalar(select(Document.node_id)
-                            .where(Document.storage_dentry_id == event.biz_id).limit(1))
-        if node_id:
-            return node_id
+        # A legacy download key is a candidate only if it identifies one node.
+        # The deployment adds its index before restarting the collector.
+        nodes = list(db.scalars(select(Document.node_id)
+                            .where(Document.storage_dentry_id == event.biz_id).limit(2)))
+        if len(nodes) == 1:
+            return nodes[0]
     return ""
 
 
@@ -417,7 +422,8 @@ def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEven
     与未发通知，全部评审历史保留可查；恢复翻回位即可，绝不触发评审。"""
     if _metadata_event_expired(db, settings, event):
         return
-    node_id = event.matched_node_id or _resolve_node_locally(db, event)
+    node_id = event.matched_node_id if event.match_status == 'confirmed' else ''
+    node_id = node_id or _resolve_node_locally(db, event)
     if not node_id:
         return  # pending：bizId 映射可能晚到，重试到 48h 死信
     doc = db.get(Document, node_id)
@@ -691,7 +697,9 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
     summary['metadata_expired']=expired_count
     cutoff_ms = None if getattr(settings, "metadata_only", False) else _cutoff_ms(settings.audit_review_since)
-    snapshot_id = _latest_snapshot_id(db)
+    # Production confirmation comes only from exact remote node proof or a
+    # confirmed lifecycle. Local title matching is a legacy demo diagnostic.
+    snapshot_id = _latest_snapshot_id(db) if settings.demo_mode else ''
     queued: set[str] = set()  # 本轮事务内的巡走去重
     wiki_events: list[FileAuditEvent] = []
     for event in events:
@@ -726,7 +734,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
             event.matched_node_id = lifecycle_node
             event.match_status = "confirmed"
             summary["matched"] += 1
-        else:
+        elif settings.demo_mode:
             _provisional_match(db, event, snapshot_id, summary)  # 仅诊断参考，不再触发整库门铃
         _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
     db.commit()
@@ -776,7 +784,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     # its exact, corroborated node id is the ONLY authoritative match.
     # 公平轮转在数据库层全局取额（最久未尝试优先）——不受 BATCH 截断影响，
     # 第 501 条事件同样按轮次获得定位机会（codex 第五轮 P0）。
-    governed = set(_governed_workspaces(db))
+    governed: set[str] = set()
     located_ungoverned: set[str] = set()
     unlocated = 0
     now = utcnow()
@@ -829,12 +837,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
             return (event.extension or "").lower() == "adoc" or bool(settings.wiki_storage_space_id)
 
         locatable = [event for event in candidates if _can_locate(event)]
-        for event in locatable:
-            event.last_attempt_at = now
-            event.locate_attempts += 1
-            event.next_locate_at = now + timedelta(seconds=settings.bridge_locator_retry_seconds * 2 ** (event.locate_attempts - 1))
-        # Durable reservation: a crash cannot reset event retry counts.
-        db.commit()
+        attempted = []
 
         async def _locate_one(event: FileAuditEvent):
             # Storage search returns dentryUuids (== wiki nodeIds) plus the
@@ -858,21 +861,34 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
 
             async def _bounded(event: FileAuditEvent):
                 async with semaphore:
+                    # Reserve only when a concurrency slot is actually available.
+                    # Waiting tasks canceled at the deadline did not call DingTalk.
+                    event.last_attempt_at = utcnow()
+                    event.locate_attempts += 1
+                    event.next_locate_at = event.last_attempt_at + timedelta(
+                        seconds=settings.bridge_locator_retry_seconds * 2 ** (event.locate_attempts - 1))
+                    db.commit()
+                    attempted.append(event.id)
                     try:
                         return await _locate_one(event)
-                    except (IntegrationError, RuntimeError, TimeoutError):
+                    except (IntegrationError, httpx.RequestError, ValueError, RuntimeError, TimeoutError):
                         return event, None, None, None
 
-            return await asyncio.gather(*[_bounded(event) for event in locatable])
+            if not locatable:
+                return [], 0
+            tasks = [asyncio.create_task(_bounded(event)) for event in locatable]
+            try:
+                done, pending = await asyncio.wait(tasks, timeout=LOCATE_TIME_BUDGET_SECONDS)
+                return [task.result() for task in tasks if task in done], len(pending)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
-        try:
-            located = asyncio.run(asyncio.wait_for(_locate_all(), timeout=LOCATE_TIME_BUDGET_SECONDS))
-        except TimeoutError:
-            # All selected events keep their retry stamp and receive another
-            # fair turn. A timeout cannot block the worker past its budget.
-            located = []
-            unlocated += len(locatable)
-        summary["locator_attempted"] = summary.get("locator_attempted", 0) + len(locatable)
+        located, timed_out = asyncio.run(_locate_all())
+        unlocated += timed_out
+        summary["locator_attempted"] = summary.get("locator_attempted", 0) + len(attempted)
         for event, names, dentries, nodes in located:
             if names is None:
                 unlocated += 1  # network failure: keep pending for retry
@@ -940,6 +956,10 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     elif candidates:
         unlocated = len(candidates)
     if unlocated:
+        # Production never performs the legacy tree-sweep fallback, so it
+        # must not enumerate governed inventories on every idle/retry tick.
+        if settings.demo_mode and settings.bridge_walks_enabled:
+            governed = set(_governed_workspaces(db))
         if settings.demo_mode and settings.bridge_walks_enabled and len(governed) <= settings.bridge_sweep_max_governed:
             for workspace_id in governed:
                 _enqueue_walk(db, workspace_id, queued)  # 试点规模的兜底扫，代价可控
@@ -947,6 +967,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
             # org 级规模：未定位事件不触发全库兜底；发现与评审由 watcher
             # 轮巡 + KG_REVIEW_SINCE 兜底。
             summary["sweep_skipped_governed"] = len(governed)
+            summary["sweep_disabled"] = not (settings.demo_mode and settings.bridge_walks_enabled)
     summary["unlocated"] = unlocated
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
     if getattr(settings, "metadata_only", False):
@@ -999,7 +1020,7 @@ def _refresh_confirmed_metadata(db, settings, summary):
     db.commit()  # reservation survives failure; no row transaction across HTTP
     try:
         nodes = asyncio.run(DingtalkClient(settings).batch_query_wiki_nodes(ids, settings.dingtalk_sync_operator_id))
-    except (IntegrationError, RuntimeError, TimeoutError):
+    except (IntegrationError, httpx.RequestError, ValueError, RuntimeError, TimeoutError):
         nodes = []
     confirmed = {n["node_id"]: n for n in nodes if n.get("node_id") in ids and n.get("workspace_id")}
     for e in rows:

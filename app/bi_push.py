@@ -5,7 +5,8 @@ import asyncio
 import hashlib
 import json
 import random
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from uuid import uuid4
 import httpx
 from sqlalchemy import delete, select, update
@@ -25,6 +26,16 @@ class RemoteFailure(RuntimeError):
         super().__init__(code)
 
 
+def retry_after_seconds(value):
+    try:
+        if value.strip().isdigit():
+            return min(3600, int(value.strip()))
+        when = parsedate_to_datetime(value)
+        return min(3600, max(0, int((when - datetime.now(timezone.utc)).total_seconds()) + 1))
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
 class RemoteClient:
     def __init__(self, settings):
         self.settings = settings
@@ -35,16 +46,21 @@ class RemoteClient:
                 r = await http.request(method, base.rstrip("/") + path,
                                        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
                                        content=canonical(payload) if payload is not None else None, params=params)
+        retry = retry_after_seconds(r.headers.get('retry-after', ''))
         try:
             body = r.json()
             if not isinstance(body, dict):
                 raise ValueError()
         except ValueError:
+            if r.status_code >= 300:
+                raise RemoteFailure('remote_http_error', r.status_code, retry_after=retry) from None
             raise RemoteFailure("invalid_remote_response", r.status_code) from None
         if r.status_code >= 300:
-            retry = r.headers.get("retry-after", "0")
-            raise RemoteFailure(str(body.get("code") or "remote_http_error")[:64], r.status_code, body,
-                                min(3600, int(retry)) if retry.isdigit() else 0)
+            known = {'invalid_push_credential', 'push_disabled', 'payload_too_large', 'invalid_snapshot',
+                     'snapshot_conflict', 'stale_sequence', 'base_mismatch'}
+            code = body.get('code')
+            raise RemoteFailure(code if isinstance(code, str) and code in known else 'remote_http_error',
+                                r.status_code, body, retry)
         return body
 
     async def status(self):
@@ -54,9 +70,14 @@ class RemoteClient:
         return b["data"]
 
     async def send(self, frame):
-        b = await self._request("POST", self.settings.bi_push_base_url, "/api/internal/v1/knowledge-governance/snapshots", self.settings.bi_push_token, frame)
-        if b.get("ok") is not True or b.get("code") not in {"accepted", "already_accepted"}:
-            raise RemoteFailure("invalid_push_confirmation")
+        try:
+            b = await self._request("POST", self.settings.bi_push_base_url, "/api/internal/v1/knowledge-governance/snapshots", self.settings.bi_push_token, frame)
+        except RemoteFailure as exc:
+            if 200 <= exc.status < 300:
+                raise RemoteFailure('invalid_push_confirmation', 422) from None
+            raise
+        if b.get("ok") is not True or b.get("code") not in ("accepted", "already_accepted") or not isinstance(b.get('data'), dict):
+            raise RemoteFailure("invalid_push_confirmation", 422)
         return b["data"]
 
     async def employee(self, path, payload=None, params=None):
@@ -222,6 +243,8 @@ def finish_frame(db, claim, confirmation=None, error=None):
     now = utcnow()
     if not row or row.status != "sending" or row.lease_owner != claim["lease"] or naive(row.lease_until) < naive(now):
         return False
+    if confirmation is not None and not isinstance(confirmation, dict):
+        confirmation, error = None, RemoteFailure('invalid_push_confirmation', 422)
     if confirmation is not None:
         if (confirmation.get("snapshotId") != row.snapshot_id or confirmation.get("sequence") != str(row.sequence)
                 or confirmation.get("contentHash") != row.content_hash or confirmation.get("resultHash") != row.result_hash):

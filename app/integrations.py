@@ -168,7 +168,18 @@ class DingtalkClient:
             )
         if response.is_error:
             raise IntegrationError("dingtalk_dentry_search_failed", f"存储搜索失败（HTTP {response.status_code}）。", response.status_code)
-        items = response.json().get("items", []) or []
+        try:
+            payload = response.json()
+        except ValueError:
+            raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502) from None
+        items = payload.get('items', []) if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and items is None:
+            items = []
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502)
+        if any(item.get(k) is not None and type(item[k]) not in (str, int)
+               for item in items for k in ('dentryUuid', 'name', 'path')):
+            raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502)
         return [{"dentry_uuid": str(item.get("dentryUuid", "")), "name": str(item.get("name", "")),
                  "path": str(item.get("path", ""))} for item in items if isinstance(item, dict)]
 
@@ -187,9 +198,44 @@ class DingtalkClient:
             )
         if response.is_error:
             raise IntegrationError("dingtalk_nodes_batch_failed", f"节点批量查询失败（HTTP {response.status_code}）。", response.status_code)
-        payload = response.json()
-        items = payload.get("nodes", payload.get("data", [])) or []
-        return [normalize_node(item) for item in items if isinstance(item, dict)]
+        try:
+            payload = response.json()
+        except ValueError:
+            raise IntegrationError('dingtalk_nodes_batch_invalid', '节点查询返回格式无效。', 502) from None
+        items = payload.get('nodes', payload.get('data', [])) if isinstance(payload, dict) else None
+        if isinstance(payload, dict) and items is None:
+            items = []
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise IntegrationError('dingtalk_nodes_batch_invalid', '节点查询返回格式无效。', 502)
+        normalized = []
+        for item in items:
+            row = dict(item)
+            try:
+                for key in ('nodeId', 'workspaceId', 'creatorId', 'creatorUnionId', 'creatorUserId', 'modifierId'):
+                    value = row.get(key)
+                    if value is not None and type(value) not in (str, int):
+                        raise ValueError()
+                    if value is not None:
+                        row[key] = str(value)
+                for key in ('name', 'type', 'category', 'extension', 'url', 'docUrl', 'createTime', 'modifiedTime'):
+                    if row.get(key) is not None and not isinstance(row[key], str):
+                        raise ValueError()
+                stats = row.get('statisticalInfo')
+                if stats is not None and not isinstance(stats, dict):
+                    raise ValueError()
+                children = row.get('hasChildren')
+                if children is not None and (type(children) not in (bool, int) or children not in (True, False)):
+                    raise ValueError()
+                row['size'] = int(row.get('size') or 0)
+                stats = dict(stats or {})
+                stats['wordCount'] = int(stats.get('wordCount') or 0)
+                row['statisticalInfo'] = stats
+                if row['size'] < 0 or stats['wordCount'] < 0:
+                    raise ValueError()
+            except (ValueError, TypeError, OverflowError):
+                raise IntegrationError('dingtalk_nodes_batch_invalid', '节点查询返回格式无效。', 502) from None
+            normalized.append(normalize_node(row))
+        return normalized
 
     async def download_file_bytes(self, space_id: str, numeric_dentry_id: str, max_bytes: int = 50_000_000) -> bytes:
         """Two-step storage download by NUMERIC dentry id — which is exactly

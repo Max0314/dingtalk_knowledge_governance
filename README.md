@@ -9,7 +9,7 @@
 - 全量校准默认每月 10 日一轮，按知识库持久化进度，重启/手动重复调用只继续未完成任务。失败只重试该库（最多 3 次），不让未补种库拖动全组织循环。
 - 所有应用内 DingTalk 适配器请求在发出前共享数据库计数，默认总计 6.5 万次/日、10 万次/月；节点列表 6 万次/月、搜索文件 500 次/日和 1 万次/月、审计日志 1000 次/日、每轮校准总计 6 万次。计数故障时停止外呼，容器重启不清零。
 - 计数口径是 HTTP 尝试数（含失败和 token 请求），不是平台账单；正文资源下载不计作 OpenAPI 请求。部署前的历史调用不能从新计数表补算。
-- `KG_FULL_SCAN_ENABLED`、`KG_REVIEW_ENABLED` 默认关闭，生产同时关闭 `KG_AUDIT_PULL_ENABLED`、`KG_BRIDGE_ENABLED`、通知及 Stream。后台容器使用 `background` profile，普通 `docker compose up -d` 只启动 API。
+- 功能开关默认关闭；当前内网开启审计增量、事件定位和统计推送，全量补采、AI评审、正文、通知及Stream保持关闭。后台显式启动worker/publisher，watcher未启动；普通 `docker compose up -d` 仍只启动API。采集查询与异常修复见 [发布记录](docs/reviews/2026-11-04-collector-bounded-reads.md)。
 - 「连接诊断」展示调用计数、限额和暂停状态；`GET /api/v1/diagnostics/api-usage` 提供管理员诊断。超限返回 `dingtalk_budget_exhausted` 并记录无敏感信息的告警。
 - 月度校准可能因为预算或永久失败而不完整；任务明确显示 `budget_exhausted` / `completed_with_errors`，不会静默重开同月扫描。
 

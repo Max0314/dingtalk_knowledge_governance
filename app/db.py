@@ -67,6 +67,7 @@ class WorkspaceRole(Base):
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
+        Index("ix_documents_storage_dentry_id", "storage_dentry_id"),
         # Unified-file listing: current rows are filtered by both flags and
         # paged newest-first. Without this composite index MySQL filesorts the
         # whole live mirror (~153k rows) for every page.
