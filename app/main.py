@@ -228,11 +228,11 @@ def dashboard(db: Session = Depends(db_session)):
         names = page_metrics.spaces(db)
         rows = db.execute(select(BIQualityMonth.month, func.sum(BIQualityMonth.score_sum), func.sum(BIQualityMonth.scored_count))
                           .where(BIQualityMonth.workspace_id.in_(names)).group_by(BIQualityMonth.month)).all()
-        total_score, total_count = sum(float(r[1] or 0) for r in rows), sum(r[2] or 0 for r in rows)
+        total_score, total_count = sum(float(r[1] or 0) for r in rows), sum(int(r[2] or 0) for r in rows)
         average = total_score / total_count if total_count else None
         current = now.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m')
         current_row = next((r for r in rows if r[0] == current), None)
-        month_average = float(current_row[1])/current_row[2] if current_row and current_row[2] else None
+        month_average = float(current_row[1])/int(current_row[2]) if current_row and current_row[2] else None
     else:
         ranked = (
             select(

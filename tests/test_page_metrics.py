@@ -174,3 +174,19 @@ def test_page_scan_migration_is_idempotent_and_only_queues_aggregate_months(loca
         assert {r.scope_key:r.generation for r in db.scalars(select(BIDirtyScope))}==generations
     columns={r['name'] for r in inspect(bind).get_columns('employee_org_month_cache')}
     assert {'employee_name','details_ready'}<=columns
+
+
+def test_dashboard_accepts_mysql_decimal_sum_counts(local,monkeypatch):
+    from decimal import Decimal
+    from types import SimpleNamespace
+    from app import main
+    sessions,_=local
+    with sessions() as db:
+        original=db.execute
+        def execute(statement,*args,**kwargs):
+            if 'kg_bi_quality_month' in str(statement):
+                return SimpleNamespace(all=lambda:[('2026-11',Decimal('123'),Decimal('2')),('2026-10',Decimal('75'),Decimal('1'))])
+            return original(statement,*args,**kwargs)
+        monkeypatch.setattr(db,'execute',execute)
+        result=main.dashboard(db)
+        assert result['metrics']['average_ai_score']==66.0
