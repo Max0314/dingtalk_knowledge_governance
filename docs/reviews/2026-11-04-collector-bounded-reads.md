@@ -19,3 +19,15 @@
 采集/元数据/quota35项、发送与增量21项、既有演示/locator22项定向通过（分批执行，共78项）；覆盖空闲/重试无库存或名称查询、同名/改名、旧候选/重复键、A/A/B生命周期、坏嵌套、合法空/null响应、部分完成截止、429/5xx、鉴权/大小/校验错误、畸形ACK、丢ACK、过期租约和ACK后数据库回写失败。演示用例在隔离SQLite、明确启用模拟评审的测试环境执行，不访问真实服务，不影响生产暂停配置；默认关闭模拟评审时两条旧用例的“应入评审队列”断言不适用，未修改暂停逻辑或用例规避检查。Python编译检查与diff检查通过。新增索引在SQLite验证幂等及查询计划，生产仍需验证真实MySQL计划。
 
 发布采用固定SHA及旧镜像依赖层，先在线增加索引，再逐角色重建API/worker/publisher，保留持久游标、发件箱、配额和配置。迁移失败不切换镜像；运行失败可按已备份Compose及旧镜像回滚，新增索引可保留。实际版本、生产检查和回滚位置待发布后补记。
+
+## 生产验收
+
+- 运行代码：`7e349f8bf8690e4b4d32c7e4f19dc813092890f2`；镜像 `knowledge-governance-internal:7e349f8bf869`，ID `sha256:fd7449ffa8c42d6a56e3ce9becb78dfa8447a366eab0d664ec90585b99e8bbf9`。功能提交已合并main并推送GitHub；验收补记为后续文档提交，不重建业务镜像。
+- 在线迁移成功（created=true），没有停止旧采集/推送或改写业务数据。下载键MySQL计划从ALL变为ref，命中ix_documents_storage_dentry_id，估计1行；受管库查询从Workspace约152行小表开始，文档侧使用workspace索引和FirstMatch，不枚举全部文档。生产桥接不调用这项受管库诊断。
+- API、worker、publisher分角色更新，均为本次SHA且running，重启次数0，API healthy，ready=200。未启动watcher；其备用镜像也已更新，仍由full_scan=false阻止运行。`.env`发布前后字节一致，未临时关闭增量或改动凭据/额度。
+- 核对5个变更模块在运行镜像中的SHA256与交付Git archive完全一致；Windows归档带CRLF，规范化换行后与提交blob一致。没有将换行差异当成业务代码差异。
+- 审计继续成功：最近成功2026-11-04 11:43:11 CST，完成窗口推进至11:42:49.980 CST；持久游标未重置。历史缺口仍保留，不声称已完成库存补齐。
+- 源、接收和常用六个月看板均为sequence=6，源确认manifest与接收stateHash一致，board=published。真实重发已确认的4869字节增量，返回already_accepted，acceptedSequence仍为6，无重复累计。HTTP异常和数据库故障仅在本地替身环境注入，未在生产故意制造断网或错误报文。
+- 评审实例2535、任务2923、通知2519；任务succeeded2533/skipped390，通知sent58/skipped2461，均与发布前一致。metadata_only/audit_pull/bridge/bi_push开启，full_scan/review/notify/content/model_transfer/stream关闭，recovery记录0，配额仍为65000。
+- 最近worker/publisher日志未发现采集或推送错误，发送状态无blocked、force_baseline=false。未执行新的全量扫描或重建投影。
+- 回滚材料位于 `/var/backups/knowledge-governance/collector-20261104T114230`，配置副本0600、目录0700；原af469db固定镜像保留。回滚只恢复角色镜像及Compose，新增索引保留即可。用户原有AGENTS改动未提交。
