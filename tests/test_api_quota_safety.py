@@ -175,7 +175,11 @@ def test_same_month_legacy_second_day_cannot_start_another_rotation(isolated, mo
 
     async def walk(*args, **kwargs):
         calls.append("walk")
-        return SimpleNamespace(run_id="ok", status="succeeded", error_code="")
+        from app.db import SyncRun, utcnow
+        run=SyncRun(run_id="ok",workspace_id="a",status="succeeded",error_code="",collection_started_at=utcnow())
+        args[0].add(run)
+        args[0].commit()
+        return run
     monkeypatch.setattr(scan_scheduler, "resolve_watch_targets", targets)
     monkeypatch.setattr(scan_scheduler, "watch_workspace", walk)
     settings = production(full_scan_enabled=True, scan_days="10,24")

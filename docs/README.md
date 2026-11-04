@@ -11,12 +11,14 @@
 5. [发布验收](reviews/2026-10-10-release-validation.md)：版本、实测和遗留事项；[原始 Review](reviews/2026-10-10-review.md) 用于追溯问题，不是现行约束。
 6. [脚本索引](../scripts/README.md)：先按风险选入口，禁止把所有脚本当作开发指令。
 7. [2026-11-02 内网部署记录](reviews/2026-11-02-internal-deployment.md)：公司内网 API 部署、固定版本、常用命令与外部联调待办。
+8. [2026-11-04 元数据与统计发布](reviews/2026-11-04-statistics-push.md)：双端增量推送、补采和暂停项的实际验收。
 
 ## 契约和业务参考
 
 | 文档 | 用途 | 注意事项 |
 | --- | --- | --- |
 | [bi_center 导出契约](bi-center-export-contract.md) | 本服务向 bi_center 提供数据的接口 | 以发布版本的契约测试和实现核对，不代替组织权威来源 |
+| [内网采集恢复与 BI 主动推送方案](bi-center-push-and-metadata-collection-plan.md) | 元数据采集、主动推送统计及 BI 看板更新的实施契约 | §17 为增量实现准则；部署结果以发布记录为准，AI 自动评审和通知继续暂停 |
 | [评分规则映射](scoring-standard-v1.1-mapping.md) | 评分标准和维度映射 | 文体/档位随不可变评审实例留痕；当前生产评审仍暂停 |
 | [增量口径设计](incremental-design.md) | 历史基线/实时增量及统计设计背景 | 核对当期代码、主基线与研发范围；不代表扫描已启用 |
 

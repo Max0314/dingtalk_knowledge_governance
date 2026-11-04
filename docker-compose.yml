@@ -48,6 +48,25 @@ services:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
 
+  publisher:
+    profiles: ["statistics"]
+    build:
+      context: .
+      args: {VCS_REF: "${KG_RELEASE_SHA:-development}"}
+    command: ["python", "-m", "app.bi_publisher"]
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
   watcher:
     profiles: ["background"]
     build:

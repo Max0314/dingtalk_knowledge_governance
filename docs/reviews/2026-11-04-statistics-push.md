@@ -1,0 +1,29 @@
+# 2026-11-04 元数据恢复与统计推送发布
+
+## 范围与状态
+
+本次双端实现已经完成并通过定向检查；生产部署与正式传输验收待登记。AI自动评审、正文读取、模型传输、通知和Stream继续关闭，原阿里云知识库保持停止。
+
+两端从最新已合并主线开始：知识库134964f、BI673915b。知识库旧导出分支的有效逻辑已由当前主线取代，先完成祖先合并；BI既有其他开发工作区不改动。正式统计发送必须等双端提交、合并、部署和健康检查后才打开。
+
+## 已执行验证
+
+- 知识库27项定向测试通过：基线去重、北京时间、稀疏增量、无变化不写、空闲不读文件大表/员工JSON、恢复基线固定、审计配对游标、元数据完成证明、暂停评审通知、预算和恢复幂等、冻结目标真实采集证明。
+- BI接收、身份兼容与看板定向35项通过；后续12项覆盖非法增量结构和前端版本检查通过。compileall、前端node检查和diff检查通过。
+- BI项目全量检查已运行，5个禅道SQLite缺少IF函数报错已在未修改673915b主线复现。资源版本相关旧断言随本次升级同步更新，最后branding目标检查通过。未把本地检查表述为生产验收。
+- 数据服务器实测binlog_row_image=FULL，因此双端均将大报文与可变状态分表；租约、失败次数、心跳不更新大JSON。
+
+## 发布顺序与命令
+
+1. 固定双端提交；备份现有配置/镜像，保持发送、采集关闭。知识库执行 `python scripts/migrate_bi_push.py`，BI执行 `python scripts/migrate_knowledge_push.py`，均为新增表/可空列。
+2. 双端启动新API检查健康、版本和拒绝未授权推送；不传真实统计。
+3. 知识库设置KG_METADATA_ONLY=true，KG_CONTENT_EXTRACT_ENABLED=false，review/notify/model_allow_content_transfer/stream均false。在采集仍暂停时执行 `python -m app.bi_publisher seed`，500节点主键批次，单次可续播种。
+4. 双端独立推送密钥准备完毕、检查通过后，BI启用push接收及push来源，知识库启动publisher（statistics profile）。首帧基线只发送一次，后续真实变化分区增量。
+5. `python -m app.scan_recovery --recovery-id <固定UUID> --reason migration-recovery` 只做一次预算预估和持久准备；批准预算内启动元数据worker/watcher。失败库接续，不重扫成功库；冻结清单全部真实成功才标完整。
+6. 对账源/接收sequence、hash、六个月及24月看板版本与核心计数，记录采集剩余/失败、审计缺口、调用量和资源；评审/通知前后不得消费或新增。
+
+受控回滚：先停publisher/worker/watcher，恢复原配置及固定API镜像；BI保留最后发布看板和新增表。不清空quota、不重置binlog、不重跑原始表全量构建。
+
+## 生产验收
+
+待双端固定版本部署后更新。

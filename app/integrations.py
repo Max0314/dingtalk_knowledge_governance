@@ -102,6 +102,8 @@ class DingtalkClient:
 
     async def send_robot_markdown(self, user_ids: list[str], title: str, text: str) -> dict[str, Any]:
         """One-to-one robot push. Requires the robot capability plus its send scope."""
+        if getattr(self.settings, "metadata_only", False):
+            raise IntegrationError("notification_paused", "元数据采集模式不发送消息。", 423)
         if not user_ids:
             raise IntegrationError("dingtalk_no_recipient", "缺少接收人 userId。", 400)
         robot_code = self.settings.robot_code or self.settings.dingtalk_app_key
@@ -523,7 +525,7 @@ def normalize_workspace(item: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_node(item: dict[str, Any]) -> dict[str, Any]:
     stats = item.get("statisticalInfo") or {}
-    return {"source": "dingtalk", "node_id": item.get("nodeId", ""), "workspace_id": item.get("workspaceId", ""), "name": item.get("name", ""), "type": item.get("type", ""), "category": item.get("category", ""), "extension": item.get("extension", ""), "url": item.get("url", "") or item.get("docUrl", ""), "size": item.get("size", 0) or 0, "has_children": bool(item.get("hasChildren")), "word_count": stats.get("wordCount", 0) or 0, "permission_role": item.get("permissionRole", ""), "creator_id": item.get("creatorId", ""), "modifier_id": item.get("modifierId", ""), "created_at": item.get("createTime", ""), "updated_at": item.get("modifiedTime", "")}
+    return {"source": "dingtalk", "node_id": item.get("nodeId", ""), "workspace_id": item.get("workspaceId", ""), "name": item.get("name", ""), "type": item.get("type", ""), "category": item.get("category", ""), "extension": item.get("extension", ""), "url": item.get("url", "") or item.get("docUrl", ""), "size": item.get("size", 0) or 0, "has_children": bool(item.get("hasChildren")), "word_count": stats.get("wordCount", 0) or 0, "permission_role": item.get("permissionRole", ""), "creator_id": item.get("creatorUnionId") or item.get("creatorUserId") or item.get("creatorId", ""), "creator_kind": "union_id" if item.get("creatorUnionId") else "user_id" if item.get("creatorUserId") else "unknown", "modifier_id": item.get("modifierId", ""), "created_at": item.get("createTime", ""), "updated_at": item.get("modifiedTime", "")}
 
 
 def resolve_model_key(config: dict[str, Any]) -> str:
@@ -536,6 +538,8 @@ async def model_connection_check(config: dict[str, Any], settings: Settings) -> 
         return {"status": "disabled", "message": "模型配置未启用，评审将使用规则引擎。"}
     if not config.get("base_url") or not config.get("model_name"):
         return {"status": "not_configured", "message": "缺少模型基础地址或模型名称。"}
+    if getattr(get_settings(), "metadata_only", False):
+        raise IntegrationError("model_paused", "元数据采集模式不调用模型。", 423)
     key = resolve_model_key(config)
     if not key:
         return {"status": "not_configured", "message": "未配置 API Key（页面填写或注入环境变量均可）。"}
@@ -600,6 +604,8 @@ async def model_score_content(config: dict[str, Any], content: str, filename: st
     The model receives a bounded temporary body only after the caller has enforced the
     explicit data-transfer policy. Its output is schema-checked before use.
     """
+    if getattr(get_settings(), "metadata_only", False):
+        raise IntegrationError("model_paused", "元数据采集模式不调用模型。", 423)
     key = resolve_model_key(config)
     if not key or not content:
         return None

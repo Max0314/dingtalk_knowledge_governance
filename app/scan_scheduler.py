@@ -1,5 +1,6 @@
 """One durable calibration per calendar month; failed libraries retry alone."""
 import asyncio
+import json
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 import threading
@@ -7,7 +8,7 @@ import threading
 from sqlalchemy import select, text
 
 from .api_usage import CST, scan_budget
-from .db import ScanCycle, ScanTask, utcnow
+from .db import AuditState, ScanCycle, ScanTask, SyncRun, utcnow
 from .integrations import IntegrationError
 from .service import resolve_watch_targets, watch_workspace
 
@@ -61,14 +62,17 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
                 targets = await resolve_watch_targets(settings, force=True)
                 if not targets["resolved"]:
                     return {"status": "no_targets", "walked": []}
-                cycle = ScanCycle(month=month)
+                cycle = ScanCycle(month=month, target_workspace_ids_json=json.dumps([t['workspace_id'] for t in targets['resolved']]))
                 db.add(cycle)
                 for target in targets["resolved"]:
                     space = target.get("space") or {}
                     db.add(ScanTask(month=month, workspace_id=target["workspace_id"],
                                     root_node_id=space.get("root_node_id", ""), workspace_name=target["name"]))
                 db.commit()
-            tasks = db.scalars(select(ScanTask).where(ScanTask.month == month)
+            task_query = select(ScanTask).where(ScanTask.month == month)
+            if cycle.recovery_id:
+                task_query = task_query.where(ScanTask.recovery_id == cycle.recovery_id)
+            tasks = db.scalars(task_query
                                .order_by(ScanTask.workspace_id)).all()
             now = utcnow().replace(tzinfo=None)
             for task in tasks:
@@ -91,7 +95,7 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
                 try:
                     run = await watch_workspace(db, settings, task.workspace_id, space, mode="watch")
                     task.run_id, task.error_code = run.run_id, run.error_code
-                    success = run.status in ("succeeded", "skipped")
+                    success = run.status == "succeeded"
                 except IntegrationError as exc:
                     db.rollback()
                     task.error_code = exc.code
@@ -112,6 +116,7 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
             if cycle.status == "running" and all(t.status in ("succeeded", "dead_letter") for t in tasks):
                 cycle.status = "completed_with_errors" if any(t.status == "dead_letter" for t in tasks) else "completed"
                 cycle.finished_at = utcnow()
+                complete_cycle(db, cycle, tasks)
                 db.commit()
             return {"status": cycle.status, "month": month, "walked": walked,
                     "remaining": sum(t.status in ("pending", "running") for t in tasks)}
@@ -119,3 +124,26 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
 
 def run_scan_slice(db, settings):
     return asyncio.run(run_scan_slice_async(db, settings))
+
+
+def complete_cycle(db, cycle, tasks):
+    from .bi_models import ScanRecoveryRun
+    from .metadata_mode import naive
+    recovery = db.get(ScanRecoveryRun, cycle.recovery_id) if cycle.recovery_id else None
+    expected = set(json.loads(recovery.target_workspace_ids_json if recovery else cycle.target_workspace_ids_json or '[]'))
+    requested = recovery.requested_at if recovery else cycle.started_at
+    runs = {r.run_id:r for r in db.scalars(select(SyncRun).where(SyncRun.run_id.in_([t.run_id for t in tasks])))}
+    complete = bool(expected) and expected == {t.workspace_id for t in tasks} and all(
+        t.status == 'succeeded' and t.run_id in runs and runs[t.run_id].status == 'succeeded'
+        and runs[t.run_id].workspace_id == t.workspace_id and runs[t.run_id].collection_started_at is not None
+        and naive(runs[t.run_id].collection_started_at) >= naive(requested) for t in tasks)
+    if not complete:
+        cycle.status = 'completed_with_errors'
+    if recovery:
+        recovery.finished_at = cycle.finished_at
+    if complete:
+        audit = db.get(AuditState, 1)
+        if not audit:
+            audit = AuditState(id=1)
+            db.add(audit)
+        audit.inventory_reconciled_at = cycle.finished_at

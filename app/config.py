@@ -1,7 +1,7 @@
 from functools import lru_cache
 import re
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     bi_export_enabled: bool = False
     bi_export_api_keys: str = ""
     bi_export_max_page_size: int = 200
+    metadata_only: bool = False
+    bi_push_enabled: bool = False
+    bi_push_base_url: str = ""
+    bi_push_token: str = ""
+    bi_push_source_id: str = "kg-internal-production"
+    bi_push_interval_seconds: int = Field(default=300, ge=60, le=3600)
     model_api_key: str = ""
     model_allow_content_transfer: bool = False
     # Push stays off until the robot permission is granted and a test send passes.
@@ -185,6 +191,20 @@ class Settings(BaseSettings):
     auth_enabled: bool = False
     auth_secret: str = "dev-only-not-secret"
     dingtalk_corp_id: str = Field(default="", validation_alias="DINGTALK_CORP_ID")
+
+    @model_validator(mode="after")
+    def validate_metadata_mode(self):
+        if self.metadata_only and any((self.review_enabled, self.notify_enabled, self.stream_enabled,
+                                       self.model_allow_content_transfer, self.content_extract_enabled)):
+            raise ValueError("metadata-only mode requires review, notification, stream and content processing disabled")
+        if self.bi_push_enabled:
+            from urllib.parse import urlsplit
+            u = urlsplit(self.bi_push_base_url)
+            if u.scheme != "https" or not u.hostname or u.username or u.password or u.query or u.fragment:
+                raise ValueError("BI push requires an HTTPS service base URL")
+            if not self.bi_push_token or self.bi_push_source_id != "kg-internal-production":
+                raise ValueError("BI push requires a dedicated credential and the production source")
+        return self
 
 
 @lru_cache

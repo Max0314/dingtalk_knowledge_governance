@@ -51,6 +51,7 @@ class Workspace(Base):
     # 两次才判不可见——单次列表不完整不能误停正常库（codex 第八轮 P1）。
     unreachable_misses: Mapped[int] = mapped_column(Integer, default=0)
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    metadata_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     documents: Mapped[list["Document"]] = relationship(back_populates="workspace")
 
 
@@ -73,6 +74,9 @@ class Document(Base):
         Index("ix_documents_current_cover", "is_folder", "is_deleted", "source_created_at", "node_id", "workspace_id"),
     )
     node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    source_creator_key: Mapped[str | None] = mapped_column(id_string(), nullable=True)
+    source_creator_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    metadata_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     workspace_id: Mapped[str] = mapped_column(ForeignKey("workspaces.workspace_id"), index=True)
     # 目录架构：walk 遍历时可直接得到父节点；审计直建的文档先记 path、
     # 置 directory_pending，父节点由每月目录校准补准。
@@ -205,6 +209,7 @@ class SyncRun(Base):
     documents_changed: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    collection_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -443,6 +448,7 @@ class FileAuditEvent(Base):
     # Retry-window base for dead-letter reopens; received_at stays untouched.
     retry_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    metadata_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -468,6 +474,8 @@ class ApiUsage(Base):
 class ScanCycle(Base):
     __tablename__ = "scan_cycles"
     month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    recovery_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    target_workspace_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="running")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -476,6 +484,7 @@ class ScanCycle(Base):
 class ScanTask(Base):
     __tablename__ = "scan_tasks"
     month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    recovery_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     workspace_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
     root_node_id: Mapped[str] = mapped_column(id_string(), default="")
     workspace_name: Mapped[str] = mapped_column(String(255), default="")
@@ -532,6 +541,14 @@ class AuditState(Base):
     """Singleton cursor row for the audit CDC puller."""
     __tablename__ = "audit_state"
     id: Mapped[int] = mapped_column(primary_key=True)
+    window_start_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    window_end_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    next_gmt_create: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    next_biz_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    completed_end_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    gap_since_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    gap_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    inventory_reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_gmt_create: Mapped[int] = mapped_column(BigInteger().with_variant(Integer(), "sqlite"), default=0)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_rows: Mapped[int] = mapped_column(Integer, default=0)
@@ -582,6 +599,9 @@ def init_db(max_attempts: int = 30, retry_delay: float = 2.0) -> None:
     cannot order startup; the MySQL server may be briefly unreachable while
     containers restart. Retrying here beats crash-looping the whole service.
     """
+    if get_settings().metadata_only or get_settings().bi_push_enabled:
+        from .bi_projection import install_change_hooks
+        install_change_hooks()
     last_error: Exception | None = None
     for attempt in range(max_attempts):
         try:

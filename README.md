@@ -1,7 +1,7 @@
 # DingTalk Knowledge Governance · 钉钉知识库治理
 
 面向"入库可追溯 · 质量可评审 · 增量可统计"的知识库治理服务。
-运行模式以发布单为准：2026-11-02 已在公司内网通过 Docker Compose 启动页面/API，原阿里云应用保持停止；后台采集、评审、通知和全量校准继续暂停。内网登录及外部接口的验收进展见 [内网部署记录](docs/reviews/2026-11-02-internal-deployment.md)。历史能力描述不代表已获准启用。
+运行模式以发布单为准：公司内网为正式服务，原阿里云应用保持停止。2026-11-04 授权恢复元数据采集和向 bi_center 主动推送统计，AI 自动评审、正文读取和通知继续暂停；实现与分阶段启用见 [主动推送方案](docs/bi-center-push-and-metadata-collection-plan.md)，实际发布状态见 [内网部署记录](docs/reviews/2026-11-02-internal-deployment.md)。
 
 ## 钉钉调用量保护
 

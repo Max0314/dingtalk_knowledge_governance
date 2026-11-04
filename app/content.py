@@ -270,6 +270,8 @@ def extract_text(extension: str, data: bytes) -> str:
 async def fetch_document_content(settings: Settings, doc: Document) -> tuple[str, str]:
     """Return (text, source). Source names the channel for the review record;
     the text itself is the caller's ephemeral copy and must not be persisted."""
+    if getattr(settings, "metadata_only", False):
+        return "", "metadata_only"
     extension = (doc.extension or "").lower()
     if doc.is_folder:
         return "", "unsupported"

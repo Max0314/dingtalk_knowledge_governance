@@ -243,6 +243,8 @@ def _route_review_event(db: Session, settings: Settings, doc: Document,
     no-body debt quiet while ensuring a real upload/overwrite is immediate and
     an online edit still uses the merge window.
     """
+    if getattr(settings, "metadata_only", False) or not settings.review_enabled:
+        return
     from .service import is_review_excluded_workspace, is_robot_uploader
 
     kind = _action_kind(event)
@@ -300,6 +302,8 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     if doc is None:
         doc = Document(node_id=node["node_id"], workspace_id=workspace_id, name=node.get("name") or "")
         db.add(doc)
+    elif workspace_id:
+        doc.workspace_id = workspace_id
     for field in ("name", "category", "url"):
         if node.get(field):
             setattr(doc, field, node[field])
@@ -315,7 +319,7 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     doc.source_created_at = node.get("created_at") or doc.source_created_at or ""
     doc.source_updated_at = node.get("updated_at") or doc.source_updated_at or ""
     if node.get("has_children") is not None:
-        doc.is_folder = bool(node.get("has_children"))
+        doc.is_folder = str(node.get("type", "")).lower() in ("folder", "directory") or bool(node.get("has_children"))
     doc.file_class = classify(doc.extension, doc.is_folder)
     if path:
         doc.path = path
@@ -330,13 +334,19 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     # 绝不改写上传人——通知与统计都按上传人归属。
     filled_creator = False
     if is_new:
-        doc.uploader_key = node.get("creator_id") or event.operator_user_id or ""
+        doc.uploader_key = node.get("creator_id") or ("" if getattr(settings, "metadata_only", False) else event.operator_user_id) or ""
         filled_creator = True
     elif not doc.uploader_key and node.get("creator_id"):
         doc.uploader_key = node.get("creator_id") or ""
         filled_creator = True
     doc.last_modifier_key = event.operator_user_id or doc.last_modifier_key or ""
-    if filled_creator:
+    if not doc.source_creator_key and node.get("creator_id"):
+        doc.source_creator_key = node["creator_id"]
+        doc.source_creator_kind = node.get("creator_kind") or "unknown"
+    from .metadata_mode import database_now
+    doc.metadata_applied_at = database_now(db)
+    event.metadata_applied_at = doc.metadata_applied_at
+    if filled_creator and not getattr(settings, "metadata_only", False):
         identity: dict = {}
         if doc.uploader_key:
             identity_input = ({"userId": doc.uploader_key} if doc.uploader_key.isdigit()
@@ -411,6 +421,17 @@ def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEven
         return
     event.matched_node_id = node_id
     event.match_status = "confirmed"
+    if getattr(settings, "metadata_only", False):
+        from .metadata_mode import database_now
+        doc.metadata_applied_at = database_now(db)
+        event.metadata_applied_at = doc.metadata_applied_at
+        doc.is_deleted = kind == "delete"
+        doc.deleted_at = utcnow() if doc.is_deleted else None
+        doc.watch_misses = 0
+        _finish(db, event, "deleted" if doc.is_deleted else "restored")
+        key = "deleted" if doc.is_deleted else "restored"
+        summary[key] = summary.get(key, 0) + 1
+        return
     if kind == "delete":
         doc.is_deleted = True
         doc.deleted_at = utcnow()
@@ -457,6 +478,11 @@ def _try_finish_confirmed(db: Session, event: FileAuditEvent, settings: Settings
     doc = db.get(Document, event.matched_node_id)
     if doc is None:
         return False
+    if getattr(settings, "metadata_only", False):
+        if event.metadata_applied_at is None:
+            return False
+        _finish(db, event, "metadata_applied_review_paused")
+        return True
     if kind == "metadata":
         _finish(db, event, "metadata_applied")
         return True
@@ -631,7 +657,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     events = db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False))
                         .order_by(FileAuditEvent.gmt_create).limit(BATCH)).all()
     summary = {"events": len(events), "wiki_events": 0, "matched": 0, "confirmed": 0, "walks": []}
-    cutoff_ms = _cutoff_ms(settings.audit_review_since)
+    cutoff_ms = None if getattr(settings, "metadata_only", False) else _cutoff_ms(settings.audit_review_since)
     snapshot_id = _latest_snapshot_id(db)
     queued: set[str] = set()  # 本轮事务内的巡走去重
     wiki_events: list[FileAuditEvent] = []
@@ -857,7 +883,9 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
                 # 完成语义按类型收口：上传文件须有数字下载键，原生
                 # .adoc 由 node id 导出正文；元数据类只更新镜像。
                 kind = _action_kind(event)
-                if kind == "metadata":
+                if getattr(settings, "metadata_only", False):
+                    _finish(db, event, "metadata_applied_review_paused")
+                elif kind == "metadata":
                     _finish(db, event, "metadata_applied")
                 elif _body_fetch_ready(doc):
                     _finish(db, event, "done")
@@ -884,6 +912,8 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
             summary["sweep_skipped_governed"] = len(governed)
     summary["unlocated"] = unlocated
     summary["located_ungoverned"] = sorted(located_ungoverned)[:5]
+    if getattr(settings, "metadata_only", False):
+        _refresh_confirmed_metadata(db, settings, summary)
 
     # 死信裁决：到期仍未完成的事件带原因归档，绝不伪装成功。窗口基准是
     # retry_started_at（重开）→ received_at；池子含批外的 confirmed-pending。
@@ -907,6 +937,43 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
         _drain_walk_queue(db, settings, summary)
         db.commit()
     return summary
+
+
+def _refresh_confirmed_metadata(db, settings, summary):
+    """Node identity is not proof that this event's metadata was refreshed."""
+    now = utcnow()
+    rows = db.scalars(select(FileAuditEvent).where(
+        FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed",
+        FileAuditEvent.matched_node_id != "", FileAuditEvent.metadata_applied_at.is_(None),
+        FileAuditEvent.locate_attempts < settings.bridge_locator_max_attempts,
+        or_(FileAuditEvent.next_locate_at.is_(None), FileAuditEvent.next_locate_at <= now),
+        or_(FileAuditEvent.action_view.like("%知识库%"), FileAuditEvent.module_view == "团队空间"))
+        .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(), FileAuditEvent.last_attempt_at, FileAuditEvent.gmt_create)
+        .limit(WIKI_LOCATE_BUDGET)).all()
+    rows = [e for e in rows if _action_kind(e) in {"review", "modify", "metadata"}]
+    if not rows:
+        return
+    for e in rows:
+        e.last_attempt_at = now
+        e.locate_attempts += 1
+        e.next_locate_at = now + timedelta(seconds=settings.bridge_locator_retry_seconds * 2 ** (e.locate_attempts - 1))
+    ids = sorted({e.matched_node_id for e in rows})
+    db.commit()  # reservation survives failure; no row transaction across HTTP
+    try:
+        nodes = asyncio.run(DingtalkClient(settings).batch_query_wiki_nodes(ids, settings.dingtalk_sync_operator_id))
+    except (IntegrationError, RuntimeError, TimeoutError):
+        nodes = []
+    confirmed = {n["node_id"]: n for n in nodes if n.get("node_id") in ids and n.get("workspace_id")}
+    for e in rows:
+        node = confirmed.get(e.matched_node_id)
+        if node:
+            _upsert_audit_document(db, settings, e, node, "")
+            _finish(db, e, "metadata_applied_review_paused")
+            summary["metadata_refreshed"] = summary.get("metadata_refreshed", 0) + 1
+        elif e.locate_attempts >= settings.bridge_locator_max_attempts:
+            _finish(db, e, "dead_letter_metadata_unavailable")
+            summary["dead_letter"] = summary.get("dead_letter", 0) + 1
+    db.commit()
 
 
 def _drain_walk_queue(db: Session, settings: Settings, summary: dict) -> None:

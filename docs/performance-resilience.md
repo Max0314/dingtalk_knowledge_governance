@@ -55,6 +55,8 @@ PDF 提取隔离子进程，20 秒超时，Linux CPU 15 秒、地址空间 384Mi
 
 ## 验收与恢复
 
+2026-11-04 新增主动统计链路：一次按主键游标播种后，由事务内 dirty node 队列更新本地日/月预聚合；空闲不读取 documents/historical_file_nodes，不读取员工分区JSON，不改写相同统计。仅受影响分区生成增量，初始或已核实灾备恢复才发送基线。publisher 独立 profile `statistics`，限1 CPU/384MiB。源端和BI均将不可变大报文与可变状态分表，适用于MySQL FULL行镜像，重试不重复写整份JSON。首次补采只预估一次预算，按冻结监控范围逐库执行，不改数据库binlog配置。详见 [实施方案§17](bi-center-push-and-metadata-collection-plan.md#17-2026-11-04-补充最新主线先验收后传输增量与数据库负载)。
+
 完整部署步骤、人员分工、密钥交接、回滚与重新启用规则见 [部署指引](deployment-guide.md)。
 
 `scripts/ops_resilience.py` 仅访问本地 HTTP 和本服务 MySQL：

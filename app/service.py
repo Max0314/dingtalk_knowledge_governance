@@ -151,7 +151,7 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
     数据允许生成占位评分，生产数据无任何例外。"""
     from .content import fetch_document_content
 
-    if not settings.demo_mode and not settings.review_enabled:
+    if getattr(settings, "metadata_only", False) or (not settings.demo_mode and not settings.review_enabled):
         raise ContentUnavailableError("review_paused")
     doc = db.get(Document, node_id)
     if not doc:
@@ -260,7 +260,7 @@ def run_review(db: Session, settings: Settings, node_id: str, trigger: str = "ma
 
 
 def process_next_job(db: Session, settings: Settings) -> bool:
-    if not settings.demo_mode and not settings.review_enabled:
+    if getattr(settings, "metadata_only", False) or (not settings.demo_mode and not settings.review_enabled):
         return False
     job = db.scalar(select(ReviewJob).where(ReviewJob.status == "pending").order_by(ReviewJob.created_at).limit(1))
     if not job:
@@ -320,6 +320,8 @@ def harvest_due_reviews(db: Session, settings: Settings) -> int:
     已有评审兜着"（成功建任务，或有尚未启动的 pending 任务）时清零；撞上
     running 任务则原样保留——正文可能已被抓走，任务结束后下轮再收割补评
     （codex 第八轮 P0：清了标记又不建任务=修改永久丢失）。"""
+    if getattr(settings, "metadata_only", False) or not settings.review_enabled:
+        return 0
     now = _to_naive_utc(utcnow())
     cap_edge = now - timedelta(seconds=MODIFY_MERGE_MAX_SECONDS)
     harvested = 0
@@ -350,7 +352,7 @@ def harvest_due_reviews(db: Session, settings: Settings) -> int:
 
 async def _upsert_document(db: Session, settings: Settings, run: SyncRun, workspace_id: str, item: dict,
                            enqueue: bool, trigger_new: str, trigger_change: str,
-                           parent_node_id: str = "") -> None:
+                           parent_node_id: str = "", scan_started_at=None) -> None:
     """Persist one listed node.
 
     A completed seed remains mirror-only, so stock can never flood the review
@@ -366,7 +368,11 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     fixes the earlier field-name mismatch that zeroed both columns).
     """
     run.documents_seen += 1
-    doc = db.get(Document, item["node_id"])
+    from .metadata_mode import database_now, naive
+    doc = db.scalar(select(Document).where(Document.node_id == item["node_id"])
+                    .with_for_update().execution_options(populate_existing=True))
+    if doc and scan_started_at and doc.metadata_applied_at and naive(doc.metadata_applied_at) > naive(scan_started_at):
+        return
     is_new = doc is None
     changed = doc is not None and doc.source_updated_at != (item.get("updated_at") or "")
     if not doc:
@@ -380,7 +386,7 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
     doc.word_count = item.get("word_count") or 0
     doc.source_created_at = item.get("created_at") or ""
     doc.source_updated_at = item.get("updated_at") or ""
-    doc.is_folder = item["has_children"]
+    doc.is_folder = str(item.get("type", "")).lower() in ("folder", "directory") or item["has_children"]
     doc.file_class = classify(doc.extension, doc.is_folder)
     if parent_node_id or is_new:
         # 遍历路径天然知道父节点：写入并清掉"目录待定"（审计直建的文档
@@ -389,9 +395,15 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
         doc.directory_pending = False
     if doc.is_deleted:  # seen again — a recycle-bin restore, not a new document
         doc.is_deleted = False
+        doc.deleted_at = None
     doc.watch_misses = 0
     source_creator = item.get("creator_id") or ""
-    if is_new or changed:
+    if not doc.source_creator_key and source_creator:
+        doc.source_creator_key = source_creator
+        doc.source_creator_kind = item.get("creator_kind") or "unknown"
+    if is_new or db.is_modified(doc, include_collections=False):
+        doc.metadata_applied_at = scan_started_at or database_now(db)
+    if (is_new or changed) and not getattr(settings, "metadata_only", False):
         # 个别节点没有创建人 id（2026-08-14 生产实测三个库因此整轮回滚）：
         # None 必须钳成空串，后续 .isdigit()/机器人判定才不炸。
         doc.uploader_key = source_creator or doc.uploader_key or ""
@@ -409,7 +421,7 @@ async def _upsert_document(db: Session, settings: Settings, run: SyncRun, worksp
             doc.org_matched = True
         else:
             doc.uploader_name, doc.department_name, doc.biz_group_name, doc.org_matched = "未映射", "未映射", "未映射", False
-    if enqueue and is_new and (doc.extension or "").lower() == "adoc":
+    if settings.review_enabled and not getattr(settings, "metadata_only", False) and enqueue and is_new and (doc.extension or "").lower() == "adoc":
         cutoff = settings.audit_review_since or settings.review_since
         after_cutoff = not cutoff or _at_or_after(doc.source_created_at, cutoff)
         eligible = (
@@ -447,6 +459,7 @@ async def sync_from_dingtalk(db: Session, settings: Settings, mode: str = "incre
                     if item["has_children"]:
                         await walk(workspace_id, item["node_id"])
                 next_token = page.get("next_token", "")
+                db.flush()
                 if not next_token:
                     return
 
@@ -629,6 +642,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         ws.source_updated_at = raw.get("updated_at", "") or ws.source_updated_at
         ws.creator_key = raw.get("creator_id", "") or ws.creator_key
         ws.synced_at = utcnow()
+        ws.metadata_confirmed_at = utcnow()
         ws.is_active = True  # 走到这说明库可见：曾被排除的自动复活
         ws.unreachable_misses = 0
         run.workspace_name = ws.name
@@ -639,6 +653,9 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
         if seeding:
             run.mode = f"{mode}_seed"
         seen: set[str] = set()
+        from .metadata_mode import database_now, naive
+        scan_started_at = database_now(db)
+        run.collection_started_at = scan_started_at
 
         async def walk(parent_node_id: str) -> None:
             next_token = ""
@@ -653,7 +670,7 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
                     seen.add(item["node_id"])
                     await _upsert_document(db, settings, run, workspace_id, item, enqueue=not seeding,
                                            trigger_new="watch", trigger_change="watch_change",
-                                           parent_node_id=parent_node_id)
+                                           parent_node_id=parent_node_id, scan_started_at=scan_started_at)
                     if item["has_children"]:
                         await walk(item["node_id"])
                 next_token = page.get("next_token", "")
@@ -662,8 +679,8 @@ async def watch_workspace(db: Session, settings: Settings, workspace_id: str, sp
 
         await walk(raw.get("root_node_id", "") or "")
         # Only a complete, successful walk may accuse a document of deletion.
-        for doc in db.scalars(select(Document).where(Document.workspace_id == workspace_id, Document.is_deleted.is_(False))).all():
-            if doc.node_id in seen:
+        for doc in db.scalars(select(Document).where(Document.workspace_id == workspace_id, Document.is_deleted.is_(False)).execution_options(yield_per=500)):
+            if doc.node_id in seen or (doc.metadata_applied_at and naive(doc.metadata_applied_at) > naive(scan_started_at)):
                 continue
             doc.watch_misses += 1
             if doc.watch_misses >= max(1, settings.watch_delete_misses):

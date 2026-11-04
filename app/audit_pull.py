@@ -87,7 +87,7 @@ async def _fetch_pages(settings: Settings, start_ms: int, end_ms: int) -> list[d
     return rows
 
 
-def _ingest(db: Session, rows: list[dict]) -> dict:
+def _ingest(db: Session, rows: list[dict], *, include_reads: bool = True) -> dict:
     stored = reads = dupes = 0
     known: dict[str, FileAuditEvent] = {}
     if rows:
@@ -112,6 +112,8 @@ def _ingest(db: Session, rows: list[dict]) -> dict:
         day = datetime.fromtimestamp(gmt / 1000, CST).strftime("%Y-%m-%d") if gmt else ""
         module = str(row.get("operateModuleView") or "")
         if _is_read(action_view):
+            if not include_reads:
+                continue
             reads += 1
             if day:
                 key = (day, module, action_view)
@@ -153,6 +155,8 @@ def _ingest(db: Session, rows: list[dict]) -> dict:
 
 
 def _maybe_alarm(db: Session, settings: Settings, state: AuditState) -> None:
+    if getattr(settings, "metadata_only", False):
+        return
     now_cst = datetime.now(CST)
     if now_cst.weekday() >= 5 or not (9 <= now_cst.hour < 18):
         return
@@ -183,6 +187,8 @@ def _maybe_alarm(db: Session, settings: Settings, state: AuditState) -> None:
 
 def run_audit_pull(db: Session, settings: Settings) -> dict:
     """One CDC cycle. Returns a summary for the worker log."""
+    if getattr(settings, "metadata_only", False):
+        return asyncio.run(_pull_metadata_window(db, settings))
     state = _state(db)
     now_ms = int(time.time() * 1000)
     start_ms = max((state.last_gmt_create or 0) - LOOKBACK_MS, now_ms - 24 * 3600 * 1000)
@@ -200,6 +206,81 @@ def run_audit_pull(db: Session, settings: Settings) -> dict:
     db.commit()
     _maybe_alarm(db, settings, state)
     return {"rows": len(rows), **summary}
+
+
+async def _audit_page(client, settings, start, end, cursor_g, cursor_b):
+    from .http_client import outbound_client
+    token = await client._token_value()
+    params = {"startDate": start, "endDate": end, "pageSize": PAGE_SIZE}
+    if cursor_g is not None:
+        params.update(nextGmtCreate=cursor_g, nextBizId=cursor_b)
+    reserve_call(settings, "exclusive.fileAuditLogs")
+    async with outbound_client(settings, timeout=25) as http:
+        response = await http.get("https://api.dingtalk.com/v1.0/exclusive/fileAuditLogs", params=params,
+                                  headers={"x-acs-dingtalk-access-token": token})
+    if response.status_code != 200:
+        raise IntegrationError("audit_pull_failed", "审计元数据读取失败。", response.status_code)
+    rows = response.json().get("list")
+    if not isinstance(rows, list) or len(rows) > PAGE_SIZE:
+        raise IntegrationError("audit_invalid_page", "审计分页响应无效。", 502)
+    return rows
+
+
+async def _pull_metadata_window(db, settings):
+    """Commit each page and its paired cursor together; never skip a capped page."""
+    state = _state(db)
+    now_ms = int(time.time() * 1000)
+    lower = now_ms - 24 * 3600 * 1000
+    if state.window_start_ms is not None and state.window_start_ms < lower:
+        state.gap_since_ms = min(state.gap_since_ms or state.window_start_ms, state.window_start_ms)
+        state.gap_reason = "expired_window"
+        state.window_start_ms = state.window_end_ms = state.next_gmt_create = state.next_biz_id = None
+    if state.window_start_ms is None:
+        old_end = state.completed_end_ms
+        wanted = old_end - LOOKBACK_MS if old_end is not None else now_ms - LOOKBACK_MS
+        if old_end is None or wanted < lower:
+            old_run = state.last_run_at
+            old_ms = int(old_run.replace(tzinfo=old_run.tzinfo or timezone.utc).timestamp() * 1000) if old_run else wanted
+            gap = min(wanted, old_ms)
+            state.gap_since_ms = min(state.gap_since_ms or gap, gap)
+            state.gap_reason = "migration_gap" if old_end is None else "lookback_exceeded"
+        state.window_start_ms, state.window_end_ms = max(wanted, lower), now_ms
+        state.next_gmt_create = state.next_biz_id = None
+    db.commit()
+    result = {"rows": 0, "stored": 0, "dupes": 0, "reads": 0, "pages": 0, "window_complete": False}
+    client = DingtalkClient(settings)
+    for _ in range(MAX_PAGES_PER_CYCLE):
+        start, end = state.window_start_ms, state.window_end_ms
+        cg, cb = state.next_gmt_create, state.next_biz_id
+        db.commit()
+        rows = await _audit_page(client, settings, start, end, cg, cb)
+        if rows:
+            try:
+                ng, nb = int(rows[-1]["gmtCreate"]), str(rows[-1]["bizId"])
+                same_time_backwards = (ng == cg and cb is not None and
+                                       (int(nb) <= int(cb) if nb.isdigit() and str(cb).isdigit() else nb <= str(cb)))
+                if not nb or (cg is not None and (ng < cg or same_time_backwards)):
+                    raise ValueError()
+            except (KeyError, TypeError, ValueError):
+                raise IntegrationError("audit_cursor_stalled", "审计分页游标未推进。", 502) from None
+        summary = _ingest(db, rows, include_reads=False)
+        state = _state(db)
+        state.last_run_at, state.last_rows = utcnow(), len(rows)
+        state.last_gmt_create = max(state.last_gmt_create or 0, summary["max_gmt"])
+        if len(rows) < PAGE_SIZE:
+            state.completed_end_ms = end
+            state.window_start_ms = state.window_end_ms = state.next_gmt_create = state.next_biz_id = None
+            result["window_complete"] = True
+        else:
+            state.next_gmt_create, state.next_biz_id = ng, nb
+        db.commit()
+        result["rows"] += len(rows)
+        result["pages"] += 1
+        for k in ("stored", "dupes"):
+            result[k] += summary[k]
+        if result["window_complete"]:
+            break
+    return result
 
 
 def audit_status(db: Session) -> dict:

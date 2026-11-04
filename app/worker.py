@@ -38,7 +38,7 @@ def main() -> None:
         if settings.demo_mode: seed_demo(db)
         # The scan worker owns SyncRun rows. A realtime restart must never mark
         # its concurrently running scan as interrupted or delete queued walks.
-        swept = sweep_stale_runs(db, sync_runs=False, bridge_walks=False)
+        swept = sweep_stale_runs(db, sync_runs=False, bridge_walks=False, review_jobs=not settings.metadata_only)
         if swept:
             logger.info("requeued %s interrupted realtime job(s)", swept)
     # Audit gets the earlier boot tick and runs FIRST in the loop: it is the
@@ -52,8 +52,8 @@ def main() -> None:
                 with SessionLocal() as db:
                     audit = run_audit_pull(db, settings)
                 logger.info("audit pull: %s", audit)
-            except Exception:
-                logger.exception("audit pull failed")
+            except Exception as exc:
+                logger.warning("audit pull failed: %s", type(exc).__name__)
             next_audit_at = time.time() + max(120, settings.audit_pull_interval_seconds)
         if next_bridge_at is not None and time.time() >= next_bridge_at:
             try:
@@ -63,8 +63,8 @@ def main() -> None:
                     bridge = process_audit_events(db, settings, drain_walks=False)
                 if bridge["wiki_events"] or bridge["walks"]:
                     logger.info("audit bridge: %s", bridge)
-            except Exception:
-                logger.exception("audit bridge failed")
+            except Exception as exc:
+                logger.warning("audit bridge failed: %s", type(exc).__name__)
             next_bridge_at = time.time() + max(15, settings.bridge_interval_seconds)
         with SessionLocal() as db:
             harvested = harvest_due_reviews(db, settings) if settings.review_enabled else 0

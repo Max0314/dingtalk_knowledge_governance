@@ -162,7 +162,7 @@ def _notify_decision(db: Session, settings: Settings, node_id: str, instance: Re
 
 def enqueue_review_notification(db: Session, settings: Settings, doc: Document, instance: ReviewInstance) -> Notification | None:
     """Queue a push for a finished review. Caller commits."""
-    if not settings.notify_enabled:
+    if getattr(settings, "metadata_only", False) or not settings.notify_enabled:
         return None
     if getattr(instance, "review_scope", "") != "full_content":
         # 2026-08-17 拍板：拿不到正文不推送——初检推送整体下线（手动重评产生
@@ -253,6 +253,8 @@ def process_pending_notifications(db: Session, settings: Settings, batch: int = 
     """Digest-aware pump: pushes wait out a quiet window per recipient so a
     burst of uploads becomes one summary message instead of a message storm.
     Returns how many rows were attempted (sent or failed)."""
+    if getattr(settings, "metadata_only", False) or not settings.notify_enabled:
+        return 0
     rows = db.scalars(select(Notification).where(Notification.status == "pending")
                       .order_by(Notification.created_at).limit(batch)).all()
     if not rows:
