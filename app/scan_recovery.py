@@ -5,7 +5,7 @@ import math
 import os
 from datetime import datetime
 from uuid import UUID
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, union_all
 from .api_usage import CST, usage_status
 from .bi_models import ScanRecoveryRun
 from .db import AuditState, Document, HistoricalFileNode, ScanCycle, ScanTask, SessionLocal, Workspace, utcnow
@@ -16,19 +16,20 @@ from .service import workspace_name_is_ignored
 
 
 def budget_preflight(db, settings, ids):
-    # Once per explicit recovery, never in a worker/idle loop. Conservative:
-    # count both local inventories, including overlap, plus empty folder reads.
+    # Once per explicit recovery, never in a worker/idle loop. Deduplicate the
+    # overlapping inventories before estimating directory pages/empty folders.
     estimate = 5
-    for model in (Document, HistoricalFileNode):
-        conditions = [model.workspace_id.in_(ids)]
-        if model is HistoricalFileNode:
-            conditions.append(model.snapshot_id == primary_snapshot_id(db))
-        folder = model.is_folder.is_(True) if model is Document else func.lower(model.node_type) == 'folder'
-        rows = db.execute(select(model.workspace_id, model.parent_node_id, func.count(), func.sum(case((folder, 1), else_=0))).where(*conditions)
-                          .group_by(model.workspace_id, model.parent_node_id))
-        for _, _, count, folders in rows:
-            estimate += math.ceil(count / 30) + int(folders or 0)
-    estimate = math.ceil((estimate + len(ids)) * 1.2)
+    live = select(Document.workspace_id.label('ws'),Document.parent_node_id.label('parent'),
+                  Document.is_folder.label('folder')).where(Document.workspace_id.in_(ids))
+    h=HistoricalFileNode
+    base=select(h.workspace_id,h.parent_node_id,(func.lower(h.node_type)=='folder').label('folder')).where(
+        h.snapshot_id==primary_snapshot_id(db),h.workspace_id.in_(ids),
+        ~select(Document.node_id).where(Document.node_id==h.node_id).exists())
+    nodes=union_all(live,base).subquery()
+    groups={ws:{'pages':0,'parents':0,'folders':0} for ws in ids}
+    for ws,parent,count,folders in db.execute(select(nodes.c.ws,nodes.c.parent,func.count(),func.sum(case((nodes.c.folder,1),else_=0))).group_by(nodes.c.ws,nodes.c.parent)):
+        g=groups[ws];g['pages']+=math.ceil(count/30);g['parents']+=1;g['folders']+=int(folders or 0)
+    estimate=math.ceil((estimate+sum(g['pages']+max(0,g['folders']+1-g['parents']) for g in groups.values()))*1.2)
     usage = usage_status(db, settings)
     calls = {(r['period'], r['interface']): r['calls'] for r in usage['items']}
     now = datetime.now(CST)
