@@ -41,7 +41,7 @@ def scan_lock(db):
                 _local_lock.release()
 
 
-async def run_scan_slice_async(db, settings, *, force=False) -> dict:
+async def run_scan_slice_async(db, settings, *, force=False, expected_month=None) -> dict:
     if not settings.full_scan_enabled:
         return {"status": "disabled", "walked": []}
     if not settings.watch_workspaces:
@@ -54,6 +54,12 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
     with scan_lock(db) as got:
         if not got:
             return {"status": "busy", "walked": []}
+        if expected_month:
+            if month != expected_month or datetime.now(CST).strftime('%Y-%m') != expected_month:
+                return {'status': 'cycle_outside_month', 'walked': []}
+            requested = db.get(ScanCycle, expected_month)
+            if requested is None or requested.status != 'running':
+                return {'status': 'cycle_not_running', 'walked': []}
         from .scan_pages import cleanup_completed
         cleanup_completed(db)
         cycle = db.get(ScanCycle, month)
@@ -146,8 +152,8 @@ async def run_scan_slice_async(db, settings, *, force=False) -> dict:
                     "remaining": sum(t.status in ("pending", "running") for t in tasks)}
 
 
-def run_scan_slice(db, settings):
-    return asyncio.run(run_scan_slice_async(db, settings))
+def run_scan_slice(db, settings, *, expected_month=None):
+    return asyncio.run(run_scan_slice_async(db, settings, expected_month=expected_month))
 
 
 def complete_cycle(db, cycle, tasks):

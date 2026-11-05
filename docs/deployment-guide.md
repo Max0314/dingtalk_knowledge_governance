@@ -147,27 +147,30 @@ KG_STREAM_ENABLED=false
 
 | 配置 | 基线值 | 范围 |
 | --- | ---: | --- |
-| `KG_DINGTALK_DAILY_LIMIT` | 65000 | 纳入计数的总请求每日预算 |
-| `KG_DINGTALK_MONTHLY_LIMIT` | 100000 | 总请求每月预算 |
-| `KG_DINGTALK_NODES_MONTHLY_LIMIT` | 60000 | 节点列表每月预算 |
+| `KG_DINGTALK_DAILY_LIMIT` | 100000 | 纳入计数的总请求每日预算 |
+| `KG_DINGTALK_MONTHLY_LIMIT` | 120000 | 总请求每月预算 |
+| `KG_DINGTALK_NODES_MONTHLY_LIMIT` | 100000 | 节点列表每月预算 |
 | `KG_DINGTALK_SEARCH_DAILY_LIMIT` | 500 | 文件搜索每日预算 |
 | `KG_DINGTALK_SEARCH_MONTHLY_LIMIT` | 10000 | 文件搜索每月预算 |
-| `KG_DINGTALK_AUDIT_DAILY_LIMIT` | 1000 | 专属版文件审计日志每日预算 |
-| `KG_SCAN_MAX_API_CALLS` | 60000 | 同月校准周期总请求预算 |
+| `KG_DINGTALK_AUDIT_DAILY_LIMIT` | 2000 | 专属版文件审计日志每日预算 |
+| `KG_SCAN_MAX_API_CALLS` | 100000 | 同月校准周期总请求预算 |
+| `KG_SCAN_DAILY_RESERVE` / `KG_SCAN_MONTHLY_RESERVE` | 5000 / 10000 | 全量为增量保留的总请求预算 |
 | `KG_SCAN_DAYS` | 10 | 每月从 10 日起允许自动建立一轮 |
 | `KG_SCAN_MAX_ATTEMPTS` / `KG_SCAN_RETRY_SECONDS` | 3 / 900 | 每库最多 3 次尝试，失败约 15/30 分钟退避 |
 | `KG_BRIDGE_LOCATOR_MAX_ATTEMPTS` / `KG_BRIDGE_LOCATOR_RETRY_SECONDS` | 3 / 600 | 事件定位最多 3 次，失败约 10/20 分钟退避 |
 
 这些是本服务的请求预算，不是钉钉购买额度。提额必须审批，0 不是合法的禁用限额方式。请求在 MySQL 中先原子预留再发出，重启不清零；计数数据库不可用则拒绝外呼。超限错误为 `dingtalk_budget_exhausted`，计数不可用为 `dingtalk_budget_unavailable`。
 
-`scan_cycles` 和 `scan_tasks` 保存月度周期及逐库进度。成功库当月不重扫；失败/中断的单个知识库可能从头重试，不是节点级断点续扫。最多 3 次包括首次及中断尝试。调用量由目录、分页和其他请求决定，不是一个知识库一次调用；单轮实际量查看 `scan:YYYY-MM`。
+`scan_cycles` 和 `scan_tasks` 保存月度周期及逐库进度。生产元数据模式已按页持久化断点，失败/中断继续成功页之后的目录，不重扫成功库；成功切片和可恢复中断不增加失败尝试。真实失败最多3次。调用量由目录、分页和其他请求决定，不是一个知识库一次调用；单轮实际量查看 `scan:YYYY-MM`。
+
+仅批准一次补采时，先用固定recovery-id准备并冻结当月范围，再以`python -m app.watcher --cycle-month YYYY-MM`运行。指定月份必须为当前北京时间月份且已有running周期；不存在、终态或跨月即退出，不自动创建新周期。本轮Compose watcher命令固定月份，restart使用`on-failure:3`，正常终态不自动重启。AI评审与通知开关独立保持暂停。
 
 手动校准可提前建立当月周期，重复操作只推进未完成任务，不开第二轮。旧版 10,24 只取最早日期。`completed_with_errors` 和 `budget_exhausted` 不是全部成功，也不会自动重开同月周期。暂停保留任务；禁止删表、清计数、改月份或反复重启强制重扫。
 
 计数及暂停边界：
 
 - 口径为接入适配器的 HTTP 尝试/预留数，包含失败及应用 token 请求，从修复部署后开始，不补算历史，不等于钉钉付费成功调用账单。
-- `GET /api/v1/diagnostics/api-usage` 只查数据库；但当前“连接诊断”整页还自动做真实连通性检查，打开或刷新会有少量钉钉调用，配置模型时也可能测试模型。
+- `GET /api/v1/diagnostics/api-usage` 和连接诊断GET只读本地状态；管理员显式POST才单项测试连通性，模型暂停时不实际调用模型。
 - `/api/v1/dingtalk/knowledge-bases...` 是实时钉钉代理，交互浏览会消耗额度。后台关闭不等于所有 API 均无外呼。
 - 浏览器登录的用户 token/资料接口、部分独立历史脚本未统一纳入计数，其他服务共用应用的调用也不在本库预算内。禁止定时运行旧扫描/探测脚本；未经评审不得运行 `scan_uploader_baseline.py`、`*_probe.py` 等直连脚本。
 - 正文资源下载不作为 OpenAPI 请求计数，模型费用另算。需要严格禁止出站时另加平台网络策略，登录也可能因此不可用；日常零钉钉调用验收用第十节数据库检查。

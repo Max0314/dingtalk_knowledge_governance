@@ -11,7 +11,7 @@ AI 和部署人员先读 [工程约束](../AGENTS.md)、[部署指引](../docs/d
 | 知识库登记 | `sync_workspace_registry.py`、`backfill_yida_departments.py` | 存在外呼及本地写入，先 dry-run 并确认额度 |
 | 月度校准 | `run_watch_once.py` | 走持久任务和额度保护，不重复开同月已完成的库 |
 | 主动统计发布 | `python -m app.bi_publisher seed/run/retry/rebuild` | seed仅在采集暂停时按主键游标播种；run仅在双端发布准入后启动；retry/rebuild需管理员及原因，不扫描原始大表 |
-| 暂停后补采 | `python -m app.scan_recovery --recovery-id <UUID> --reason <原因>` | 一次预算预估、冻结监控范围和旧任务留档；同ID恢复不重置成功任务，随后watcher接续本月周期 |
+| 暂停后补采 | `python -m app.scan_recovery --recovery-id <UUID> --reason <原因>` | 一次预算预估、冻结监控范围和旧任务留档；同ID恢复不重置成功任务。仅一次授权时用`python -m app.watcher --cycle-month YYYY-MM`，已有当月周期终态/跨月退出，部署restart=on-failure:3 |
 | 采集查询索引 | `migrate_collector_lookup_index.py` | 显式部署前执行；仅增加下载键索引，在线LOCK=NONE且锁等待3秒，失败不强制重建表，不开启补采 |
 | 页面与扫描迁移 | `migrate_page_scan.py` | 新增断点/页面身份状态小表；组织缓存列仅INSTANT，身份缓存索引仅INPLACE/LOCK=NONE；一次从日汇总排页面身份任务，不扫描/回写文件大表，不开启全量 |
 | 遗留全量基线 | `scan_uploader_baseline.py` | 非常规任务；默认拒绝，显式参数 `--approve-paid-baseline` + 全量开关，仍受共享额度限制 |
