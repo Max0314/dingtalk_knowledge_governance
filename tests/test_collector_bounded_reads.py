@@ -31,6 +31,39 @@ def add_event(sessions, key='event', **overrides):
     with sessions.begin() as db:db.add(FileAuditEvent(**values))
 
 
+@pytest.mark.parametrize('storage', ['', 'synthetic-storage'])
+def test_local_only_backlog_cannot_starve_upload_locator_or_confirmed_refresh(collector, monkeypatch, storage):
+    sessions, _, s = collector
+    s = s.model_copy(update={'wiki_storage_space_id': storage})
+    now = int(utcnow().timestamp()*1000)
+    with sessions.begin() as db:
+        for i in range(45):
+            db.add(FileAuditEvent(event_key=f'local-{i}', biz_id=f'local-{i}', gmt_create=now+i,
+                action_view='知识库删除文件' if i%2 else '知识库恢复文件', module_view='团队空间',
+                match_status='confirmed' if i<25 else '', matched_node_id=f'missing-{i}' if i<25 else ''))
+        # All local-only rows have never been attempted and would win the old LIMIT.
+        db.add(FileAuditEvent(event_key='upload', biz_id='upload', gmt_create=now-1000,
+            action_view='创建文档', module_view='团队空间', resource='synthetic-upload', extension='ADOC',
+            locate_attempts=1, last_attempt_at=utcnow()-timedelta(minutes=20)))
+        db.add(FileAuditEvent(event_key='confirmed-upload', biz_id='confirmed-upload', gmt_create=now-1000,
+            action_view='知识库修改文件', module_view='团队空间', resource='synthetic-known', extension='adoc',
+            match_status='confirmed', matched_node_id='synthetic-known', locate_attempts=1,
+            last_attempt_at=utcnow()-timedelta(minutes=20)))
+    searches=[]; refreshed=[]
+    class Client:
+        def __init__(self,*a):pass
+        async def search_dentries(self, name, *a, **k):searches.append(name);return []
+        async def batch_query_wiki_nodes(self, ids, *a):refreshed.extend(ids);return []
+    monkeypatch.setattr(audit_bridge,'DingtalkClient',Client)
+    with sessions() as db:
+        audit_bridge.process_audit_events(db,s,drain_walks=False)
+        upload=db.scalar(select(FileAuditEvent).where(FileAuditEvent.event_key=='upload'))
+        assert upload.locate_attempts==2 and searches==['synthetic-upload', 'synthetic-upload.ADOC']
+        assert refreshed==['synthetic-known']
+        local=db.scalars(select(FileAuditEvent).where(FileAuditEvent.event_key.like('local-%'))).all()
+        assert all(e.locate_attempts==0 and not e.processed for e in local)
+
+
 def test_idle_and_repeated_unresolved_events_do_not_read_document_inventory(collector,monkeypatch):
     sessions,bind,s=collector
     calls=[];sql=[]

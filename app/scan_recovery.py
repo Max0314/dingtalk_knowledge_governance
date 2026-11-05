@@ -9,11 +9,12 @@ from uuid import UUID
 from sqlalchemy import case, func, select, union_all
 from .api_usage import CST, usage_status
 from .bi_models import ScanRecoveryRun
-from .db import AuditState, Document, HistoricalFileNode, ScanCycle, ScanTask, SessionLocal, Workspace, utcnow
+from .db import AuditState, Document, HistoricalFileNode, ScanCycle, ScanTask, SyncRun, SessionLocal, Workspace, utcnow
 from .metadata_mode import naive
 from .metrics import primary_snapshot_id
 from .scan_scheduler import scan_lock
 from .service import workspace_name_is_ignored
+from .scan_models import ScanProgress
 
 
 def budget_preflight(db, settings, ids):
@@ -96,11 +97,69 @@ def prepare_recovery(db, settings, recovery_id, reason):
     return {'status': 'prepared', 'month': month, 'recoveryId': recovery_id, 'workspaceCount': len(ids), **budget}
 
 
+def resume_failed(db, settings, recovery_id, resume_id, reason, *, expected_failed, expected_success, apply=False):
+    """Preview by default. Applying requires a fresh, explicit authorization ID."""
+    if str(UUID(resume_id)) != resume_id or not reason or len(reason) > 255:
+        raise ValueError('valid resume ID and reason required')
+    recovery = db.get(ScanRecoveryRun, recovery_id)
+    month = datetime.now(CST).strftime('%Y-%m')
+    if not recovery or recovery.month != month:
+        raise ValueError('current original recovery required')
+    prior = json.loads(recovery.prior_tasks_json)
+    history = prior.get('resumptions', [])
+    if any(r['resumeId'] == resume_id for r in history):
+        return {'status': 'already_applied', 'month': month, 'resumeId': resume_id}
+    cycle = db.get(ScanCycle, month)
+    if not cycle or cycle.status != 'completed_with_errors' or cycle.recovery_id != recovery_id:
+        raise ValueError('original failed cycle must be stopped')
+    tasks = list(db.scalars(select(ScanTask).where(ScanTask.month == month).order_by(ScanTask.workspace_id)))
+    original = set(json.loads(recovery.target_workspace_ids_json))
+    if set(json.loads(cycle.target_workspace_ids_json)) != original or {t.workspace_id for t in tasks} != original:
+        raise ValueError('frozen workspace scope mismatch')
+    failed = [t for t in tasks if t.status == 'dead_letter']
+    succeeded = [t for t in tasks if t.status == 'succeeded']
+    if len(failed) != expected_failed or len(succeeded) != expected_success or len(failed)+len(succeeded) != len(tasks):
+        raise ValueError('failed/success counts changed')
+    runs = {r.run_id: r for r in db.scalars(select(SyncRun).where(SyncRun.run_id.in_([t.run_id for t in tasks])))}
+    checkpoints = {r.run_id: r for r in db.scalars(select(ScanProgress).where(ScanProgress.run_id.in_([t.run_id for t in tasks])))}
+    for task in tasks:
+        run, progress = runs.get(task.run_id), checkpoints.get(task.run_id)
+        if task.recovery_id != recovery_id or not run or not progress or run.workspace_id != task.workspace_id or progress.workspace_id != task.workspace_id or progress.cycle_month != month:
+            raise ValueError('missing or conflicting original checkpoint')
+        if task.status == 'succeeded' and (run.status != 'succeeded' or progress.phase != 'complete'):
+            raise ValueError('success proof mismatch')
+        if task.status == 'dead_letter' and progress.phase == 'complete':
+            raise ValueError('completed checkpoint needs reconciliation first')
+    result = {'status': 'ready_to_resume' if not apply else 'resume_applied', 'month': month,
+              'failedCount': len(failed), 'preservedSuccessCount': len(succeeded), 'resumeId': resume_id,
+              'keepsOriginalRunIds': True, 'noInventoryEstimate': True}
+    if not apply:
+        return result
+    if not settings.metadata_only or any((settings.review_enabled, settings.notify_enabled, settings.content_extract_enabled, settings.model_allow_content_transfer)):
+        raise ValueError('metadata-only paused review/notification mode required')
+    history.append({'resumeId': resume_id, 'requestedAt': utcnow().isoformat(), 'reason': reason,
+                    'failedTasks': [{'workspaceId': t.workspace_id, 'runId': t.run_id, 'attempts': t.attempts, 'errorCode': t.error_code} for t in failed]})
+    prior['resumptions'] = history
+    recovery.prior_tasks_json, recovery.finished_at = json.dumps(prior), None
+    for task in failed:
+        cooling_down = task.error_code.startswith('dingtalk_rate_limited') and task.next_attempt_at and naive(task.next_attempt_at) > naive(utcnow())
+        task.status, task.attempts = 'pending', 0
+        if not cooling_down:
+            task.error_code, task.next_attempt_at = '', None
+    cycle.status, cycle.finished_at = 'running', None
+    return result
+
+
 def main():
     from .config import get_settings
     p = argparse.ArgumentParser()
     p.add_argument('--recovery-id', required=True)
     p.add_argument('--reason', required=True)
+    p.add_argument('--resume-failed', action='store_true')
+    p.add_argument('--resume-id')
+    p.add_argument('--expected-failed', type=int)
+    p.add_argument('--expected-success', type=int)
+    p.add_argument('--apply', action='store_true', help='Actually reopen only failed tasks after user approval')
     args = p.parse_args()
     if hasattr(os, 'geteuid') and os.geteuid() != 0:
         raise SystemExit('deployment administrator required')
@@ -109,7 +168,15 @@ def main():
         with scan_lock(db) as got:
             if not got:
                 raise SystemExit('scan busy')
-            result = prepare_recovery(db, settings, args.recovery_id, args.reason)
+            if args.resume_failed:
+                if not args.resume_id or args.expected_failed is None or args.expected_success is None:
+                    p.error('--resume-failed needs --resume-id, --expected-failed and --expected-success')
+                result = resume_failed(db, settings, args.recovery_id, args.resume_id, args.reason,
+                                       expected_failed=args.expected_failed, expected_success=args.expected_success, apply=args.apply)
+            else:
+                if args.apply:
+                    p.error('--apply is only valid with --resume-failed')
+                result = prepare_recovery(db, settings, args.recovery_id, args.reason)
             db.commit()
             print(json.dumps(result))
 

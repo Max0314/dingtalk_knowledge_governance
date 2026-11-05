@@ -101,6 +101,12 @@ async def run_scan_slice_async(db, settings, *, force=False, expected_month=None
                     task.next_attempt_at = None if settings.metadata_only else now + timedelta(seconds=settings.scan_retry_seconds)
             db.commit()
             walked = []
+            # Provider rate limits apply to the app, not only the first library.
+            # Persisted task cooldown survives watcher restarts and avoids
+            # spending the remaining libraries' attempts during Retry-After.
+            if any(t.error_code.startswith('dingtalk_rate_limited') and t.next_attempt_at
+                   and t.next_attempt_at.replace(tzinfo=None) > now for t in tasks):
+                return {'status': 'rate_limit_wait', 'month': month, 'walked': []}
             for task in tasks:
                 if task.status != "pending":
                     continue
@@ -133,6 +139,13 @@ async def run_scan_slice_async(db, settings, *, force=False, expected_month=None
                 in_progress = bool(settings.metadata_only and run and run.run_id == task.run_id and run.status in ('running', 'paused'))
                 task.status = 'pending' if in_progress else ('succeeded' if success else ('dead_letter' if task.attempts >= settings.scan_max_attempts else 'pending'))
                 task.next_attempt_at = None if success or in_progress else utcnow() + timedelta(seconds=settings.scan_retry_seconds * 2 ** max(0, task.attempts - 1))
+                if not success and not in_progress and run:
+                    try:
+                        retry_after = json.loads(run.error_detail).get('retryAfter')
+                    except (ValueError, TypeError, AttributeError):
+                        retry_after = None
+                    if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool) and 0 < retry_after <= 86400:
+                        task.next_attempt_at = max(task.next_attempt_at, utcnow() + timedelta(seconds=retry_after))
                 if task.error_code.startswith('dingtalk_scan_daily_reserved'):
                     tomorrow = datetime.now(CST).replace(hour=0, minute=1, second=0, microsecond=0) + timedelta(days=1)
                     task.next_attempt_at = tomorrow.astimezone(timezone.utc).replace(tzinfo=None)
@@ -141,6 +154,8 @@ async def run_scan_slice_async(db, settings, *, force=False, expected_month=None
                 if task.error_code.startswith("dingtalk_budget_"):
                     cycle.status, cycle.finished_at = "budget_exhausted", utcnow()
                 db.commit()
+                if task.error_code.startswith('dingtalk_rate_limited'):
+                    break
                 if cycle.status != "running" or len(walked) >= max(1, settings.watch_slice_size):
                     break
             if cycle.status == "running" and all(t.status in ("succeeded", "dead_letter") for t in tasks):

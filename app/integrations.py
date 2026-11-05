@@ -74,10 +74,10 @@ class DingtalkClient:
         # httpx serializes None as an empty string; DingTalk rejects e.g. nextToken= with HTTP 400.
         cleaned = {key: value for key, value in params.items() if value not in (None, "")}
         response = await self._request("GET", f"https://api.dingtalk.com/v2.0{path}", params=cleaned, headers={"x-acs-dingtalk-access-token": token})
-        if response.status_code == 403:
-            raise IntegrationError("dingtalk_permission_denied", "钉钉权限不足，请检查 Wiki.Workspace.Read、Wiki.Node.Read 和 operatorId 的访问权限。", 403)
         if response.is_error:
-            raise IntegrationError("dingtalk_request_failed", f"钉钉接口调用失败（HTTP {response.status_code}）。", response.status_code)
+            from .dingtalk_errors import from_response
+            raise from_response(response, endpoint=interface, secrets=(token, self.settings.dingtalk_app_key,
+                                self.settings.dingtalk_app_secret, self.settings.dingtalk_sync_operator_id, params.get('operatorId')))
         return response.json()
 
     async def list_workspaces(self, operator_id: str, next_token: str = "", max_results: int = 30) -> dict[str, Any]:
@@ -88,7 +88,11 @@ class DingtalkClient:
         return {"items": [normalize_workspace(item) for item in items], "next_token": payload.get("nextToken", "")}
 
     async def workspace_detail(self, workspace_id: str, operator_id: str) -> dict[str, Any]:
-        return normalize_workspace(await self._get(f"/wiki/workspaces/{workspace_id}", {"operatorId": operator_id}))
+        payload = await self._get(f"/wiki/workspaces/{workspace_id}", {"operatorId": operator_id, 'withPermissionRole': 'true'})
+        workspace = payload.get('workspace', payload) if isinstance(payload, dict) else None
+        if not isinstance(workspace, dict) or not workspace.get('workspaceId') or not workspace.get('rootNodeId'):
+            raise IntegrationError('dingtalk_workspace_invalid', '知识库详情响应缺少有效的根目录。', 502)
+        return normalize_workspace(workspace)
 
     async def list_nodes(self, workspace_id: str, operator_id: str, parent_node_id: str = "", next_token: str = "", max_results: int = 100) -> dict[str, Any]:
         if not parent_node_id:

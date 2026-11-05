@@ -239,6 +239,15 @@ def _action_kind(event: FileAuditEvent) -> str:
     return "unknown"
 
 
+def _remote_action_filter():
+    """Apply the action classifier before LIMIT so local-only rows cannot starve remote work."""
+    view = func.trim(func.coalesce(FileAuditEvent.action_view, ""))
+    local = or_(*(view.contains(word) for word in IGNORE_ACTIONS + RESTORE_ACTIONS + DELETE_ACTIONS))
+    remote = or_(view.in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT)),
+                 *(view.contains(word) for word in METADATA_ACTIONS))
+    return and_(~local, remote)
+
+
 def _route_review_event(db: Session, settings: Settings, doc: Document,
                         event: FileAuditEvent) -> None:
     """Apply the event's explicit review semantics once body fetching is ready.
@@ -808,6 +817,9 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
                             or_(FileAuditEvent.action_view.like("%知识库%"),
                                 FileAuditEvent.module_view == "团队空间")]
     candidate_conditions.extend(eligibility)
+    candidate_conditions.append(_remote_action_filter())
+    if not settings.wiki_storage_space_id:
+        candidate_conditions.append(func.lower(FileAuditEvent.extension) == "adoc")
     if cutoff_ms is not None:
         # Plan A: old backlog is retained terminally by the bounded main pass;
         # never let it consume remote locator capacity before that happens.
@@ -816,8 +828,8 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     # historically accumulated behind high-volume attachment uploads. Give
     # review/modify adoc events the first slots in the bounded locator; within
     # each tier the established fair retry ordering remains unchanged.
-    native_review = and_(FileAuditEvent.extension == "adoc",
-                         FileAuditEvent.action_view.in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT)))
+    native_review = and_(func.lower(FileAuditEvent.extension) == "adoc",
+                         func.trim(FileAuditEvent.action_view).in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT)))
     locate_order = (FileAuditEvent.last_attempt_at.is_(None).desc(),
                     FileAuditEvent.last_attempt_at.asc(), FileAuditEvent.gmt_create.desc())
     native_candidates = db.scalars(
@@ -1045,6 +1057,7 @@ def _refresh_confirmed_metadata(db, settings, summary):
         *_metadata_window(settings),
         FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed",
         FileAuditEvent.matched_node_id != "", FileAuditEvent.metadata_applied_at.is_(None),
+        _remote_action_filter(),
         FileAuditEvent.locate_attempts < settings.bridge_locator_max_attempts,
         or_(FileAuditEvent.next_locate_at.is_(None), FileAuditEvent.next_locate_at <= now),
         or_(FileAuditEvent.action_view.like("%知识库%"), FileAuditEvent.module_view == "团队空间"))

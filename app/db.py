@@ -3,7 +3,8 @@ import hashlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, case
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from .config import get_settings
@@ -26,6 +27,32 @@ def id_string(length: int = 128):
 
 class Base(DeclarativeBase):
     pass
+
+
+class ByteSize:
+    """Exact 64-bit sizes with an instant-add, no-backfill legacy fallback."""
+    _legacy_size: Mapped[int] = mapped_column('size', Integer, default=0)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    @hybrid_property
+    def size(self):
+        return (self.size_bytes or 0) if self._legacy_size == -1 else (self._legacy_size or 0)
+
+    @size.inplace.setter
+    def _set_size(self, value):
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63-1:
+            raise ValueError('invalid_byte_size')
+        large = value > 2**31-1
+        self.size_bytes = value if large else None
+        # -1 is an unambiguous extended-size marker. Old writers replacing it
+        # with any legitimate nonnegative size cannot leave a stale new value
+        # shadowing their update, including a transition to an empty file.
+        self._legacy_size = -1 if large else value
+
+    @size.inplace.expression
+    @classmethod
+    def _size_expression(cls):
+        return case((cls._legacy_size == -1, func.coalesce(cls.size_bytes, 0)), else_=cls._legacy_size).label('size')
 
 
 class Workspace(Base):
@@ -64,7 +91,7 @@ class WorkspaceRole(Base):
     display_name: Mapped[str] = mapped_column(String(128), default="")
 
 
-class Document(Base):
+class Document(ByteSize, Base):
     __tablename__ = "documents"
     __table_args__ = (
         Index("ix_documents_storage_dentry_id", "storage_dentry_id"),
@@ -88,7 +115,6 @@ class Document(Base):
     category: Mapped[str] = mapped_column(String(64), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
     url: Mapped[str] = mapped_column(String(1024), default="")
-    size: Mapped[int] = mapped_column(Integer, default=0)
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     is_folder: Mapped[bool] = mapped_column(Boolean, default=False)
     source_created_at: Mapped[str] = mapped_column(String(64), default="")
@@ -407,7 +433,7 @@ class StreamEvent(Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
-class FileAuditEvent(Base):
+class FileAuditEvent(ByteSize, Base):
     """Write-type operations from the exclusive audit trail (pillar B CDC)."""
     __tablename__ = "file_audit_events"
     __table_args__ = (
@@ -428,7 +454,6 @@ class FileAuditEvent(Base):
     module_view: Mapped[str] = mapped_column(String(64), default="")
     resource: Mapped[str] = mapped_column(String(512), default="")
     extension: Mapped[str] = mapped_column(String(32), default="")
-    size: Mapped[int] = mapped_column(Integer, default=0)
     target_space_id: Mapped[str] = mapped_column(String(64), default="", index=True)
     # Human-readable Wiki workspace name carried by the audit source. Unlike
     # targetSpaceId (an org-wide shared storage scope), this can be resolved

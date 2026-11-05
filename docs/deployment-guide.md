@@ -6,6 +6,8 @@
 
 **2026-11-04 本次批准模式：API、元数据 worker、月度 watcher 和统计 publisher。AI 自动评审、正文提取、模型正文传输、通知和 Stream 保持关闭。两端完成提交、合并、部署和准入检查后才正式传输。** 具体开关与受控恢复见 [主动推送方案](bi-center-push-and-metadata-collection-plan.md)。
 
+2026-11-05 首轮149库已结束，107成功、42失败等待用户再次批准断点续采；当前仅API、元数据worker和publisher运行，`KG_FULL_SCAN_ENABLED=false`、watcher停止。此次升级先显式运行 `python scripts/migrate_size_bytes.py`，对两表INSTANT加可空扩展列、不回填；仅失败续采默认预览、不得使用旧的重建周期命令。步骤、回滚展示限制及验收见 [失败库修复记录](reviews/2026-11-05-failed-scan-repair.md)。
+
 2026-11-02 公司内网部署沿用此暂停模式，使用已验收的固化镜像。用户指定以 IP 和 HTTP 联调，入口为 `http://10.70.32.32:39021`，本次暂不配置域名、证书或 Nginx 反代；后文 HTTPS 与反代章节适用于配置相应入口的环境。内网实际版本、Compose 文件、运维命令及联调状态见 [内网部署记录](reviews/2026-11-02-internal-deployment.md)。
 
 ## 一 责任分工与操作边界

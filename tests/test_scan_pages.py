@@ -273,3 +273,64 @@ def test_paged_scan_commits_inventory_revision_with_each_new_page(local,monkeypa
     with sessions() as db:assert db.get(FileInventoryVersion,'synthetic-space').revision==1
     assert finish(sessions,settings,first.run_id).status=='succeeded'
     with sessions() as db:assert db.get(FileInventoryVersion,'synthetic-space').revision==2
+
+
+def test_transient_forbidden_retries_same_page_without_repeating_committed_nodes(local,monkeypatch):
+    from app import scan_pages
+    from app.dingtalk_errors import from_response
+    import httpx
+    sessions,settings=local;calls=[];sleeps=[]
+    async def sleep(delay):sleeps.append(delay)
+    monkeypatch.setattr(scan_pages.asyncio,'sleep',sleep)
+    class Client:
+        def __init__(self,*a):pass
+        async def list_nodes(self,ws,operator,parent,token,**kwargs):
+            calls.append((parent,token))
+            if len(calls)==1:raise from_response(httpx.Response(403,json={'code':'Forbidden.Unknown','requestId':'synthetic-request'}),endpoint='wiki.nodes')
+            return {'items':[node('synthetic')],'next_token':''}
+    monkeypatch.setattr(service,'DingtalkClient',Client)
+    first=run(sessions,settings)
+    assert first.status=='running' and calls==[('root',''),('root','')] and sleeps==[2]
+    with sessions() as db:
+        assert db.get(SyncRun,first.run_id).documents_seen==1
+        assert db.get(ScanSeen,(first.run_id,'synthetic'))
+
+
+def test_rate_limit_retry_after_defers_all_libraries_without_spending_their_attempts(local,monkeypatch):
+    import json
+    from app.db import ScanCycle
+    from datetime import datetime
+    sessions,settings=local;settings=settings.model_copy(update={'watch_slice_size':2});month=datetime.now(api_usage.CST).strftime('%Y-%m');calls=[]
+    with sessions.begin() as db:
+        db.add(ScanCycle(month=month,target_workspace_ids_json='["a","b"]'))
+        db.add_all([ScanTask(month=month,workspace_id='a'),ScanTask(month=month,workspace_id='b')])
+    async def limited(db,s,ws,space,mode,**kwargs):
+        calls.append(ws)
+        row=SyncRun(run_id=kwargs['resume_run_id'],workspace_id=ws,status='failed',error_code='dingtalk_rate_limited:429',
+                    error_detail=json.dumps({'retryAfter':3600}))
+        db.add(row);db.commit();return row
+    monkeypatch.setattr(scan_scheduler,'watch_workspace',limited)
+    with sessions() as db:scan_scheduler.run_scan_slice(db,settings)
+    with sessions() as db:
+        assert scan_scheduler.run_scan_slice(db,settings)['status']=='rate_limit_wait'
+        assert db.get(ScanTask,(month,'b')).attempts==0
+        assert db.get(ScanTask,(month,'a')).next_attempt_at.replace(tzinfo=None) > (utcnow()+timedelta(minutes=59)).replace(tzinfo=None)
+    assert calls==['a']
+
+
+def test_root_detail_rate_limit_is_not_swallowed_by_workspace_listing_fallback(local,monkeypatch):
+    from app.dingtalk_errors import from_response
+    import httpx,json
+    sessions,settings=local;calls=[]
+    class Client:
+        def __init__(self,*a):pass
+        async def workspace_detail(self,*a):
+            calls.append(1)
+            raise from_response(httpx.Response(429,headers={'Retry-After':'3600'},json={'code':'Throttling.User'}),endpoint='wiki.workspaceDetail')
+        async def list_workspaces(self,*a,**k):raise AssertionError('must honor Retry-After before another request')
+    monkeypatch.setattr(service,'DingtalkClient',Client)
+    with sessions() as db,scan_budget('2026-11'):
+        result=asyncio.run(service.watch_workspace(db,settings,'synthetic-space',{'name':'C-Synthetic'}))
+        assert result.error_code=='dingtalk_rate_limited:429'
+        assert json.loads(result.error_detail)['retryAfter']==3600
+    assert calls==[1]

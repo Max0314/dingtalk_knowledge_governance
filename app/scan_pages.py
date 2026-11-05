@@ -10,6 +10,21 @@ from .db import Document, SyncRun, Workspace, utcnow
 from .integrations import IntegrationError
 from .metadata_mode import database_now, naive
 from .scan_models import ScanDirectory, ScanPageToken, ScanProgress, ScanSeen
+from .dingtalk_errors import diagnostic_detail
+
+
+async def _directory_page(client, settings, workspace_id, parent, token):
+    # Short retries stay on the exact same page, consume real API budgets,
+    # and never hold a SQL transaction. Long Retry-After goes to the scheduler.
+    async with asyncio.timeout(30):
+        for attempt in range(3):
+            try:
+                return await client.list_nodes(workspace_id, settings.dingtalk_sync_operator_id, parent, token, max_results=30)
+            except IntegrationError as exc:
+                delay = getattr(exc, 'retry_after', None) or 2 ** (attempt+1)
+                if not getattr(exc, 'retryable', False) or attempt == 2 or delay > 10:
+                    raise
+                await asyncio.sleep(delay)
 
 
 def cleanup_completed(db, limit=500):
@@ -100,7 +115,7 @@ async def _watch_paged(db, settings, workspace_id, space, mode, client, resume_r
     if run is None:
         run = SyncRun(run_id=run_id, status='running', mode=mode, workspace_id=workspace_id, workspace_name=(space or {}).get('name', ''))
         db.add(run)
-    run.status, run.error_code, run.finished_at = 'running', '', None
+    run.status, run.error_code, run.error_detail, run.finished_at = 'running', '', '', None
     db.commit()
     old_lock_wait = None
     try:
@@ -115,8 +130,10 @@ async def _watch_paged(db, settings, workspace_id, space, mode, client, resume_r
                 if not raw.get('root_node_id'):
                     try:
                         raw = await asyncio.wait_for(client.workspace_detail(workspace_id, settings.dingtalk_sync_operator_id), timeout=30)
-                    except IntegrationError:
-                        raw = None
+                    except IntegrationError as exc:
+                        if exc.status_code != 404 and exc.code != 'dingtalk_permission_denied':
+                            raise
+                        raw = None  # Personal-library detail compatibility only.
                     if not raw or not raw.get('root_node_id'):
                         token, tokens = '', set()
                         for _ in range(1000):
@@ -169,7 +186,7 @@ async def _watch_paged(db, settings, workspace_id, space, mode, client, resume_r
                     parent, incoming = directory.parent_id, directory.next_token
                     # Every SQL transaction (including read snapshots) ends before remote I/O.
                     db.commit()
-                    page = await asyncio.wait_for(client.list_nodes(workspace_id, settings.dingtalk_sync_operator_id, parent, incoming, max_results=30), timeout=30)
+                    page = await _directory_page(client, settings, workspace_id, parent, incoming)
                     items, next_token = _validated(page, workspace_id)
                     if next_token and (next_token == incoming or db.get(ScanPageToken, (run_id, parent, _token(next_token)))):
                         raise IntegrationError('scan_pagination_cycle', '目录分页游标重复，校准未完成。', 502)
@@ -208,7 +225,7 @@ async def _watch_paged(db, settings, workspace_id, space, mode, client, resume_r
                         ws.watch_seeded = True
                         progress.phase = 'complete'
                         run = db.get(SyncRun, run_id)
-                        run.status, run.error_code, run.finished_at = 'succeeded', '', utcnow()
+                        run.status, run.error_code, run.error_detail, run.finished_at = 'succeeded', '', '', utcnow()
                         db.commit()
                         return run
             return db.get(SyncRun, run_id)
@@ -226,7 +243,7 @@ async def _watch_paged(db, settings, workspace_id, space, mode, client, resume_r
         code = exc.code if isinstance(exc, IntegrationError) else 'scan_page_failed'
         run.status = 'paused' if code == 'dingtalk_scan_daily_reserved' else 'failed'
         run.error_code = f'{code}:{exc.status_code}'[:64] if isinstance(exc, IntegrationError) else code
-        run.error_detail = code if isinstance(exc, IntegrationError) else type(exc).__name__
+        run.error_detail = diagnostic_detail(exc)
         run.finished_at = utcnow()
         db.commit()
         return run
