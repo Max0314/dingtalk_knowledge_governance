@@ -15,7 +15,7 @@ AI 和部署人员先读 [工程约束](../AGENTS.md)、[部署指引](../docs/d
 | 采集查询索引 | `migrate_collector_lookup_index.py` | 显式部署前执行；仅增加下载键索引，在线LOCK=NONE且锁等待3秒，失败不强制重建表，不开启补采 |
 | 页面与扫描迁移 | `migrate_page_scan.py` | 新增断点/页面身份状态小表；组织缓存列仅INSTANT，身份缓存索引仅INPLACE/LOCK=NONE；一次从日汇总排页面身份任务，不扫描/回写文件大表，不开启全量 |
 | 大文件字节迁移 | `migrate_size_bytes.py` | documents/file_audit_events各新增可空BIGINT；MySQL旧size必须signed，仅INSTANT、3秒MDL，不回填/重建大表；先迁移再更新应用，watcher仍不启动 |
-| 失败任务续采预览 | `python -m app.scan_recovery --resume-failed --recovery-id <原ID> --resume-id <新授权ID> --reason <原因> --expected-failed 42 --expected-success 107` | 默认只预览；仅用户确认后添加`--apply`重开原周期失败任务并启动watcher。保留107成功任务、原run_id/游标/seen/调用计数；同授权ID幂等，不调用旧prepare重置整个周期 |
+| 失败任务续采预览 | `python -m app.scan_recovery --resume-failed --recovery-id <原ID> --resume-id <新授权ID> --reason <原因> --expected-failed 42 --expected-success 107` | 默认只预览；仅用户确认后添加`--apply`重开原周期失败任务，另行开启`KG_FULL_SCAN_ENABLED`并以原月`--cycle-month`启动watcher，命令本身不启动进程。保留107成功任务、原run_id/游标/seen/调用计数；同授权ID幂等，不调用旧prepare重置整个周期 |
 | 遗留全量基线 | `scan_uploader_baseline.py` | 非常规任务；默认拒绝，显式参数 `--approve-paid-baseline` + 全量开关，仍受共享额度限制 |
 | 评审/推送 | `run_review_once.py`、`notify_pump_once.py`、`send_notify_samples.py` | 外呼收费/真实消息；未批准不执行，样例不进入生产镜像 |
 | 数据维护 | `cleanup_*.py`、`reopen_dead_letters.py`、`switch_primary_baseline.py`、`seed_space_map.py`、`import_historical_snapshot.py`、`migrate_*.py` | 可能删除/改口径/重放/迁移；精确范围、备份、审批先于执行 |
