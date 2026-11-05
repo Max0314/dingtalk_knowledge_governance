@@ -76,3 +76,28 @@ def test_performance_reports_route_templates_without_ids(page):
     data = client.get('/api/v1/diagnostics/performance').json()
     assert any('{config_id}' in r['route'] for r in data['items'])
     assert '987654' not in str(data)
+
+
+def test_runtime_status_is_local_and_available_to_non_admin_without_loading_overview(page,monkeypatch):
+    client,_,_=page
+    def forbidden(*a,**k):pytest.fail('runtime status must not call external services')
+    monkeypatch.setattr(integrations,'outbound_client',forbidden)
+    response=client.get('/api/v1/runtime/status')
+    assert response.status_code==200
+    data=response.json()
+    assert isinstance(data['registered_workspaces'],int)
+    assert data['review_enabled'] is False and data['notify_enabled'] is False
+    assert data['scan']['total']==0
+
+
+def test_runtime_progress_includes_pending_and_excludes_other_recovery(page):
+    from datetime import datetime
+    from app.api_usage import CST
+    from app.db import ScanCycle,ScanTask
+    client,sessions,_=page;month=datetime.now(CST).strftime('%Y-%m')
+    with sessions.begin() as db:
+        db.add(ScanCycle(month=month,recovery_id='current'))
+        for workspace,status,recovery in [('pending','pending','current'),('failed','dead_letter','current'),('old','succeeded','prior')]:
+            db.add(ScanTask(month=month,workspace_id=workspace,status=status,recovery_id=recovery))
+    scan=client.get('/api/v1/runtime/status').json()['scan']
+    assert scan['total']==2 and scan['failed']==1 and scan['remaining']==2 and scan['succeeded']==0

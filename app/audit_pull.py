@@ -69,7 +69,8 @@ async def _fetch_pages(settings: Settings, start_ms: int, end_ms: int) -> list[d
     token = await client._token_value()
     rows: list[dict] = []
     cursor_g = cursor_b = None
-    async with httpx.AsyncClient(timeout=25) as http:
+    from .http_client import outbound_client
+    async with outbound_client(settings, timeout=25) as http:
         for _ in range(MAX_PAGES_PER_CYCLE):
             params = {"startDate": start_ms, "endDate": end_ms, "pageSize": PAGE_SIZE}
             if cursor_g:
@@ -87,7 +88,7 @@ async def _fetch_pages(settings: Settings, start_ms: int, end_ms: int) -> list[d
     return rows
 
 
-def _ingest(db: Session, rows: list[dict], *, include_reads: bool = True) -> dict:
+def _ingest(db: Session, rows: list[dict], *, include_reads: bool = True, retain_metadata: bool = False) -> dict:
     stored = reads = dupes = 0
     known: dict[str, FileAuditEvent] = {}
     if rows:
@@ -141,6 +142,10 @@ def _ingest(db: Session, rows: list[dict], *, include_reads: bool = True) -> dic
             workspace_name=str(row.get("workSpaceName") or "")[:255],
             ip_address=str(row.get("ipAddress") or "")[:64], platform=str(row.get("platformView") or "")[:32],
         )
+        if retain_metadata and int(time.time()*1000)-24*3600*1000 <= gmt <= int(time.time()*1000)+300000:
+            # Persist eligibility once. Waiting for quota must not age an
+            # already accepted event out of the collection queue.
+            event.retry_started_at = utcnow()
         db.add(event)
         known[event_key] = event
         stored += 1
@@ -263,7 +268,7 @@ async def _pull_metadata_window(db, settings):
                     raise ValueError()
             except (KeyError, TypeError, ValueError):
                 raise IntegrationError("audit_cursor_stalled", "审计分页游标未推进。", 502) from None
-        summary = _ingest(db, rows, include_reads=False)
+        summary = _ingest(db, rows, include_reads=False, retain_metadata=True)
         state = _state(db)
         state.last_run_at, state.last_rows = utcnow(), len(rows)
         state.last_gmt_create = max(state.last_gmt_create or 0, summary["max_gmt"])

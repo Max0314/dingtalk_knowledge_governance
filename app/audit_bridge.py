@@ -317,6 +317,9 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     if doc is None:
         doc = Document(node_id=node["node_id"], workspace_id=workspace_id, name=node.get("name") or "")
         db.add(doc)
+    elif settings.metadata_only and doc.is_deleted and _metadata_source_ms(db, doc) > event.gmt_create:
+        _finish(db, event, 'metadata_superseded')
+        return None
     elif workspace_id:
         doc.workspace_id = workspace_id
     for field in ("name", "category", "url"):
@@ -361,6 +364,8 @@ def _upsert_audit_document(db: Session, settings: Settings, event: FileAuditEven
     from .metadata_mode import database_now
     doc.metadata_applied_at = database_now(db)
     event.metadata_applied_at = doc.metadata_applied_at
+    if settings.metadata_only:
+        _mark_metadata_source(db, doc, int(_as_utc_ms(doc.metadata_applied_at)))
     if filled_creator and not getattr(settings, "metadata_only", False):
         identity: dict = {}
         if doc.uploader_key:
@@ -439,12 +444,17 @@ def _handle_delete_restore(db: Session, settings: Settings, event: FileAuditEven
     doc = db.get(Document, node_id)
     if doc is None:
         return
+    if settings.metadata_only and _metadata_source_ms(db, doc) > event.gmt_create:
+        _finish(db, event, 'metadata_superseded')
+        summary['superseded'] = summary.get('superseded', 0) + 1
+        return
     event.matched_node_id = node_id
     event.match_status = "confirmed"
     if getattr(settings, "metadata_only", False):
         from .metadata_mode import database_now
         doc.metadata_applied_at = database_now(db)
         event.metadata_applied_at = doc.metadata_applied_at
+        _mark_metadata_source(db, doc, event.gmt_create)
         doc.is_deleted = kind == "delete"
         doc.deleted_at = utcnow() if doc.is_deleted else None
         doc.watch_misses = 0
@@ -608,6 +618,28 @@ def _as_utc_ms(moment) -> float:
     return moment.timestamp() * 1000
 
 
+def _metadata_source_ms(db, doc):
+    from .db import MetadataEventWatermark
+    from .metadata_mode import naive
+    mark = db.get(MetadataEventWatermark, doc.node_id)
+    if mark and naive(mark.observed_at) == naive(doc.metadata_applied_at):
+        return mark.source_event_ms
+    # A directory scan or another writer has replaced the observation. Its
+    # clock is a baseline only; audit writes below retain their source order.
+    return _as_utc_ms(doc.metadata_applied_at) if doc.metadata_applied_at else 0
+
+
+def _mark_metadata_source(db, doc, source_ms):
+    from .db import MetadataEventWatermark
+    mark = db.get(MetadataEventWatermark, doc.node_id)
+    if mark is None:
+        mark = MetadataEventWatermark(node_id=doc.node_id)
+        db.add(mark)
+    mark.source_event_ms = source_ms
+    mark.observed_at = doc.metadata_applied_at
+    db.flush()  # next same-node event in this batch must see the source watermark
+
+
 def _expired(event: FileAuditEvent, now_ms: int) -> bool:
     """重试窗口基准：retry_started_at（死信重开时设置，received_at 作为原始
     入库审计字段保持不动）→ received_at → 事件时间。"""
@@ -675,25 +707,49 @@ def _metadata_window(settings):
     if not getattr(settings, 'metadata_only', False):
         return []
     now_ms=int(time.time()*1000)
-    return [FileAuditEvent.gmt_create >= now_ms-24*60*60*1000, FileAuditEvent.gmt_create <= now_ms+300000]
+    return [FileAuditEvent.gmt_create > 0, FileAuditEvent.gmt_create <= now_ms+300000,
+            or_(FileAuditEvent.gmt_create >= now_ms-24*60*60*1000,
+                FileAuditEvent.retry_started_at.is_not(None))]
 
 
 def _metadata_event_expired(db, settings, event):
     if not getattr(settings, 'metadata_only', False):
         return False
     now_ms=int(time.time()*1000)
-    if not event.gmt_create or not now_ms-24*60*60*1000 <= event.gmt_create <= now_ms+300000:
+    accepted = event.retry_started_at is not None or bool(event.gmt_create and event.gmt_create >= now_ms-24*60*60*1000)
+    if not event.gmt_create or event.gmt_create > now_ms+300000 or not accepted:
         _finish(db,event,'metadata_event_expired')
         return True
     return False
 
 
 def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool = True) -> dict:
+    from .dingtalk_rate import shared_lock
+    with shared_lock(settings, 'metadata-bridge') as handle:
+        if handle is None:
+            return {'events': 0, 'wiki_events': 0, 'matched': 0, 'confirmed': 0, 'walks': [], 'busy': True}
+        from .metadata_compensation import advance
+        if settings.metadata_only:
+            advance(db, settings)
+        return _process_audit_events(db, settings, drain_walks=drain_walks)
+
+
+def _process_audit_events(db: Session, settings: Settings, *, drain_walks: bool = True) -> dict:
     """One bridge cycle.「完成才消费」生命周期：wiki 事件唯有 locator 确认
     节点、文档入镜像、正文适配器具备定位条件才算 done；到期未确认转 dead_letter_*
     可观测死信。定位按"最久未尝试"轮转取额，最多三次并有退避；生产环境
     不触发整库巡走，目录校准交给独立月度任务。"""
     eligibility=_metadata_window(settings)
+    if settings.metadata_only:
+        # An attempt reservation can survive a crash before terminal writeback.
+        # Such rows must not remain forever excluded by the < max candidates.
+        interrupted = db.scalars(select(FileAuditEvent).where(
+            FileAuditEvent.processed.is_(False), *eligibility, _remote_action_filter(),
+            FileAuditEvent.locate_attempts >= settings.bridge_locator_max_attempts)
+            .order_by(FileAuditEvent.id).limit(100)).all()
+        for event in interrupted:
+            _finish(db, event, 'dead_letter_interrupted_limit')
+        db.commit()
     expired_count=0
     if eligibility:
         expired=db.scalars(select(FileAuditEvent).where(FileAuditEvent.processed.is_(False),
@@ -1018,7 +1074,10 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     for event in expiry_pool.values():
         if event.processed:
             continue
-        if _expired(event, now_ms):
+        # Metadata retries terminate after actual failed attempts. Local-only
+        # delete/restore mappings retain the existing finite waiting window.
+        time_limited = not settings.metadata_only or not event.retry_started_at or _action_kind(event) in ('delete', 'restore')
+        if time_limited and _expired(event, now_ms):
             reason = "dead_letter_no_doc" if event.match_status == "confirmed" else "dead_letter_unmatched"
             _finish(db, event, reason)
             summary["dead_letter"] = summary.get("dead_letter", 0) + 1
@@ -1042,7 +1101,7 @@ def _budget_is_waiting(db, settings, interface, summary):
 
 
 def _defer_budget(event, prior, exc, summary):
-    if exc.code not in ('dingtalk_budget_exhausted', 'dingtalk_budget_unavailable'):
+    if exc.code not in ('dingtalk_budget_exhausted', 'dingtalk_budget_unavailable', 'dingtalk_rate_unavailable'):
         return False
     event.locate_attempts, event.last_attempt_at = prior
     event.next_locate_at = getattr(exc, 'retry_at', None) or utcnow() + timedelta(seconds=60)
@@ -1078,7 +1137,7 @@ def _refresh_confirmed_metadata(db, settings, summary):
     try:
         nodes = asyncio.run(DingtalkClient(settings).batch_query_wiki_nodes(ids, settings.dingtalk_sync_operator_id))
     except IntegrationError as exc:
-        if exc.code in ('dingtalk_budget_exhausted', 'dingtalk_budget_unavailable'):
+        if exc.code in ('dingtalk_budget_exhausted', 'dingtalk_budget_unavailable', 'dingtalk_rate_unavailable'):
             for e in rows:
                 _defer_budget(e, prior[e.id], exc, summary)
             db.commit()

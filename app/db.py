@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, case
 from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.dialects.mysql import DATETIME as MySQLDateTime
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from .config import get_settings
@@ -478,6 +479,37 @@ class FileAuditEvent(ByteSize, Base):
     processed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     metadata_applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MetadataCompensationRun(Base):
+    __tablename__ = 'metadata_compensation_runs'
+    run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    since_ms: Mapped[int] = mapped_column(BigInteger)
+    until_ms: Mapped[int] = mapped_column(BigInteger)
+    max_event_id: Mapped[int] = mapped_column(Integer)
+    cursor_id: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(24), default='running', index=True)
+    enrolled: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MetadataCompensationItem(Base):
+    __tablename__ = 'metadata_compensation_items'
+    event_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    prior_attempts: Mapped[int] = mapped_column(Integer)
+    prior_processed: Mapped[bool] = mapped_column(Boolean)
+    prior_resolution: Mapped[str] = mapped_column(String(32))
+    prior_next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class MetadataEventWatermark(Base):
+    __tablename__ = 'metadata_event_watermarks'
+    node_id: Mapped[str] = mapped_column(id_string(), primary_key=True)
+    source_event_ms: Mapped[int] = mapped_column(BigInteger)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True).with_variant(MySQLDateTime(fsp=6), 'mysql'))
 
 
 class WatchPlan(Base):

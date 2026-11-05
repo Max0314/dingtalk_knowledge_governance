@@ -9,6 +9,9 @@ services:
     env_file: .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      KG_DINGTALK_RATE_DIR: /run/kg-dingtalk-rate
+    volumes:
+      - ${KG_DINGTALK_RATE_HOST_DIR:-./runtime/dingtalk-rate}:/run/kg-dingtalk-rate
     ports:
       # Loopback by default: the platform nginx on this host is the only
       # intended client; override KG_PUBLISH_BIND=0.0.0.0 only deliberately.
@@ -38,6 +41,9 @@ services:
     env_file: .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      KG_DINGTALK_RATE_DIR: /run/kg-dingtalk-rate
+    volumes:
+      - ${KG_DINGTALK_RATE_HOST_DIR:-./runtime/dingtalk-rate}:/run/kg-dingtalk-rate
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped
@@ -57,6 +63,9 @@ services:
     env_file: .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      KG_DINGTALK_RATE_DIR: /run/kg-dingtalk-rate
+    volumes:
+      - ${KG_DINGTALK_RATE_HOST_DIR:-./runtime/dingtalk-rate}:/run/kg-dingtalk-rate
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped
@@ -76,6 +85,9 @@ services:
     env_file: .env
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      KG_DINGTALK_RATE_DIR: /run/kg-dingtalk-rate
+    volumes:
+      - ${KG_DINGTALK_RATE_HOST_DIR:-./runtime/dingtalk-rate}:/run/kg-dingtalk-rate
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
     restart: unless-stopped

@@ -282,7 +282,7 @@ def test_official_search_payload_flows_to_metadata_mirror_without_review(collect
 
 
 @pytest.mark.parametrize('confirmed',[False,True])
-@pytest.mark.parametrize('code',['dingtalk_budget_exhausted','dingtalk_budget_unavailable'])
+@pytest.mark.parametrize('code',['dingtalk_budget_exhausted','dingtalk_budget_unavailable','dingtalk_rate_unavailable'])
 def test_quota_race_restores_prior_attempts_and_survives_new_session(collector,monkeypatch,confirmed,code):
     sessions,_,s=collector
     original_time=utcnow()-timedelta(minutes=20)

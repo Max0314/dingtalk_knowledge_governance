@@ -15,6 +15,8 @@ AI 和部署人员先读 [工程约束](../AGENTS.md)、[部署指引](../docs/d
 | 采集查询索引 | `migrate_collector_lookup_index.py` | 显式部署前执行；仅增加下载键索引，在线LOCK=NONE且锁等待3秒，失败不强制重建表，不开启补采 |
 | 页面与扫描迁移 | `migrate_page_scan.py` | 新增断点/页面身份状态小表；组织缓存列仅INSTANT，身份缓存索引仅INPLACE/LOCK=NONE；一次从日汇总排页面身份任务，不扫描/回写文件大表，不开启全量 |
 | 大文件字节迁移 | `migrate_size_bytes.py` | documents/file_audit_events各新增可空BIGINT；MySQL旧size必须signed，仅INSTANT、3秒MDL，不回填/重建大表；先迁移再更新应用，watcher仍不启动 |
+| 增量补偿表 | `migrate_metadata_compensation.py` | 只创建补偿批次、明细、节点水位三个小表，不ALTER/回填文档或审计表；水位观察时间DATETIME(6)，先迁移再部署新worker |
+| 增量补偿准备 | `python -m app.metadata_compensation --run-id <固定UUID> --since <含时区时间> --until <含时区时间> [--apply]` | 默认预览；apply仅冻结已入库事件范围，worker在共享桥接锁内每片100行推进。范围最多近7天、一事件最多获得一次新3次授权，保留旧尝试。不得用于重放8月历史或续采42个库 |
 | 失败任务续采预览 | `python -m app.scan_recovery --resume-failed --recovery-id <原ID> --resume-id <新授权ID> --reason <原因> --expected-failed 42 --expected-success 107` | 默认只预览；仅用户确认后添加`--apply`重开原周期失败任务，另行开启`KG_FULL_SCAN_ENABLED`并以原月`--cycle-month`启动watcher，命令本身不启动进程。保留107成功任务、原run_id/游标/seen/调用计数；同授权ID幂等，不调用旧prepare重置整个周期 |
 | 遗留全量基线 | `scan_uploader_baseline.py` | 非常规任务；默认拒绝，显式参数 `--approve-paid-baseline` + 全量开关，仍受共享额度限制 |
 | 评审/推送 | `run_review_once.py`、`notify_pump_once.py`、`send_notify_samples.py` | 外呼收费/真实消息；未批准不执行，样例不进入生产镜像 |

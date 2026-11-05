@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>钉钉知识库治理</title>
 <link rel="icon" type="image/png" href="assets/brand/app-icon.png?v=20260818a">
-<link rel="stylesheet" href="styles.css?v=20260818a">
+<link rel="stylesheet" href="styles.css?v=20261105-status">
 <script>
 /* 首屏并发：总览接口在这里就发出，而不是等 1MB 的 echarts 下载+解析完、
    app.js 执行、再串行等一次 auth/me 之后才开始。未登录时这次预取拿到 401
@@ -22,7 +22,7 @@ window.__boot=(!location.hash||/^#\/?overview$/.test(location.hash))?fetch('api/
       <div class="brand-text"><b>钉钉知识库治理</b><small>入库可追溯 · 质量可评审 · 增量可统计</small></div>
     </div>
     <div class="header-actions">
-      <span class="status-pill" id="scopePill" title="已扫描 / 可见 / 全公司知识库数">覆盖 —</span>
+      <span class="status-pill" id="scopePill" role="button" tabindex="0" title="登记数量与本轮同步进度分别统计；点击刷新">正在读取知识库状态…</span>
       <span id="userBox" class="user-box"><span class="avatar">·</span></span>
     </div>
   </header>
@@ -46,7 +46,7 @@ window.__boot=(!location.hash||/^#\/?overview$/.test(location.hash))?fetch('api/
     <div class="side-foot">正文不落库<br><small>评审期间仅内存 / tmpfs</small></div>
   </aside>
   <div class="sidebar-backdrop" id="backdrop"></div>
-  <main class="app-main"><div id="app" class="page-shell">
+  <main class="app-main"><div id="runtimeNotice" class="runtime-notice" role="status" hidden></div><div id="app" class="page-shell">
     <!-- 骨架屏按总览页的真实版式占位：加载态和完成态高度接近，页面不再从
          一张小卡片突然长到两屏，滚动条也就不会中途冒出来。 -->
     <div class="skeleton skeleton-head"></div>
@@ -60,6 +60,6 @@ window.__boot=(!location.hash||/^#\/?overview$/.test(location.hash))?fetch('api/
   </div></main>
 </div>
 <div id="toast" class="toast"></div>
-<script src="app.js?v=20261104-performance"></script>
+<script src="app.js?v=20261105-status"></script>
 </body>
 </html>

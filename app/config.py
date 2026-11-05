@@ -99,9 +99,11 @@ class Settings(BaseSettings):
     dingtalk_daily_limit: int = Field(default=100000, ge=1)
     dingtalk_monthly_limit: int = Field(default=120000, ge=1)
     dingtalk_nodes_monthly_limit: int = Field(default=100000, ge=1)
-    dingtalk_search_daily_limit: int = Field(default=500, ge=1)
+    dingtalk_search_daily_limit: int = Field(default=2000, ge=1)
     dingtalk_search_monthly_limit: int = Field(default=10000, ge=1)
     dingtalk_audit_daily_limit: int = Field(default=2000, ge=1)
+    dingtalk_qps: int = Field(default=5, ge=1, le=10)
+    dingtalk_rate_dir: str = ''
     bridge_walks_enabled: bool = False
     bridge_locator_max_attempts: int = Field(default=3, ge=1, le=3)
     bridge_locator_retry_seconds: int = Field(default=600, ge=60)

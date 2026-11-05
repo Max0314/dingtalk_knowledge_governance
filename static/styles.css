@@ -93,6 +93,9 @@ b{font-weight:600}
 .data-table tbody tr.rowlink:hover{background:#f8faff}
 .data-table td small,.data-table th small{color:var(--muted)}
 .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.data-table th.num,.data-table td.num{text-align:right}
+.runtime-notice{margin-bottom:16px;padding:10px 14px;border:1px solid #cbd5e1;border-radius:8px;background:#f1f5f9;color:#475569;font-size:13px;line-height:1.7}
+#scopePill{cursor:pointer}
 
 /* forms & buttons */
 .input,select.input{border:1px solid #d1d5db;border-radius:8px;padding:8px 11px;font-size:13.5px;background:#fff;color:var(--ink);min-width:0;font-family:inherit}

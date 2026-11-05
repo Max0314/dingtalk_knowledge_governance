@@ -35,7 +35,12 @@ class _HostTLSAsyncTransport(httpx.AsyncBaseTransport):
 
 def outbound_client(settings: Settings, *, timeout: float = 5.0,
                     follow_redirects: bool = False) -> httpx.AsyncClient:
-    options = {"timeout": timeout, "follow_redirects": follow_redirects}
+    async def pace(request):
+        if request.url.host in {'api.dingtalk.com', 'oapi.dingtalk.com'}:
+            from .dingtalk_rate import acquire
+            await acquire(settings)
+    options = {"timeout": timeout, "follow_redirects": follow_redirects,
+               "event_hooks": {"request": [pace]}}
     if not settings.tls_insecure_hosts:
         return httpx.AsyncClient(**options)
     transport = _HostTLSAsyncTransport(set(settings.tls_insecure_hosts.split(",")))

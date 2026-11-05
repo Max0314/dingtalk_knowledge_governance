@@ -62,6 +62,44 @@ const noteText=v=>!v?'':(NOTE_ZH[v]||(String(v).startsWith('fetch_failed')?'正�
 const COLOR={routine:'#2563eb',bulk:'#f59e0b'};
 function toast(msg){const x=document.querySelector('#toast');x.textContent=msg;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),2800)}
 
+function beijingTime(value){
+  if(!value)return '—';
+  const raw=String(value),hasZone=/Z$|[+-]\d\d:\d\d$/.test(raw);
+  const parsed=new Date(hasZone?raw:raw.replace(' ','T')+'Z');
+  if(Number.isNaN(parsed.getTime()))return '时间不可用';
+  return new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(parsed);
+}
+function scanErrorText(code){
+  if(String(code).startsWith('dingtalk_permission_denied'))return '历史403拒绝（旧记录未保留业务码，不能据此判断当前权限）';
+  if(String(code).startsWith('dingtalk_rate_limited'))return '接口限流，等待冷却';
+  if(String(code).startsWith('dingtalk_forbidden'))return '请求被拒绝，原因待核实';
+  if(code==='scan_page_failed')return '目录页入库失败';
+  return code||'未知错误';
+}
+let runtimeRequest=null;
+async function refreshRuntimeStatus(){
+  if(runtimeRequest)return runtimeRequest;
+  const pill=document.querySelector('#scopePill'),notice=document.querySelector('#runtimeNotice');
+  const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+  runtimeRequest=(async()=>{
+    try{
+      const response=await fetch('api/v1/runtime/status',{signal:controller.signal,cache:'no-store'});
+      if(response.status===401){renderLogin();return}
+      if(!response.ok)throw new Error('runtime_unavailable');
+      const d=await response.json();if(!state.authReady)return;
+      if(!Number.isInteger(d.registered_workspaces)||!d.scan)throw new Error('invalid_runtime');
+      state.runtime=d;
+      pill.textContent=`已登记 ${nf(d.registered_workspaces)} 库`;
+      pill.title=`本轮同步：成功 ${nf(d.scan.succeeded)} / 共 ${nf(d.scan.total)} 库，未完成 ${nf(d.scan.remaining)} 库（失败 ${nf(d.scan.failed)} 库）；登记不代表已同步完成。点击刷新。`;
+      if(notice){notice.hidden=false;notice.textContent=`知识库变动采集${d.audit_enabled?'运行中':'已暂停'}；AI 自动评审${d.review_enabled?'运行中':'已暂停，保留历史评审记录'}；通知${d.notify_enabled?'运行中':'已暂停'}。全量补采${d.scan.enabled?'已启用':'已暂停'}${d.scan.remaining?`，本轮 ${nf(d.scan.remaining)} 库未完成`:'。'}`;}
+    }catch(e){if(state.loginRedirecting)return;pill.textContent='知识库状态暂不可用';pill.title='点击重试';
+      if(notice){notice.hidden=false;notice.textContent='运行状态暂不可用，可点击顶部知识库状态重试。';}}
+    finally{clearTimeout(timer);runtimeRequest=null}
+  })();
+  pill.onclick=refreshRuntimeStatus;pill.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();refreshRuntimeStatus()}};
+  return runtimeRequest;
+}
+
 /* ---- charts ----
    一个 ResizeObserver 驱动全部图表，且只在宽度真的变了时重绘。旧实现里
    全局 window 'resize' 监听没有节流，滚动条每出现/消失一次就同步重绘所有
@@ -139,7 +177,6 @@ async function overview(){
      不允许它在用户已切到别页后回来覆盖当前 DOM。 */
   ensureCurrentNav(controller);
   const org=d.org_context||{};
-  document.querySelector('#scopePill').textContent=`已登记 ${d.metrics.workspace_count} 库`;
   shell('知识库总览','公司知识库全景：规模、增量与文档质量。月份按钉钉 createTime（Asia/Shanghai）归属。',`
   ${org.note?`<div class="banner">${esc(org.note)}</div>`:''}
   <div class="grid metrics">
@@ -599,9 +636,9 @@ async function diagnostics(){const controller=navAbort;
   }
   await Promise.allSettled([
     section('connectivity','/api/v1/diagnostics/connectivity',diagnosticItems),
-    section('usage','/api/v1/diagnostics/api-usage',u=>`<h2>接口额度与采集状态</h2><p class="hint">${esc(u.measurement)}。总预算 ${nf(u.limits.daily)} 次/日、${nf(u.limits.monthly)} 次/月；目录节点 ${nf(u.limits.nodes_monthly)} 次/月。</p><p>全量校准：${u.switches.full_scan?'已启用':'已暂停'} · 审计增量：${u.switches.audit_pull?'运行中':'已暂停'} · 自动评审：${u.switches.reviews?'已启用':'已暂停'}</p><div class="table-wrap"><table class="data-table"><thead><tr><th>统计期间</th><th>接口</th><th>请求次数</th></tr></thead><tbody>${u.items.map(x=>`<tr><td>${esc(x.period)}</td><td>${esc(x.interface)}</td><td>${nf(x.calls)}</td></tr>`).join('')}</tbody></table></div>`),
-    section('sync','/api/v1/diagnostics/sync-runs?status=failed',d=>`<h2>最近采集异常</h2>${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>错误码</th><th>时间</th></tr></thead><tbody>${d.items.slice(0,10).map(x=>`<tr><td>${esc(x.workspace_name||'—')}</td><td>${esc(x.error_code||'—')}</td><td>${esc(x.created_at||'—')}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无失败记录。</p>'}`),
-    section('notifications','/api/v1/notifications?limit=10',d=>`<h2>评审结果通知</h2><p>${d.notify_enabled?'已启用':'已暂停'}</p><p class="hint">暂停期间不发送通知。</p><div class="table-wrap"><table class="data-table"><thead><tr><th>时间</th><th>标题</th><th>状态</th><th>错误码</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${esc(x.created_at||'—')}</td><td>${esc(x.title||'—')}</td><td>${esc(x.status||'—')}</td><td>${esc(x.error_code||'—')}</td></tr>`).join('')}</tbody></table></div>`),
+    section('usage','/api/v1/diagnostics/api-usage',u=>`<h2>接口额度与采集状态</h2><p class="hint">${esc(u.measurement)}。总预算 ${nf(u.limits.daily)} 次/日、${nf(u.limits.monthly)} 次/月；目录节点 ${nf(u.limits.nodes_monthly)} 次/月。搜索 ${nf(u.limits.search_daily)} 次/日、${nf(u.limits.search_monthly)} 次/月；本机所有进程共享 ${nf(u.qps)} 次/秒限速。</p><p>全量校准：${u.switches.full_scan?'已启用':'已暂停'} · 审计增量：${u.switches.audit_pull?'运行中':'已暂停'} · 自动评审：${u.switches.reviews?'已启用':'已暂停'}</p><div class="table-wrap"><table class="data-table"><thead><tr><th>统计期间</th><th>接口</th><th class="num">请求次数</th></tr></thead><tbody>${u.items.map(x=>`<tr><td>${esc(x.period)}</td><td>${esc(x.interface)}</td><td class="num">${nf(x.calls)}</td></tr>`).join('')}</tbody></table></div>`),
+    section('sync','/api/v1/diagnostics/sync-runs?status=failed',d=>`<h2>历史采集异常</h2><p class="hint">以下保留失败发生时的记录，不代表当前连接或权限。全量暂停期间不会自动续采。时间为北京时间。</p>${d.items.length?`<div class="table-wrap"><table class="data-table"><thead><tr><th>知识库</th><th>失败说明</th><th>发生时间（北京时间）</th></tr></thead><tbody>${d.items.slice(0,10).map(x=>`<tr><td>${esc(x.workspace_name||'—')}</td><td>${esc(scanErrorText(x.error_code))}<br><small>${esc(x.error_code||'—')}</small></td><td>${esc(beijingTime(x.created_at))}</td></tr>`).join('')}</tbody></table></div>`:'<p class="hint">暂无失败记录。</p>'}`),
+    section('notifications','/api/v1/notifications?limit=10',d=>`<h2>评审结果通知</h2><p>${d.notify_enabled?'已启用':'已暂停'}</p><p class="hint">暂停期间不发送通知。</p><div class="table-wrap"><table class="data-table"><thead><tr><th>时间（北京时间）</th><th>标题</th><th>状态</th><th>错误码</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${esc(beijingTime(x.created_at))}</td><td>${esc(x.title||'—')}</td><td>${esc(x.status||'—')}</td><td>${esc(x.error_code||'—')}</td></tr>`).join('')}</tbody></table></div>`),
     section('performance','/api/v1/diagnostics/performance',d=>`<h2>页面接口性能</h2><p class="hint">本次进程运行期间的有界采样，接口耗时包含会话校验和等待；前台 SQL 列不含后台缓存刷新，刷新任务单独列出。</p><div class="table-wrap"><table class="data-table"><thead><tr><th>接口</th><th>采样数</th><th>p95 毫秒</th><th>平均前台 SQL 毫秒</th><th>缓存命中</th><th>失败</th></tr></thead><tbody>${d.items.map(x=>`<tr><td>${esc(x.route)}</td><td>${nf(x.samples)}</td><td>${x.p95_ms}</td><td>${x.db_avg_ms}</td><td>${nf(x.cache_hits)}</td><td>${nf(x.errors)}</td></tr>`).join('')}</tbody></table></div><h3>缓存刷新</h3>${d.refreshes.map(x=>`<p class="hint">${esc(x.endpoint)}：p95 ${x.p95_ms} 毫秒，平均 SQL ${x.db_avg_ms} 毫秒，失败 ${x.errors} 次。</p>`).join('')}`)
   ])
 }
@@ -739,4 +776,5 @@ document.querySelector('#backdrop').onclick=()=>document.body.classList.remove('
     state.authEnabled=d.auth_enabled;renderUser(d.user);state.authReady=true;
   }catch(e){renderLogin('service_unavailable');return}finally{clearTimeout(timer)}
   if(!location.hash)history.replaceState(null,'','#/overview');
+  refreshRuntimeStatus();
   render()})();

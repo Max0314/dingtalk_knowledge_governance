@@ -8,6 +8,8 @@
 
 2026-11-05 首轮149库已结束，107成功、42失败等待用户再次批准断点续采；当前仅API、元数据worker和publisher运行，`KG_FULL_SCAN_ENABLED=false`、watcher停止。此次升级先显式运行 `python scripts/migrate_size_bytes.py`，对两表INSTANT加可空扩展列、不回填；仅失败续采默认预览、不得使用旧的重建周期命令。步骤、回滚展示限制及验收见 [失败库修复记录](reviews/2026-11-05-failed-scan-repair.md)。
 
+同日后续页面/QPS/增量补偿发布：先运行 `python scripts/migrate_metadata_compensation.py` 创建三个小表，不修改已有大表；所有角色统一bind共享限速目录，不能使用独立tmpfs。内网宿主目录为`/run/kg/dingtalk-rate`、容器路径为`/run/kg-dingtalk-rate`，预建应用哈希对应qps和metadata-bridge文件并使kg-app与容器运行用户均可读写（目录0770、文件0660），不保存凭据。搜索日预算2000、月预算10000、共享5QPS，计数不清零。固定范围补偿准备命令只建立台账，worker每片有界推进；旧镜像不理解新入队资格，回滚时先暂停bridge，保留三表及原事件，不删除台账。操作与实际结果见 [发布记录](reviews/2026-11-05-ui-qps-compensation.md)。
+
 2026-11-02 公司内网部署沿用此暂停模式，使用已验收的固化镜像。用户指定以 IP 和 HTTP 联调，入口为 `http://10.70.32.32:39021`，本次暂不配置域名、证书或 Nginx 反代；后文 HTTPS 与反代章节适用于配置相应入口的环境。内网实际版本、Compose 文件、运维命令及联调状态见 [内网部署记录](reviews/2026-11-02-internal-deployment.md)。
 
 ## 一 责任分工与操作边界

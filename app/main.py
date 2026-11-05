@@ -1217,6 +1217,26 @@ def scoring_rule_rollback(config_id: int, history_id: int, request: Request, db:
     return {"config_id": row.id, "rolled_back_to": history_id, "version": row.version}
 
 
+@app.get('/api/v1/runtime/status')
+def runtime_status(db: Session = Depends(db_session)):
+    from .api_usage import CST
+    from .db import ScanCycle, ScanTask
+    settings = get_settings()
+    month = datetime.now(CST).strftime('%Y-%m')
+    cycle = db.get(ScanCycle, month)
+    counts = dict(db.execute(select(ScanTask.status, func.count()).where(
+        ScanTask.month==month, ScanTask.recovery_id==cycle.recovery_id)
+        .group_by(ScanTask.status)).all()) if cycle else {}
+    return {'registered_workspaces': db.scalar(select(func.count()).select_from(Workspace)),
+            'audit_enabled': settings.audit_pull_enabled and settings.bridge_enabled,
+            'review_enabled': settings.review_enabled and not settings.metadata_only,
+            'notify_enabled': settings.notify_enabled and not settings.metadata_only,
+            'scan': {'enabled': settings.full_scan_enabled, 'month': month,
+                     'status': cycle.status if cycle else 'not_started', 'total': sum(counts.values()),
+                     'succeeded': counts.get('succeeded', 0), 'failed': counts.get('dead_letter', 0),
+                     'remaining': sum(counts.values())-counts.get('succeeded', 0)}}
+
+
 @app.get("/api/v1/diagnostics/connectivity", dependencies=[Depends(require_admin)])
 def connectivity(db: Session = Depends(db_session)):
     from .diagnostics import local_status
@@ -1285,6 +1305,7 @@ def api_usage_status(db: Session = Depends(db_session)):
                          "bridge": settings.bridge_enabled, "reviews": settings.review_enabled,
                          "event_tree_walks": settings.bridge_walks_enabled},
             "scan_days": settings.scan_days,
+            "qps": settings.dingtalk_qps,
             "cycles": [{"month": c.month, "status": c.status} for c in db.scalars(select(ScanCycle)).all()],
             "scan_tasks": [{"month": t.month, "status": t.status, "attempts": t.attempts,
                             "error_code": t.error_code} for t in db.scalars(select(ScanTask)).all()]}

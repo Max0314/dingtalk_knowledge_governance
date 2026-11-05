@@ -30,6 +30,7 @@ from starlette.concurrency import run_in_threadpool
 from .config import Settings, get_settings
 from .http_client import outbound_client
 from .db import AuthSession, SessionLocal, utcnow
+from .integrations import IntegrationError
 
 COOKIE_NAME = "kg_session"
 STATE_COOKIE_NAME = "kg_login_state"
@@ -279,7 +280,7 @@ def register_auth_routes(app) -> None:
             if reason not in {"state_invalid", "state_expired", "code_missing", "corp_mismatch"}:
                 reason = "authorization_failed"
             return login_redirect(settings, target, reason)
-        except httpx.HTTPError:
+        except (httpx.HTTPError, IntegrationError):
             return login_redirect(settings, target, "authorization_unavailable")
         try:
             token = await run_in_threadpool(issue_session, user)
