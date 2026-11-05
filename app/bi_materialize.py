@@ -83,7 +83,7 @@ def scope_value(settings, projection, current, allow_empty=False):
             "baselineAttribution": "baseline_wins", "allowEmpty": allow_empty}
 
 
-def dirty_plan(db, settings, now=None):
+def dirty_plan(db, settings, now=None, *, allow_pending_projection=False):
     now = now or utcnow()
     projection = db.get(BIProjectionState, 1)
     if not projection or not projection.seed_complete:
@@ -91,7 +91,7 @@ def dirty_plan(db, settings, now=None):
     state = db.get(BIPushState, 1)
     if not state or state.workspace_registry_ready_at is None:
         raise SnapshotUnavailable("workspace_metadata_unready")
-    if db.scalar(select(BIDirtyNode.node_id).limit(1)):
+    if not allow_pending_projection and db.scalar(select(BIDirtyNode.node_id).limit(1)):
         raise SnapshotUnavailable("projection_pending")
     headers = partition_headers(db)
     scopes = db.execute(select(BIDirtyScope.scope_key, BIDirtyScope.generation).where(~BIDirtyScope.scope_key.like('page_month/%'))).all()
@@ -139,9 +139,9 @@ def _workspace_rows(db, ids, names, current):
     return result
 
 
-def publish_partitions(db, settings, versions, now=None, allow_empty=False):
+def publish_partitions(db, settings, versions, now=None, allow_empty=False, *, allow_pending_projection=False):
     """No HTTP: all dependent partition updates commit as one generation."""
-    plan = dirty_plan(db, settings, now)
+    plan = dirty_plan(db, settings, now, allow_pending_projection=allow_pending_projection)
     names, projection, now = plan["names"], plan["projection"], plan["now"]
     parts = {}
     current = now.astimezone(CST).strftime("%Y-%m")

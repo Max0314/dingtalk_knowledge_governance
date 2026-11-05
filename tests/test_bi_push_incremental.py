@@ -314,3 +314,43 @@ def test_verified_recovery_ack_loss_does_not_create_another_full_baseline(local)
         state=db.get(BIPushState,1)
         assert not state.force_baseline and state.send_not_before is None
         assert queue_current(db) is None
+
+
+def test_build_publishes_committed_projection_while_ingestion_stays_pending(local,monkeypatch):
+    from app import bi_publisher
+    from app.bi_materialize import dirty_plan
+    sessions,bind,settings=local
+    with sessions.begin() as db:queue_current(db)
+    ack_claim(sessions)
+    # One batch has completed; another arriving during identity preparation
+    # must neither block that batch nor leak unprojected facts into its frame.
+    with sessions.begin() as db:db.get(Document,'live-b').source_created_at='2026-11-04T09:00:00+08:00'
+    with sessions.begin() as db:assert project_dirty(db)['changedNodes']==1
+    async def no_remote(*a):pass
+    async def identities(*a):
+        with sessions.begin() as db:
+            db.add(Document(node_id='next-batch',workspace_id='space-a',name='synthetic',source_creator_key='synthetic-union-b',
+                            source_creator_kind='union_id',source_created_at='2026-11-04T09:00:00+08:00'))
+        return {'2026-11':VERSION}
+    monkeypatch.setattr(bi_publisher,'refresh_registry',no_remote)
+    monkeypatch.setattr(bi_publisher,'refresh_versions',no_remote)
+    monkeypatch.setattr(bi_publisher,'prepare_identities',identities)
+    result=asyncio.run(bi_publisher.build_cycle(sessions,settings,object()))
+    assert result['queued']
+    with sessions() as db:
+        assert db.get(BIDirtyNode,'next-batch')
+        with pytest.raises(SnapshotUnavailable,match='projection_pending'):dirty_plan(db,settings)
+        v=materialize_parts(read_partitions(db),'11111111-1111-4111-8111-111111111111',2)
+        assert v['data']['summary']['totalFileCount']==2
+    first=ack_claim(sessions)['request'];validate_delta(first)
+    # The queued fact appears exactly once after the next bounded projection.
+    with sessions.begin() as db:
+        assert project_dirty(db)['changedNodes']==1
+        publish_partitions(db,settings,{'2026-11':VERSION})
+    with sessions.begin() as db:assert queue_current(db)
+    second=ack_claim(sessions)['request'];validate_delta(second)
+    assert second['baseSequence']==first['sequence']
+    with sessions() as db:
+        assert not db.get(BIDirtyNode,'next-batch')
+        v=materialize_parts(read_partitions(db),'11111111-1111-4111-8111-111111111111',3)
+        assert v['data']['summary']['totalFileCount']==3

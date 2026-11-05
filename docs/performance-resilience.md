@@ -63,6 +63,8 @@ PDF 提取隔离子进程，20 秒超时，Linux CPU 15 秒、地址空间 384Mi
 
 2026-11-04 新增主动统计链路：一次按主键游标播种后，由事务内 dirty node 队列更新本地日/月预聚合；空闲不读取 documents/historical_file_nodes，不读取员工分区JSON，不改写相同统计。仅受影响分区生成增量，初始或已核实灾备恢复才发送基线。publisher 独立 profile `statistics`，限1 CPU/384MiB。源端和BI均将不可变大报文与可变状态分表，适用于MySQL FULL行镜像，重试不重复写整份JSON。首次补采只预估一次预算，按冻结监控范围逐库执行，不改数据库binlog配置。详见 [实施方案§17](bi-center-push-and-metadata-collection-plan.md#17-2026-11-04-补充最新主线先验收后传输增量与数据库负载)。
 
+持续补采时，publisher在共享发布锁内先按原每片最多500节点完成一批投影，再发布该批已提交的日/月聚合。构建/身份HTTP期间同一发布者不再推进投影，采集新到节点只进dirty队列、留待下一批，不能因队列尚未全空而阻止当前一致聚合发布。仅该持锁构建路径显式允许待投影节点；直接调用分区构建默认仍拒绝projection_pending。原始大表仅读取本批dirty节点主键，投影频率和批量不变，无额外全表重算。
+
 采集端生产桥接不再按标题查询本地文档/历史表，也不为已禁用的整库回退枚举文档库存；只保留确证生命周期与远端nodeId定位。演示模式的旧候选诊断不进入生产。诊断页的受管库列表从Workspace小表查询，并以workspace_id索引EXISTS判断是否有镜像。删除/恢复按下载键的查询使用新增storage_dentry_id索引，重复键或冲突生命周期不任选节点。部署先运行 `python scripts/migrate_collector_lookup_index.py`；MySQL仅允许INPLACE/LOCK=NONE，元数据锁等待3秒，失败中止，不降级为阻塞建索引。
 
 定位批次截止时保留已完成结果，取消并收回未完成任务；只有实际取得并发槽位的事件才持久化一次尝试。HTTP断连、超时、坏JSON/节点形状逐事件失败，沿用10/20分钟退避及最多3次；待并发槽位的事件不消耗次数。统计发送保留非JSON网关错误的HTTP状态和Retry-After，错误确认进入源级阻断；丢失ACK、过期租约或ACK后数据库回写失败，使用原UUID和不可变报文重试，不重复累计或重扫文档。验证与发布结果见 [采集读取修复](reviews/2026-11-04-collector-bounded-reads.md)。

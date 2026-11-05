@@ -137,15 +137,19 @@ async def refresh_versions(sessions, remote):
 
 
 async def build_cycle(sessions, settings, remote, allow_empty=False):
+    # Caller holds publisher_lock: this process is the only aggregate projector
+    # and cannot advance projections during identity HTTP. Newly collected raw
+    # nodes stay queued for the next batch; they must not starve publication of
+    # the current, already committed and internally consistent aggregate view.
     await refresh_registry(sessions, settings)
     await refresh_versions(sessions, remote)
     with sessions() as db:
-        plan = dirty_plan(db, settings)
+        plan = dirty_plan(db, settings, allow_pending_projection=True)
         inputs = {m: month_inputs(db, m, plan["names"], plan["projection"], plan["now"], plan["unconfirmed"]) for m in plan["months"]}
     versions = await prepare_identities(sessions, inputs, remote) if inputs else {}
     with sessions.begin() as db:
         # Lock is held by the caller: projector and partition builder cannot race.
-        result = publish_partitions(db, settings, versions, allow_empty=allow_empty)
+        result = publish_partitions(db, settings, versions, allow_empty=allow_empty, allow_pending_projection=True)
     with sessions.begin() as db:
         # Manifest and partition payloads come from this one committed read view.
         result["queued"] = bool(queue_current(db))
