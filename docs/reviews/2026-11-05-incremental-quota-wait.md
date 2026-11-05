@@ -22,6 +22,15 @@
 
 46项不同Python定向用例通过（api_quota_safety13、collector_bounded_reads26、metadata_only_collection7），按变更复用已通过的额度测试，并补跑受影响的采集/元数据组33项。compileall与diff检查通过。独立review指出confirmed时间戳重复写与等待队列阻挡本地删除两项边界，均已修正并加回归，最终复审通过。无前端或Compose结构改动，不重复前端测试；发布仍检查Compose配置解析。
 
+### 生产验收
+
+- 业务提交6fc02bc8dcbb4298bd0c9fa1804b94fc315bd6ee已推送功能分支并快进合并GitHub main。固定镜像knowledge-governance-internal:6fc02bc8dcbb，ID sha256:c124a9511640723fd7eb7ca5d7e2c4baa6c420e167b613f98cdaa62b58b5ab7c；无依赖、结构迁移或额度配置修改。
+- 2026-11-05 09:18 CST按worker→API→publisher更新，三角色同SHA、running、重启0，API healthy，health/ready均200；近期日志无Traceback、采集/发送失败信号。两份修改业务文件与冻结Git archive字节一致，Compose配置解析通过，.env与备份字节相同。
+- 容器内使用独立内存SQLite合成两种事件验证部署产物：各原尝试2次，在额度满状态下连续两轮仍为2次、未结束，事件UPDATE为0、外呼0；没有填满生产额度或向生产插入合成事件。真实当天搜索计数5/500，额度门禁显示可继续；不把隔离测试描述为线上真实耗尽场景。
+- 真实审计最近成功01:18:35 UTC（09:18:35 CST），增量/桥接/推送均开启；源issued/acked145、接收145、常用6月看板145，stateHash一致为48c71b04a9f8f1240b4841f4ea982265aa5c42346841ac0527765c6856fa9a8a，无blocked/force_baseline，24月看板143沿用小时刷新窗口，两种实际预计算响应均200。
+- 全量开关关闭、watcher未运行、scan_cycle/recovery/progress均0；AI/通知/正文/模型传输/Stream关闭。评审实例2535、任务2923、通知2519均未改变；历史缺口、死信和元数据资格规则保留。
+- 发布前配置及版本备份/var/backups/knowledge-governance/quota-wait-20261105T091814，保留4177410旧固定镜像；运行版本记录标记accepted_incremental_quota_wait。回滚可恢复备份Compose并按既有角色启旧镜像，不清调用计数、不重放历史事件。
+
 ## bi_center 状态与存储检查
 
 主动接收增量分区、幂等校验、本地预计算看板及实际后台维护修复已于11月4日提交并合并GitHub/GitLab main。运行d64c527，镜像sha256:6dda319a33a9bc2881e86b24fc973431744b7cc4cb5769c9cdeb01cfce89a78e；11月5日现场healthy，接收实现及后台启动文件与服务器checkout字节一致。本次无需重复部署bi_center。
