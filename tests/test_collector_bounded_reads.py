@@ -204,3 +204,126 @@ def test_empty_dingtalk_results_keep_legacy_null_compatibility(monkeypatch,paylo
     c=integrations.DingtalkClient(s)
     assert asyncio.run(c.search_dentries('synthetic','synthetic-operator'))==[]
     assert asyncio.run(c.batch_query_wiki_nodes(['synthetic-node'],'synthetic-operator'))==[]
+
+
+@pytest.mark.parametrize('confirmed',[False,True])
+@pytest.mark.parametrize('code',['dingtalk_budget_exhausted','dingtalk_budget_unavailable'])
+def test_quota_race_restores_prior_attempts_and_survives_new_session(collector,monkeypatch,confirmed,code):
+    sessions,_,s=collector
+    original_time=utcnow()-timedelta(minutes=20)
+    retry_at=utcnow()+timedelta(minutes=5)
+    calls=[]
+    class Client:
+        def __init__(self,*a):pass
+        async def search_dentries(self,*a,**k):
+            calls.append('search')
+            exc=integrations.IntegrationError(code,'synthetic quota',429)
+            exc.retry_at=retry_at
+            raise exc
+        async def batch_query_wiki_nodes(self,*a,**k):
+            calls.append('batch')
+            exc=integrations.IntegrationError(code,'synthetic quota',429)
+            exc.retry_at=retry_at
+            raise exc
+    monkeypatch.setattr(audit_bridge,'DingtalkClient',Client)
+    add_event(sessions,locate_attempts=2,last_attempt_at=original_time,
+              matched_node_id='known' if confirmed else '',match_status='confirmed' if confirmed else '')
+    for _ in range(2):
+        with sessions() as db:
+            result=audit_bridge.process_audit_events(db,s,drain_walks=False)
+            e=db.scalar(select(FileAuditEvent))
+            assert e.locate_attempts==2 and not e.processed and not e.resolution
+            assert e.last_attempt_at.replace(tzinfo=None)==original_time.replace(tzinfo=None)
+            assert e.next_locate_at.replace(tzinfo=None)==retry_at.replace(tzinfo=None)
+    assert len(calls)==1
+    # Eligibility resumes without changing the allowance; a genuine failure
+    # can still spend the remaining third attempt and reach its original end.
+    async def network_failure(*a,**k):raise httpx.ConnectError('synthetic disconnect')
+    monkeypatch.setattr(Client,'search_dentries',network_failure)
+    monkeypatch.setattr(Client,'batch_query_wiki_nodes',network_failure)
+    with sessions.begin() as db:db.scalar(select(FileAuditEvent)).next_locate_at=utcnow()-timedelta(seconds=1)
+    with sessions() as db:
+        audit_bridge.process_audit_events(db,s,drain_walks=False)
+        e=db.scalar(select(FileAuditEvent))
+        assert e.locate_attempts==3 and e.processed
+        assert e.resolution==('dead_letter_metadata_unavailable' if confirmed else 'dead_letter_locator_limit')
+
+
+@pytest.mark.parametrize('confirmed',[False,True])
+def test_known_exhaustion_never_calls_provider_or_writes_events(collector,monkeypatch,confirmed):
+    from app.db import ApiUsage
+    from app.api_usage import CST
+    from datetime import datetime
+    sessions,bind,s=collector
+    interface='wiki.batchQuery' if confirmed else 'storage.search'
+    s=s.model_copy(update={'dingtalk_daily_limit':3,'dingtalk_search_daily_limit':3})
+    with sessions.begin() as db:
+        db.add(ApiUsage(period=datetime.now(CST).strftime('day:%Y-%m-%d'),interface=interface,calls=3))
+    class Client:
+        def __init__(self,*a):raise AssertionError('blocked quota must skip provider')
+    monkeypatch.setattr(audit_bridge,'DingtalkClient',Client)
+    add_event(sessions,locate_attempts=2,matched_node_id='known' if confirmed else '',match_status='confirmed' if confirmed else '')
+    writes=[]
+    def observe(_,__,statement,*a):
+        if statement.lower().startswith('update file_audit_events'):writes.append(statement)
+    event.listen(bind,'before_cursor_execute',observe)
+    try:
+        for _ in range(2):
+            with sessions() as db:
+                result=audit_bridge.process_audit_events(db,s,drain_walks=False)
+                e=db.scalar(select(FileAuditEvent))
+                assert result.get('budget_wait_until')
+                assert e.locate_attempts==2 and not e.processed and e.next_locate_at is None
+        assert writes==[]
+    finally:event.remove(bind,'before_cursor_execute',observe)
+
+
+def test_quota_after_successful_search_keeps_other_completed_event(collector,monkeypatch):
+    sessions,_,s=collector
+    retry_at=utcnow()+timedelta(minutes=5)
+    class Client:
+        def __init__(self,*a):pass
+        async def search_dentries(self,name,*a,**k):return [{'dentry_uuid':name,'name':name}]
+        async def batch_query_wiki_nodes(self,ids,*a):
+            if ids==['waiting.adoc']:
+                exc=integrations.IntegrationError('dingtalk_budget_exhausted','synthetic quota',429)
+                exc.retry_at=retry_at
+                raise exc
+            return [{'node_id':'good.adoc','workspace_id':'synthetic-space','name':'good.adoc',
+                     'created_at':utcnow().isoformat(),'extension':'adoc','has_children':False}]
+    monkeypatch.setattr(audit_bridge,'DingtalkClient',Client)
+    add_event(sessions,'good',resource='good.adoc',biz_id='11')
+    add_event(sessions,'waiting',resource='waiting.adoc',biz_id='22',locate_attempts=2)
+    with sessions() as db:
+        audit_bridge.process_audit_events(db,s,drain_walks=False)
+        rows={r.event_key:r for r in db.scalars(select(FileAuditEvent))}
+        assert rows['good'].processed and db.get(Document,'good.adoc') is not None
+        assert not rows['waiting'].processed and rows['waiting'].locate_attempts==2
+        assert rows['waiting'].next_locate_at.replace(tzinfo=None)==retry_at.replace(tzinfo=None)
+
+
+def test_quota_waiters_cannot_starve_confirmed_local_delete(collector,monkeypatch):
+    from app.db import ApiUsage
+    from app.api_usage import CST
+    from datetime import datetime
+    sessions,_,s=collector
+    s=s.model_copy(update={'dingtalk_daily_limit':1})
+    monkeypatch.setattr(audit_bridge,'BATCH',2)
+    monkeypatch.setattr(audit_bridge,'CONFIRM_FINISH_BUDGET',2)
+    with sessions.begin() as db:
+        db.add(ApiUsage(period=datetime.now(CST).strftime('day:%Y-%m-%d'),interface='total',calls=1))
+        db.add(Document(node_id='delete-me',workspace_id='synthetic-space',name='synthetic'))
+    stamp=int(utcnow().timestamp()*1000)
+    for i in range(5):
+        add_event(sessions,'wait-'+str(i),biz_id='',gmt_create=stamp,match_status='confirmed',matched_node_id='waiting')
+    add_event(sessions,'delete',biz_id='',gmt_create=stamp+1,action_view='知识库删除',
+              match_status='confirmed',matched_node_id='delete-me',last_attempt_at=utcnow())
+    class Client:
+        def __init__(self,*a):raise AssertionError('local delete must not call remote')
+    monkeypatch.setattr(audit_bridge,'DingtalkClient',Client)
+    with sessions() as db:
+        audit_bridge.process_audit_events(db,s,drain_walks=False)
+        e=db.scalar(select(FileAuditEvent).where(FileAuditEvent.event_key=='delete'))
+        assert e.processed and e.resolution=='deleted' and db.get(Document,'delete-me').is_deleted
+        waiters=db.scalars(select(FileAuditEvent).where(FileAuditEvent.event_key.like('wait-%'))).all()
+        assert all(not r.processed and r.last_attempt_at is None and r.locate_attempts==0 for r in waiters)

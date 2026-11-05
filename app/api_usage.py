@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import logging
 
 from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 
 from .config import Settings
 from .db import ApiUsage, SessionLocal, utcnow
@@ -23,11 +24,7 @@ def scan_budget(month: str):
         scan_month.reset(token)
 
 
-def reserve_call(settings: Settings, interface: str) -> None:
-    if settings.demo_mode:
-        return
-    from .integrations import IntegrationError
-    now = datetime.now(CST)
+def _limits(settings, interface, now):
     day, month = now.strftime("day:%Y-%m-%d"), now.strftime("month:%Y-%m")
     scanning = bool(scan_month.get())
     limits = [(day, "total", max(0, settings.dingtalk_daily_limit - (settings.scan_daily_reserve if scanning else 0))),
@@ -41,6 +38,45 @@ def reserve_call(settings: Settings, interface: str) -> None:
     limits += [(day, interface, dl), (month, interface, ml)]
     if scan_month.get():
         limits.append(("scan:" + scan_month.get(), "total", settings.scan_max_api_calls))
+    return limits
+
+
+def _reset_at(period, now):
+    if period.startswith('day:'):
+        reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
+    else:
+        reset = (now.replace(day=28) + timedelta(days=4)).replace(day=1, hour=0, minute=0, second=1, microsecond=0)
+    return reset.astimezone(timezone.utc)
+
+
+def budget_wait_until(db, settings, interface):
+    """Cheap advisory read; reserve_call remains the atomic final gate."""
+    if settings.demo_mode:
+        return None
+    from .integrations import IntegrationError
+    now = datetime.now(CST)
+    limits = _limits(settings, interface, now)
+    try:
+        # Independent short snapshot: never roll back local event changes when
+        # this advisory read fails, or retain a caller's stale quota snapshot.
+        with Session(bind=db.get_bind()) as reader:
+            rows = reader.scalars(select(ApiUsage).where(ApiUsage.period.in_({p for p, _, _ in limits}),
+                                                         ApiUsage.interface.in_({'total', interface}))).all()
+            calls = {(r.period, r.interface): r.calls for r in rows}
+    except Exception as exc:
+        raise IntegrationError('dingtalk_budget_unavailable', '调用量计数不可用，已停止钉钉请求。', 503) from exc
+    resets = [_reset_at(p, now) for p, name, limit in limits if calls.get((p, name), 0) >= limit]
+    return max(resets) if resets else None
+
+
+def reserve_call(settings: Settings, interface: str) -> None:
+    if settings.demo_mode:
+        return
+    from .integrations import IntegrationError
+    now = datetime.now(CST)
+    day, month = now.strftime("day:%Y-%m-%d"), now.strftime("month:%Y-%m")
+    scanning = bool(scan_month.get())
+    limits = _limits(settings, interface, now)
     try:
         with SessionLocal.begin() as db:
             for period, name, limit in limits:
@@ -61,7 +97,9 @@ def reserve_call(settings: Settings, interface: str) -> None:
                         raise IntegrationError('dingtalk_scan_daily_reserved', '本日补采额度已用尽，预留额度供增量采集；次日继续断点。', 429)
                     if scanning and name == 'total' and period == month and settings.scan_monthly_reserve:
                         raise IntegrationError('dingtalk_budget_scan_monthly_reserved', '补采触及月度增量预留额度，已停止。', 429)
-                    raise IntegrationError("dingtalk_budget_exhausted", "钉钉接口调用预算已达上限，已停止外部请求。", 429)
+                    error = IntegrationError("dingtalk_budget_exhausted", "钉钉接口调用预算已达上限，已停止外部请求。", 429)
+                    error.retry_at = _reset_at(period, now)
+                    raise error
     except IntegrationError:
         raise
     except Exception as exc:

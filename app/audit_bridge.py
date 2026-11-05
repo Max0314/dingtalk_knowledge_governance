@@ -28,7 +28,7 @@ import time
 import uuid as uuid_module
 import httpx
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, func
 from sqlalchemy.orm import Session
 
 from datetime import datetime, timedelta, timezone
@@ -38,6 +38,7 @@ from .db import (BridgeWalk, Document, FileAuditEvent, HistoricalFileNode, Histo
                  ReviewJob, SpaceMap, Workspace, utcnow)
 from .fileclass import classify, review_classes
 from .integrations import BiCenterClient, DingtalkClient, IntegrationError
+from .api_usage import budget_wait_until
 from .service import MODIFY_MERGE_WINDOW_SECONDS, watch_workspace, workspace_name_is_ignored
 
 logger = logging.getLogger("kg.bridge")
@@ -768,16 +769,28 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     # 事件不能只靠 BATCH 窗口推进——纯 DB 操作按全局取额完成。取额按
     # 最久未尝试轮转（codex 第七轮 P0）：50 个"文档迟迟不来"的老事件
     # 不得堵死后来者，每次尝试盖 last_attempt_at 章自然转到队尾。
+    finish_eligibility = []
+    if settings.metadata_only:
+        # Remote waiters have their own bounded refresh queue. Keep them out
+        # of local finish slots so they cannot starve deletes/restores when
+        # the first BATCH and all finish slots are occupied by quota waiters.
+        remote_action = or_(func.trim(FileAuditEvent.action_view).in_(tuple(REVIEW_ACTIONS_EXACT | MODIFY_ACTIONS_EXACT)),
+                            *(FileAuditEvent.action_view.contains(k) for k in METADATA_ACTIONS))
+        local_action = or_(*(FileAuditEvent.action_view.contains(k) for k in IGNORE_ACTIONS + RESTORE_ACTIONS + DELETE_ACTIONS))
+        finish_eligibility = [or_(FileAuditEvent.metadata_applied_at.is_not(None), local_action, ~remote_action)]
     confirmed_pending = db.scalars(
         select(FileAuditEvent)
-        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed", *eligibility)
+        .where(FileAuditEvent.processed.is_(False), FileAuditEvent.match_status == "confirmed", *eligibility, *finish_eligibility)
         .order_by(FileAuditEvent.last_attempt_at.is_(None).desc(),
                   FileAuditEvent.last_attempt_at.asc(),
                   FileAuditEvent.gmt_create.asc())
         .limit(CONFIRM_FINISH_BUDGET)).all()
     finish_stamp = utcnow()
     for event in confirmed_pending:
-        event.last_attempt_at = finish_stamp
+        # Metadata refresh owns its remote-attempt rotation below. Local
+        # finishing must not rewrite a quota-waiting event every bridge tick.
+        if not settings.metadata_only or _action_kind(event) in ('delete', 'restore', 'ignore', 'unknown'):
+            event.last_attempt_at = finish_stamp
         _try_finish_confirmed(db, event, settings, summary, queued, cutoff_ms)
 
     # Locator: a wiki-search by file name gives the doorbell an address, and
@@ -823,6 +836,9 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
             select(FileAuditEvent).where(*fill_conditions)
             .order_by(*locate_order).limit(WIKI_LOCATE_BUDGET - len(candidates))).all()
     if settings.bridge_locator_enabled and candidates:
+        if _budget_is_waiting(db, settings, 'storage.search', summary):
+            candidates = []
+    if settings.bridge_locator_enabled and candidates:
         client = DingtalkClient(settings)
         operator = settings.dingtalk_sync_operator_id
         # Uploaded files belong to the configured shared storage space. Native
@@ -863,6 +879,7 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
                 async with semaphore:
                     # Reserve only when a concurrency slot is actually available.
                     # Waiting tasks canceled at the deadline did not call DingTalk.
+                    prior = (event.locate_attempts, event.last_attempt_at)
                     event.last_attempt_at = utcnow()
                     event.locate_attempts += 1
                     event.next_locate_at = event.last_attempt_at + timedelta(
@@ -871,7 +888,11 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
                     attempted.append(event.id)
                     try:
                         return await _locate_one(event)
-                    except (IntegrationError, httpx.RequestError, ValueError, RuntimeError, TimeoutError):
+                    except IntegrationError as exc:
+                        if _defer_budget(event, prior, exc, summary):
+                            db.commit()
+                        return event, None, None, None
+                    except (httpx.RequestError, ValueError, RuntimeError, TimeoutError):
                         return event, None, None, None
 
             if not locatable:
@@ -997,6 +1018,26 @@ def process_audit_events(db: Session, settings: Settings, *, drain_walks: bool =
     return summary
 
 
+def _budget_is_waiting(db, settings, interface, summary):
+    try:
+        waiting = budget_wait_until(db, settings, interface)
+    except IntegrationError:
+        summary['budget_unavailable'] = summary.get('budget_unavailable', 0) + 1
+        return True
+    if waiting:
+        summary['budget_wait_until'] = waiting.isoformat()
+    return bool(waiting)
+
+
+def _defer_budget(event, prior, exc, summary):
+    if exc.code not in ('dingtalk_budget_exhausted', 'dingtalk_budget_unavailable'):
+        return False
+    event.locate_attempts, event.last_attempt_at = prior
+    event.next_locate_at = getattr(exc, 'retry_at', None) or utcnow() + timedelta(seconds=60)
+    summary['budget_deferred'] = summary.get('budget_deferred', 0) + 1
+    return True
+
+
 def _refresh_confirmed_metadata(db, settings, summary):
     """Node identity is not proof that this event's metadata was refreshed."""
     now = utcnow()
@@ -1012,6 +1053,9 @@ def _refresh_confirmed_metadata(db, settings, summary):
     rows = [e for e in rows if _action_kind(e) in {"review", "modify", "metadata"}]
     if not rows:
         return
+    if _budget_is_waiting(db, settings, 'wiki.batchQuery', summary):
+        return
+    prior = {e.id: (e.locate_attempts, e.last_attempt_at) for e in rows}
     for e in rows:
         e.last_attempt_at = now
         e.locate_attempts += 1
@@ -1020,7 +1064,14 @@ def _refresh_confirmed_metadata(db, settings, summary):
     db.commit()  # reservation survives failure; no row transaction across HTTP
     try:
         nodes = asyncio.run(DingtalkClient(settings).batch_query_wiki_nodes(ids, settings.dingtalk_sync_operator_id))
-    except (IntegrationError, httpx.RequestError, ValueError, RuntimeError, TimeoutError):
+    except IntegrationError as exc:
+        if exc.code in ('dingtalk_budget_exhausted', 'dingtalk_budget_unavailable'):
+            for e in rows:
+                _defer_budget(e, prior[e.id], exc, summary)
+            db.commit()
+            return
+        nodes = []
+    except (httpx.RequestError, ValueError, RuntimeError, TimeoutError):
         nodes = []
     confirmed = {n["node_id"]: n for n in nodes if n.get("node_id") in ids and n.get("workspace_id")}
     for e in rows:

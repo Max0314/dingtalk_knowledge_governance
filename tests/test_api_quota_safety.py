@@ -69,6 +69,40 @@ def test_unavailable_counter_blocks_before_http(monkeypatch):
     assert exc.value.code == "dingtalk_budget_unavailable"
 
 
+@pytest.mark.parametrize('period,expected', [
+    ('day:2026-12-31', datetime(2027, 1, 1, 0, 0, 1, tzinfo=api_usage.CST)),
+    ('month:2026-12', datetime(2027, 1, 1, 0, 0, 1, tzinfo=api_usage.CST)),
+])
+def test_budget_reset_period_and_advisory_gate(isolated, monkeypatch, period, expected):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 12, 31, 23, 59, tzinfo=api_usage.CST).astimezone(tz)
+    monkeypatch.setattr(api_usage, 'datetime', Clock)
+    settings = production(dingtalk_search_daily_limit=2, dingtalk_search_monthly_limit=3)
+    limit = 2 if period.startswith('day:') else 3
+    with isolated.begin() as db:db.add(ApiUsage(period=period, interface='storage.search', calls=limit))
+    with isolated() as db:assert api_usage.budget_wait_until(db, settings, 'storage.search') == expected
+    with pytest.raises(IntegrationError) as caught:api_usage.reserve_call(settings, 'storage.search')
+    assert caught.value.retry_at == expected
+    # Rollover uses a new counter key, including the December -> January edge.
+    monkeypatch.setattr(Clock, 'now', classmethod(lambda cls, tz=None: expected.astimezone(tz)))
+    with isolated() as db:assert api_usage.budget_wait_until(db, settings, 'storage.search') is None
+    api_usage.reserve_call(settings, 'storage.search')
+
+
+def test_advisory_gate_keeps_caller_pending_changes_when_counter_read_fails(isolated,monkeypatch):
+    with isolated() as db:
+        row=BridgeWalk(workspace_id='local-work')
+        db.add(row)
+        def offline(*a,**k):raise RuntimeError('synthetic counter offline')
+        monkeypatch.setattr(api_usage, 'Session', offline)
+        summary={}
+        assert audit_bridge._budget_is_waiting(db,production(),'storage.search',summary)
+        db.commit()
+    with isolated() as db:assert db.get(BridgeWalk,'local-work') is not None
+
+
 def test_exhausted_node_budget_never_fetches_token_or_sends_http(isolated, monkeypatch):
     settings = production(dingtalk_nodes_monthly_limit=1)
     api_usage.reserve_call(settings, "wiki.nodes")
