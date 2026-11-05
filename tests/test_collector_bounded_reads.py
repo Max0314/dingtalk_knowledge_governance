@@ -239,6 +239,48 @@ def test_empty_dingtalk_results_keep_legacy_null_compatibility(monkeypatch,paylo
     assert asyncio.run(c.batch_query_wiki_nodes(['synthetic-node'],'synthetic-operator'))==[]
 
 
+@pytest.mark.parametrize('path,expected',[
+    ({'longPath':'synthetic/root','path':'synthetic:root','url':'https://synthetic.invalid/private'},'synthetic/root'),
+    ({'path':'synthetic:root'},'synthetic:root'), ({},''), (None,''), ('synthetic/root','synthetic/root'),
+    ({'longPath':'s'*1100},'s'*1024),
+])
+def test_storage_search_accepts_official_path_object_without_storing_url(monkeypatch,path,expected):
+    monkeypatch.setattr(integrations,'reserve_call',lambda *a:None)
+    async def token(*a):return 'synthetic-token'
+    monkeypatch.setattr(integrations.DingtalkClient,'_token_value',token)
+    payload={'items':[{'dentryUuid':'synthetic-node','name':'synthetic','path':path}]}
+    monkeypatch.setattr(integrations,'outbound_client',lambda *a,**k:httpx.AsyncClient(transport=httpx.MockTransport(lambda req:httpx.Response(200,json=payload))))
+    result=asyncio.run(integrations.DingtalkClient(Settings(_env_file=None)).search_dentries('synthetic','synthetic-operator'))
+    assert result==[{'dentry_uuid':'synthetic-node','name':'synthetic','path':expected}]
+
+
+def test_official_search_payload_flows_to_metadata_mirror_without_review(collector,monkeypatch):
+    sessions,_,s=collector
+    s=s.model_copy(update={'dingtalk_sync_operator_id':'synthetic-operator'})
+    stamp=int(utcnow().timestamp()*1000)
+    add_event(sessions,gmt_create=stamp)
+    monkeypatch.setattr(integrations,'reserve_call',lambda *a:None)
+    async def token(*a):return 'synthetic-token'
+    monkeypatch.setattr(integrations.DingtalkClient,'_token_value',token)
+    paths=[]
+    def provider(request):
+        paths.append(request.url.path)
+        if request.url.path.endswith('/search'):
+            return httpx.Response(200,json={'items':[{'dentryUuid':'synthetic-node','name':'same-title.adoc',
+                'path':{'longPath':'synthetic/root','url':'https://synthetic.invalid/private'}}]})
+        return httpx.Response(200,json={'nodes':[{'nodeId':'synthetic-node','workspaceId':'synthetic-space',
+            'name':'same-title.adoc','extension':'adoc','size':30483771330,
+            'createTime':utcnow().isoformat(),'hasChildren':False}]})
+    monkeypatch.setattr(integrations,'outbound_client',lambda *a,**k:httpx.AsyncClient(transport=httpx.MockTransport(provider)))
+    with sessions() as db:
+        result=audit_bridge.process_audit_events(db,s,drain_walks=False)
+        row=db.scalar(select(FileAuditEvent))
+        doc=db.get(Document,'synthetic-node')
+        assert result.get('direct_upserts')==1 and row.processed and row.metadata_applied_at is not None, (str(result),paths)
+        assert doc.path=='synthetic/root' and doc.size==30483771330
+        assert db.scalars(select(ReviewJob)).all()==[]
+
+
 @pytest.mark.parametrize('confirmed',[False,True])
 @pytest.mark.parametrize('code',['dingtalk_budget_exhausted','dingtalk_budget_unavailable'])
 def test_quota_race_restores_prior_attempts_and_survives_new_session(collector,monkeypatch,confirmed,code):

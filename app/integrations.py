@@ -198,10 +198,22 @@ class DingtalkClient:
         if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
             raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502)
         if any(item.get(k) is not None and type(item[k]) not in (str, int)
-               for item in items for k in ('dentryUuid', 'name', 'path')):
+               for item in items for k in ('dentryUuid', 'name')):
             raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502)
-        return [{"dentry_uuid": str(item.get("dentryUuid", "")), "name": str(item.get("name", "")),
-                 "path": str(item.get("path", ""))} for item in items if isinstance(item, dict)]
+        normalized = []
+        for item in items:
+            path = item.get('path')
+            # Storage v2 returns a Path object; older responses used a string.
+            # Only its display path is needed. Never persist its URL or object repr.
+            if isinstance(path, dict):
+                if any(path.get(k) is not None and not isinstance(path[k], str) for k in ('longPath', 'path')):
+                    raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502)
+                path = path.get('longPath') or path.get('path') or ''
+            if path is not None and type(path) not in (str, int):
+                raise IntegrationError('dingtalk_dentry_search_invalid', '存储搜索返回格式无效。', 502)
+            normalized.append({'dentry_uuid': str(item.get('dentryUuid', '')), 'name': str(item.get('name', '')),
+                               'path': str(path or '')[:1024]})
+        return normalized
 
     async def batch_query_wiki_nodes(self, node_ids: list[str], operator_id: str) -> list[dict]:
         """POST /v2.0/wiki/nodes/batchQuery — nodeIds -> full nodes incl. workspaceId."""
