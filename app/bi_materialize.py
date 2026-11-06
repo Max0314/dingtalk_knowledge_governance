@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session
 from .bi_models import (BIDirtyNode, BIDirtyScope, BIIdentityMonth, BIInventory, BIProjectionState, BIPushState,
                         BIQualityMonth, BIStatPartition, BIUploadDay)
 from .bi_projection import Q_MAP, enqueue
-from .bi_push_contract import canonical, empty_quality, materialize_parts, partition_manifest, state_hash, utc_text
+from .bi_push_contract import RD_FIRST_MONTH, RD_PREFIX, canonical, empty_quality, materialize_parts, partition_manifest, state_hash, utc_text
 from .bi_snapshot import CST, SnapshotUnavailable, _collection, add_quality, build_snapshot
-from .db import Workspace, utcnow
+from .db import EmployeeOrgMonth, Workspace, utcnow
 from .service import review_excluded_levels, workspace_level, workspace_name_is_ignored
 
 
@@ -83,6 +83,11 @@ def scope_value(settings, projection, current, allow_empty=False):
             "baselineAttribution": "baseline_wins", "allowEmpty": allow_empty}
 
 
+def _rd_months(current):
+    year, month = map(int, current.split("-"))
+    return {f"{n // 12:04d}-{n % 12 + 1:02d}" for n in range(int(RD_FIRST_MONTH[:4]) * 12, year * 12 + month)}
+
+
 def dirty_plan(db, settings, now=None, *, allow_pending_projection=False):
     now = now or utcnow()
     projection = db.get(BIProjectionState, 1)
@@ -102,18 +107,57 @@ def dirty_plan(db, settings, now=None, *, allow_pending_projection=False):
     changed_scope = {k: v for k, v in old_meta.get("scope", {}).items() if k != "currentMonth"} != {k: v for k, v in expected_scope.items() if k != "currentMonth"}
     calendar = old_meta.get("scope", {}).get("currentMonth") != current
     full = not headers or any(r.scope_key == "all" for r in scopes) or changed_scope
-    selected = available_months(db, names) if full or scopes else sorted(k[6:] for k in headers if k.startswith("month/"))
+    fact_dirty = any(not r.scope_key.startswith(RD_PREFIX) for r in scopes)
+    selected = available_months(db, names) if full or fact_dirty else sorted(k[6:] for k in headers if k.startswith("month/"))
     months = set(selected) if full else {r.scope_key[6:] for r in scopes if r.scope_key.startswith("month/") and r.scope_key[6:] in selected}
     months |= set(selected) - {k[6:] for k in headers if k.startswith("month/")}
     workspaces = set(names) if full or calendar else {r.scope_key[10:] for r in scopes if r.scope_key.startswith("workspace/")}
     # A workspace becoming visible/hidden changes every month it contributes to.
     scope_ws = {r.scope_key[9:] for r in scopes if r.scope_key.startswith("registry/")}
     workspaces |= scope_ws
+    workspace_months = set()
     if scope_ws:
-        months |= set(db.scalars(select(BIUploadDay.month).where(BIUploadDay.workspace_id.in_(scope_ws)).distinct())) & set(selected)
-        months |= set(db.scalars(select(BIQualityMonth.month).where(BIQualityMonth.workspace_id.in_(scope_ws)).distinct())) & set(selected)
+        for model in (BIUploadDay, BIQualityMonth):
+            workspace_months.update(db.scalars(select(model.month).where(model.workspace_id.in_(scope_ws)).distinct()))
+        months |= workspace_months & set(selected)
+    rd_expected = _rd_months(current) if settings.bi_push_rd_metrics_enabled else set()
+    rd_dirty = workspace_months | {r.scope_key.split("/", 1)[1] for r in scopes
+                                  if r.scope_key.startswith(("month/", RD_PREFIX))}
+    rd_dirty |= {m for m in rd_expected if RD_PREFIX + m not in headers}
     return {"headers": headers, "meta": old_meta, "scopes": scopes, "names": names, "unconfirmed": unconfirmed, "months": sorted(months),
-            "workspaces": workspaces, "selected": selected, "projection": projection, "now": now, "full": full, "calendar": calendar}
+            "workspaces": workspaces, "selected": selected, "projection": projection, "now": now, "full": full, "calendar": calendar,
+            "rd_months": rd_expected if full else rd_dirty & rd_expected, "rd_expected": rd_expected, "fact_dirty": fact_dirty}
+
+
+def _rd_month_parts(db, months, names):
+    """Use existing upload-day and review-month counters for confirmed non-personal libraries."""
+    if not months:
+        return {}, set()
+    org = EmployeeOrgMonth
+    memberships = set(db.execute(select(org.month, org.department_name)
+        .where(org.month.in_(months), org.is_rd_system.is_(True), org.details_ready.is_(True)).distinct()))
+    ready_months = {month for month, _ in memberships}
+    missing = set()
+    totals = {month: [0, 0, Decimal(0)] for month in months}
+    upload, quality = BIUploadDay, BIQualityMonth
+    for model, columns, offset in (
+        (upload, (upload.file_count,), 0),
+        (quality, (quality.scored_count, quality.score_sum), 1),
+    ):
+        rows = db.execute(select(model.month, Workspace.owner_department_name, *map(func.sum, columns))
+            .join(Workspace, Workspace.workspace_id == model.workspace_id)
+            .where(model.month.in_(months), model.workspace_id.in_(names))
+            .group_by(model.month, Workspace.owner_department_name))
+        for month, department, *counts in rows:
+            if month not in ready_months and counts[0]:
+                missing.add(month)
+            elif (month, department) in memberships:
+                for index, value in enumerate(counts, offset):
+                    totals[month][index] += value
+    parts = {RD_PREFIX + month: {"month": month, "uploadedFileCount": int(uploaded),
+                              "scoredDocumentCount": int(scored), "scoreSum": format(score, ".4f")}
+             for month, (uploaded, scored, score) in totals.items() if month not in missing}
+    return parts, {RD_PREFIX + month for month in missing}
 
 
 def _workspace_rows(db, ids, names, current):
@@ -160,10 +204,14 @@ def publish_partitions(db, settings, versions, now=None, allow_empty=False, *, a
                                    "diagnostics": v["data"]["diagnostics"]["monthly"][0], "identityVersion": version}
     # The retained time window may move; explicit deletions are sent downstream.
     removed = {k for k in plan["headers"] if (k.startswith("month/") and k[6:] not in plan["selected"])
-               or (k.startswith("workspace/") and k[10:] not in names)}
+               or (k.startswith("workspace/") and k[10:] not in names)
+               or (k.startswith(RD_PREFIX) and k[len(RD_PREFIX):] not in plan["rd_expected"])}
+    rd_parts, unavailable = _rd_month_parts(db, plan["rd_months"], names)
+    parts.update(rd_parts)
+    removed |= unavailable & plan["headers"].keys()
     for w, row in _workspace_rows(db, plan["workspaces"], names, current).items():
         parts["workspace/" + w] = row
-    if plan["scopes"] or plan["full"] or plan["calendar"] or "summary" not in plan["headers"]:
+    if plan["fact_dirty"] or plan["full"] or plan["calendar"] or "summary" not in plan["headers"]:
         existing_ws = {key: json.loads(payload) for key, payload in db.execute(select(BIStatPartition.partition_key, BIStatPartition.payload_json)
                        .where(BIStatPartition.partition_key.like("workspace/%")))}
         existing_ws.update({k: v for k, v in parts.items() if k.startswith("workspace/")})
@@ -187,7 +235,7 @@ def publish_partitions(db, settings, versions, now=None, allow_empty=False, *, a
     meta_core = {"scope": scope_value(settings, projection, current, allow_empty), "collection": _collection(db, now),
                  "identityVersions": selected_versions, "unconfirmedWorkspaceCount": plan["unconfirmed"]}
     old_meta = plan["meta"]
-    if plan["scopes"] or plan["full"] or any(old_meta.get(k) != v for k, v in meta_core.items()):
+    if plan["fact_dirty"] or plan["full"] or any(old_meta.get(k) != v for k, v in meta_core.items()):
         parts["meta"] = {**meta_core, "metadataReadAt": utc_text(projection.last_projected_at or now), "generatedAt": utc_text(now)}
     manifest = partition_manifest(parts)
     changed = 0

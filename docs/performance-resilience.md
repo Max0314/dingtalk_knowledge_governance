@@ -102,3 +102,5 @@ python scripts/ops_resilience.py restore-drill --path /tmp/release.kgenc --key /
 - 部署指引中的定时备份/RPO、长期监控须由业务和 DBA 批准落实；本次请求不自动创建定时任务。
 
 本次页面与分页校准的实现、定向边界用例和生产验收见 [2026-11-04 优化记录](reviews/2026-11-04-page-and-scan-optimization.md)。统计页按基线归属+实时增量；文档浏览保留当前镜像类型/日期和live覆盖的原有语义，不用统计总数冒充浏览行数。
+
+研发部门指标复用 `kg_bi_upload_day`、`kg_bi_quality_month` 及月度组织缓存。首次补建和后续变更只读取所需月份的预聚合，并按哈希写入变化的小分区。空闲轮次只核对分区头，不重读日/月事实。接口和发布顺序见 [主动推送契约 §17.5](bi-center-push-and-metadata-collection-plan.md#175-研发部门指标月度分区)。

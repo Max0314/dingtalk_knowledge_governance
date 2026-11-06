@@ -3,6 +3,9 @@ from sqlalchemy import delete, select
 
 from .db import EmployeeOrgMonth, utcnow
 from .bi_snapshot import SnapshotUnavailable
+from .bi_projection import enqueue
+from .bi_models import BIDirtyScope
+from .bi_push_contract import RD_PREFIX
 
 
 async def prepare_month(sessions, month, version, remote, shared):
@@ -52,3 +55,4 @@ async def prepare_month(sessions, month, version, remote, shared):
         db.add_all([EmployeeOrgMonth(month=month, employee_key=k, **v, details_ready=True, directory_version=version['directoryVersion'],
                     policy_version=version['policyVersion'], resolved_snapshot_month=version['resolvedSnapshotMonth'], synced_at=utcnow())
                     for k, v in shared[key].items()])
+        enqueue(db, BIDirtyScope, [RD_PREFIX + month])

@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     bi_export_max_page_size: int = 200
     metadata_only: bool = False
     bi_push_enabled: bool = False
+    bi_push_rd_metrics_enabled: bool = False
     bi_push_base_url: str = ""
     bi_push_token: str = ""
     bi_push_source_id: str = "kg-internal-production"

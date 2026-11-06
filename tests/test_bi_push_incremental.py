@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 import httpx
 from app import bi_projection
-from app.bi_models import (BIIdentityMonth, BIPushState, BIPushOutbox, BIProjectionState, BIUploadDay,
+from app.bi_models import (BIIdentityMonth, BIPushState, BIPushOutbox, BIProjectionState, BIQualityMonth, BIUploadDay,
                           BIDirtyNode, BIDirtyScope, BIFileFact)
 from app.bi_materialize import publish_partitions, read_partitions
 from app.bi_projection import enqueue, project_dirty, seed_slice
@@ -19,7 +19,7 @@ from app.bi_push_contract import (ContractError, canonical, content_hash, materi
 from app.bi_publisher import reconcile_remote, send_once
 from app.bi_snapshot import SnapshotUnavailable
 from app.config import Settings
-from app.db import Base, Document, HistoricalFileNode, HistoricalSnapshot, Workspace, utcnow
+from app.db import Base, Document, EmployeeOrgMonth, HistoricalFileNode, HistoricalSnapshot, Workspace, utcnow
 
 NOW = datetime(2026, 11, 4, 0, tzinfo=timezone.utc)
 VERSION = {"month": "2026-11", "directoryVersion": "directory-test-1", "policyVersion": "policy-test-1", "resolvedSnapshotMonth": "2026-11"}
@@ -110,6 +110,70 @@ def ack_claim(sessions):
     with sessions.begin() as db:
         assert finish_frame(db, claim, confirmation)
     return claim
+
+
+def test_rd_rollout_and_updates_send_only_aggregate_partitions(local):
+    sessions, bind, settings = local
+    with sessions.begin() as db:
+        db.get(Workspace, "space-a").owner_department_name = "Synthetic RD"
+        db.add_all([
+            Workspace(workspace_id="personal", name="I-Personal", owner_department_name="Synthetic RD", metadata_confirmed_at=NOW),
+            Workspace(workspace_id="outside", name="D-Outside", owner_department_name="Synthetic other", metadata_confirmed_at=NOW),
+            EmployeeOrgMonth(month="2026-11", employee_key="rd", department_name="Synthetic RD", is_rd_system=True, details_ready=True),
+        ])
+    with sessions.begin() as db:
+        db.add_all([
+            BIUploadDay(workspace_id=w, identity_kind="unknown", source_key="", month="2026-11", day="2026-11-01", file_count=7)
+            for w in ("personal", "outside")
+        ])
+        db.add(BIQualityMonth(workspace_id="space-a", identity_kind="unknown", source_key="", month="2026-11",
+                              reviewed_count=1, scored_count=1, score_sum=75))
+    with sessions.begin() as db:
+        publish_partitions(db, settings, {"2026-11": VERSION}, now=NOW)
+    with sessions.begin() as db:
+        queue_current(db)
+    old = ack_claim(sessions)["request"]
+    assert "rdMonthly" not in old["data"]
+
+    enabled = settings.model_copy(update={"bi_push_rd_metrics_enabled": True})
+    sql = []
+    def record(_, __, statement, *args):
+        sql.append(statement.lower())
+    event.listen(bind, "before_cursor_execute", record)
+    try:
+        with sessions.begin() as db:
+            publish_partitions(db, enabled, {}, now=NOW)
+        with sessions.begin() as db:
+            queue_current(db)
+            parts = read_partitions(db)
+        frame = ack_claim(sessions)["request"]
+        assert {r["key"].split("/")[0] for r in frame["changes"]["upserts"]} == {"rd-month"}
+        assert parts["rd-month/2026-11"] == {"month": "2026-11", "uploadedFileCount": 2,
+                                            "scoredDocumentCount": 1, "scoreSum": "75.0000"}
+        assert parts["rd-month/2025-01"]["uploadedFileCount"] == 0
+        v = materialize_parts(parts, old["snapshotId"], 2)
+        assert split_snapshot(v) == parts
+        assert not any("from documents" in s or "from historical_file_nodes" in s for s in sql)
+
+        sql.clear()
+        with sessions.begin() as db:
+            assert publish_partitions(db, enabled, {}, now=NOW)["changedPartitions"] == 0
+        assert not any("kg_bi_upload_day" in s or "kg_bi_quality_month" in s or "employee_org_month" in s for s in sql)
+        # Reclassifying the owner through the versioned directory refresh only changes the RD partition.
+        with sessions.begin() as db:
+            org = db.scalar(select(EmployeeOrgMonth).where(EmployeeOrgMonth.month == "2026-11",
+                                                            EmployeeOrgMonth.employee_key == "rd"))
+            org.department_name = "Synthetic other"
+            enqueue(db, BIDirtyScope, ["rd-month/2026-11"])
+        with sessions.begin() as db:
+            assert publish_partitions(db, enabled, {}, now=NOW)["changedPartitions"] == 1
+        with sessions.begin() as db:
+            queue_current(db)
+        updated = ack_claim(sessions)["request"]["changes"]["upserts"]
+        assert updated == [{"key": "rd-month/2026-11", "value": {"month": "2026-11", "uploadedFileCount": 7,
+                                                               "scoredDocumentCount": 0, "scoreSum": "0.0000"}}]
+    finally:
+        event.remove(bind, "before_cursor_execute", record)
 
 
 def test_one_change_emits_delta_and_keeps_unchanged_space(local):

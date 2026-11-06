@@ -59,7 +59,8 @@ def _change_hook(db, *_):
         elif isinstance(obj, ReviewInstance) and (obj in db.new or obj in db.deleted):
             nodes.add(obj.node_id)
         elif isinstance(obj, Workspace):
-            changed = obj in db.new or obj in db.deleted or any(state.attrs[k].history.has_changes() for k in ("name", "is_active"))
+            changed = obj in db.new or obj in db.deleted or any(state.attrs[k].history.has_changes()
+                for k in ("name", "is_active", "owner_department_name"))
             confirmation = state.attrs.metadata_confirmed_at.history
             changed = changed or (confirmation.has_changes() and (not confirmation.deleted or confirmation.deleted[0] is None))
             if changed and obj.workspace_id:

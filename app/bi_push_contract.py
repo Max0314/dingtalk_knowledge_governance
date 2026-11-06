@@ -16,6 +16,9 @@ MONTH = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 CALIBRATION = {"not_started", "running", "completed", "completed_with_errors", "budget_exhausted", "expired", "unconfigured", "no_targets"}
 TOP = {"contractVersion", "sourceId", "snapshotId", "sequence", "generatedAt", "metadataReadAt", "contentHash", "scope", "collection", "identityVersions", "data"}
 BUCKETS = ("officialUploadedFileCount", "robotExcludedFileCount", "unknownIdentityFileCount", "unmatchedIdentityFileCount", "policyExcludedFileCount")
+RD_FIRST_MONTH = "2025-01"
+RD_PREFIX = "rd-month/"
+RD_KEYS = {"month", "uploadedFileCount", "scoredDocumentCount", "scoreSum"}
 
 
 class ContractError(ValueError):
@@ -87,14 +90,18 @@ def _time(value, path, now, nullable=False):
         raise ContractError(path) from None
 
 
+def _score_sum(row, path):
+    s = row["scoreSum"]
+    _require(type(s) is str and len(s) <= 24 and bool(re.fullmatch(r"(?:0|[1-9]\d*)\.\d{4}", s)), path + ".scoreSum")
+    _require(0 <= Decimal(s) <= 100 * row["scoredDocumentCount"], path + ".scoreSum")
+
+
 def _quality(row, path):
     for k in Q_COUNTS:
         _count(row[k], path + "." + k)
-    s = row["scoreSum"]
-    _require(type(s) is str and bool(re.fullmatch(r"(?:0|[1-9]\d*)\.\d{4}", s)), path + ".scoreSum")
+    _score_sum(row, path)
     _require(row["scoredDocumentCount"] <= row["reviewedDocumentCount"], path)
     _require(sum(row[k] for k in ("passCount", "manualReviewCount", "returnCount")) <= row["reviewedDocumentCount"], path)
-    _require(0 <= Decimal(s) <= 100 * row["scoredDocumentCount"], path + ".scoreSum")
 
 
 def _rows(value, keys, row_keys, path):
@@ -148,7 +155,18 @@ def validate_snapshot(v, now=None):
         _month(c["calibrationMonth"], "collection.calibrationMonth")
     _require(c["calibrationStatus"] in CALIBRATION, "collection.calibrationStatus")
     d = v["data"]
-    _object(d, {"summary", "monthly", "workspaces", "employees", "diagnostics"}, "data")
+    keys = {"summary", "monthly", "workspaces", "employees", "diagnostics"}
+    _object(d, keys | ({"rdMonthly"} if isinstance(d, dict) and "rdMonthly" in d else set()), "data")
+    if "rdMonthly" in d:
+        path = "data.rdMonthly"
+        _rows(d["rdMonthly"], RD_KEYS, ("month",), path)
+        _require(bool(d["rdMonthly"]), path)
+        for r in d["rdMonthly"]:
+            _month(r["month"], path + ".month")
+            _require(RD_FIRST_MONTH <= r["month"] <= scope["currentMonth"], path + ".month")
+            _count(r["uploadedFileCount"], path + ".uploadedFileCount")
+            _count(r["scoredDocumentCount"], path + ".scoredDocumentCount")
+            _score_sum(r, path)
     s = d["summary"]
     sc = {"workspaceCount", "totalFileCount", "currentMonthNewFileCount", "undatedFileCount"}
     _object(s, sc | Q_KEYS | {"currentMonthQuality"}, "data.summary")
@@ -224,6 +242,8 @@ def split_snapshot(v):
         m = r["month"]
         parts["month/" + m] = {"monthly": r, "employees": [e for e in d["employees"] if e["month"] == m],
                                 "diagnostics": diagnostics[m], "identityVersion": versions[m]}
+    for row in d.get("rdMonthly", []):
+        parts[RD_PREFIX + row["month"]] = row
     return parts
 
 
@@ -248,7 +268,7 @@ def _materialize_parts(parts, snapshot_id, sequence):
     _require("summary" in parts and "meta" in parts, "changes")
     meta = parts["meta"]
     _object(meta, {"scope", "collection", "identityVersions", "metadataReadAt", "generatedAt", "unconfirmedWorkspaceCount"}, "partition.meta")
-    months, workspaces, employees, diagnostics, versions = [], [], [], [], []
+    months, workspaces, employees, diagnostics, versions, rd_monthly = [], [], [], [], [], []
     for key, value in sorted(parts.items()):
         _partition_key(key)
         if key.startswith("workspace/"):
@@ -264,12 +284,18 @@ def _materialize_parts(parts, snapshot_id, sequence):
             employees.extend(value["employees"])
             diagnostics.append(value["diagnostics"])
             versions.append(value["identityVersion"])
+        elif key.startswith(RD_PREFIX):
+            _object(value, RD_KEYS, "partition.rdMonth")
+            _require(value["month"] == key[len(RD_PREFIX):], "partition.rdMonth.month")
+            rd_monthly.append(value)
     _require(meta["identityVersions"] == versions, "partition.identityVersions")
     v = {"contractVersion": 1, "sourceId": SOURCE_ID, "snapshotId": snapshot_id, "sequence": str(sequence),
          **{k: meta[k] for k in ("scope", "collection", "identityVersions", "metadataReadAt", "generatedAt")},
          "data": {"summary": parts["summary"], "monthly": months, "workspaces": workspaces, "employees": employees,
                   "diagnostics": {"undatedFileCount": parts["summary"]["undatedFileCount"],
                                   "unconfirmedWorkspaceCount": meta["unconfirmedWorkspaceCount"], "monthly": diagnostics}}}
+    if rd_monthly:
+        v["data"]["rdMonthly"] = rd_monthly
     v["contentHash"] = content_hash(v)
     return validate_snapshot(v)
 
@@ -277,7 +303,8 @@ def _materialize_parts(parts, snapshot_id, sequence):
 def _partition_key(key):
     _require(type(key) is str and 0 < len(key) <= 160 and (key in {"summary", "meta"}
              or (key.startswith("workspace/") and 0 < len(key[10:]) <= 128)
-             or (key.startswith("month/") and MONTH.fullmatch(key[6:]))), "changes.key")
+             or (key.startswith("month/") and MONTH.fullmatch(key[6:]))
+             or (key.startswith(RD_PREFIX) and MONTH.fullmatch(key[len(RD_PREFIX):]))), "changes.key")
 
 
 def delta_hash(v):
